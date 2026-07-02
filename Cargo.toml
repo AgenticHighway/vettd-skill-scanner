@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vettd-skill-scanner",
+    "crates/parity-adapter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+base64 = "0.22"

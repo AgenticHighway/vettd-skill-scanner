@@ -1,0 +1,132 @@
+# ──────────────────────────────────────────────────────────────────────
+# CI — runs on every PR, push to main, and weekly on a schedule.
+#
+# PURPOSE:
+#   Gate merges behind automated checks: lint, test, and security
+#   scanning. This prevents regressions and catches vulnerabilities
+#   before code reaches consumers of this crate.
+#
+# JOBS (run in parallel):
+#   check         — fmt → clippy → test
+#   supply-chain  — cargo-deny + cargo-audit
+#   secrets       — gitleaks (always runs — any file can contain secrets)
+#
+# No path-filtering here (unlike vettd-cli's CI) — this repo is small
+# enough that nearly every change touches Rust, so the extra job to
+# skip work isn't worth the complexity yet.
+#
+# SUPPLY CHAIN SECURITY:
+#   • All Actions pinned to full commit SHAs.
+#   • `cargo deny` checks licenses and advisories on every PR.
+#   • `cargo audit` catches known CVEs in the dependency tree.
+#   • `gitleaks` scans for accidentally committed secrets.
+#   • Minimal permissions — only `contents: read` for checkout.
+#   • Audit tool versions are pinned and verified via SHA-256 checksums
+#     before execution — no silent upgrades from upstream `latest`.
+#   • Scheduled weekly run ensures new advisories are caught even when
+#     no dependency files changed.
+# ──────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+    pull_request:
+    push:
+        branches: [main]
+    schedule:
+        # Weekly on Monday at 06:00 UTC — catches new advisories even
+        # when no dependency files have changed since the last PR.
+        - cron: '0 6 * * 1'
+
+concurrency:
+    group: ci-${{ (github.event_name == 'push' || github.event_name == 'schedule') && github.run_id || github.head_ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    check:
+        name: Lint & test
+        runs-on: blacksmith-4vcpu-ubuntu-2204
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+              with:
+                  components: clippy, rustfmt
+
+            - name: Ensure toolchain components
+              run: rustup component add clippy rustfmt
+
+            - name: Cache Cargo
+              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+            - name: Formatting
+              run: cargo fmt --check
+
+            - name: Clippy
+              run: cargo clippy --locked --all-targets -- -D warnings
+
+            - name: Test
+              run: cargo test --locked
+
+    supply-chain:
+        name: Supply chain audit
+        runs-on: blacksmith-2vcpu-ubuntu-2204
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Install cargo-deny
+              run: |
+                  DENY_VERSION="0.19.1"
+                  DENY_SHA256="baa0d618ce06bd1fb352115de47e31acba439c3e639b990dc43429c948364d70"
+                  curl -sSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+                    -o cargo-deny.tar.gz
+                  echo "${DENY_SHA256}  cargo-deny.tar.gz" | sha256sum --check --strict
+                  tar xzf cargo-deny.tar.gz --strip-components=1 -C /usr/local/bin
+                  rm cargo-deny.tar.gz
+                  cargo-deny --version
+
+            - name: Install cargo-audit
+              run: |
+                  AUDIT_VERSION="0.22.1"
+                  AUDIT_SHA256="c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab"
+                  curl -sSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${AUDIT_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${AUDIT_VERSION}.tgz" \
+                    -o cargo-audit.tgz
+                  echo "${AUDIT_SHA256}  cargo-audit.tgz" | sha256sum --check --strict
+                  tar xzf cargo-audit.tgz --strip-components=1 -C /usr/local/bin
+                  rm cargo-audit.tgz
+                  cargo-audit --version
+
+            - name: cargo deny check
+              run: cargo deny check
+
+            - name: cargo audit
+              run: cargo audit
+
+    secrets:
+        name: Secrets scan
+        runs-on: blacksmith-2vcpu-ubuntu-2204
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  fetch-depth: 0 # full history for scanning all commits
+
+            - name: Install gitleaks
+              run: |
+                  GL_VERSION="8.30.1"
+                  GL_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+                  curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_x64.tar.gz" \
+                    -o gitleaks.tar.gz
+                  echo "${GL_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
+                  tar xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
+                  rm gitleaks.tar.gz
+                  gitleaks version
+
+            - name: Scan for secrets
+              run: gitleaks detect --source . --config .gitleaks.toml --verbose
