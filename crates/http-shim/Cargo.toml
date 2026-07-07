@@ -1,0 +1,21 @@
+[package]
+name = "http-shim"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Localhost HTTP shim exposing vettd-skill-scanner to the scanner suite."
+
+[[bin]]
+name = "http-shim"
+path = "src/main.rs"
+
+[dependencies]
+vettd-skill-scanner = { path = "../vettd-skill-scanner" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -16,7 +16,8 @@ resolved.
 | Path | What it is |
 |---|---|
 | `crates/vettd-skill-scanner/` | the scanner engine — see [`lib.rs`](crates/vettd-skill-scanner/src/lib.rs) for the entry point and contract |
-| `crates/parity-adapter/` | a small binary that reads a file-map JSON envelope on stdin, calls the scanner, and writes findings as JSON on stdout — the cross-language integration point for anything that can spawn a process |
+| `crates/http-shim/` | localhost HTTP sidecar exposing the scanner to the scanner suite — `GET /health` + `POST /scan` on `127.0.0.1` (`VETTD_SHIM_PORT`, default 8788); response carries findings, structural flags, and the scanner version |
+| `crates/parity-adapter/` | a small stdin/stdout JSON binary used **only** by the `parity/` test harness — a testing tool, not a production integration path (that's `http-shim`) |
 | `parity/` | **temporary.** A Python test harness that diffs this engine's output against a hand-ported TypeScript reimplementation in the `vettd` web app, used only while both versions exist during the TS→Rust migration. Removed once that migration is complete — see [AgenticHighway/vettd#642](https://github.com/AgenticHighway/vettd/issues/642). |
 
 ## Build & test
@@ -30,4 +31,4 @@ cargo test
 ## Consumers
 
 - `vettd-cli` depends on this crate directly via a pinned Cargo `git` dependency.
-- Scanner suite integration is not yet decided — see AgenticHighway/vettd#642.
+- The scanner suite (`vettd-scanner-suite`) calls the scanner through the `http-shim` crate — see AgenticHighway/vettd#643.

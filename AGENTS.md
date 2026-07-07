@@ -16,6 +16,9 @@ safely in this repository.
 ## Repo shape
 
 - `crates/vettd-skill-scanner/` — the scanner engine
+- `crates/http-shim/` — localhost HTTP sidecar (`GET /health` + `POST /scan`)
+  through which the scanner suite calls the scanner; the production
+  integration path for non-Rust consumers
 - `crates/parity-adapter/` — subprocess entry point used by the `parity/`
   test harness only (stdin/stdout JSON protocol, documented in the crate's
   `main.rs`) — see the gotcha under Notes for agents
