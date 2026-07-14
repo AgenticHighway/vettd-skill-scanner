@@ -1,0 +1,96 @@
+# ──────────────────────────────────────────────────────────────────────
+# Publish http-shim (vettd-scanner-suite#15) — builds and pushes the
+# http-shim image to ECR so vettd-scanner-suite's remote dev deployment
+# can pull a published tag instead of building from a sibling checkout
+# (the local Compose behavior). This repo does not deploy anywhere
+# itself — vettd-scanner-suite's own deploy-dev workflow consumes the
+# `dev-latest` tag this publishes. See docs in vettd-scanner-suite for
+# the full picture.
+#
+# Runs off `main` (this repo has no dev/main split) — every push that
+# touches the shim rebuilds and republishes `dev-latest`.
+# ──────────────────────────────────────────────────────────────────────
+
+name: Publish http-shim
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - "crates/http-shim/**"
+            - "crates/vettd-skill-scanner/**"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "Dockerfile"
+            - ".github/workflows/publish-http-shim.yml"
+    workflow_dispatch:
+
+concurrency:
+    group: publish-http-shim
+    cancel-in-progress: true
+
+permissions:
+    id-token: write
+    contents: read
+
+env:
+    AWS_REGION: us-east-1
+    ECR_REPO: vettd-skill-scanner-shim
+
+jobs:
+    lint-and-test:
+        name: Lint & test
+        runs-on: blacksmith-4vcpu-ubuntu-2204
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+              with:
+                  components: clippy, rustfmt
+
+            - name: Cache Cargo
+              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+            - name: Formatting
+              run: cargo fmt --check
+
+            - name: Clippy
+              run: cargo clippy --locked --all-targets -- -D warnings
+
+            - name: Test
+              run: cargo test --locked
+
+    build-and-push:
+        name: Build & push image
+        needs: lint-and-test
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Set up Blacksmith Docker builder
+              uses: useblacksmith/setup-docker-builder@3cd79a53752a93f62c273d2edb1403bc7fa6ac6e # v1
+              with:
+                  max-cache-size-mb: "10240"
+
+            - name: Configure AWS credentials (OIDC)
+              uses: aws-actions/configure-aws-credentials@fb7eb401298e393da51cdcb2feb1ed0183619014 # v6
+              with:
+                  role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/vettd-deploy-dev
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: ecr-login
+              uses: aws-actions/amazon-ecr-login@c962da2960ed15f492addc26fffa274485265950 # v2
+
+            - name: Build and push http-shim image
+              uses: useblacksmith/build-push-action@cbd1f60d194a98cb3be5523b15134501eaf0fbf3 # v2
+              with:
+                  context: .
+                  file: Dockerfile
+                  platforms: linux/arm64
+                  push: true
+                  tags: |
+                      ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}:dev-${{ github.sha }}
+                      ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}:dev-latest
