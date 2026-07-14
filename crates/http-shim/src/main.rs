@@ -5,6 +5,11 @@
 //! cisco shim's `CISCO_SHIM_PORT` precedent — port/bind settings belong to
 //! the shim process; the suite's TOML config holds the URL its adapter dials.
 //!
+//! The bind address defaults to loopback (the shim is a sidecar, not meant to
+//! be externally reachable) but can be overridden via `VETTD_SHIM_BIND` —
+//! e.g. `0.0.0.0` when the shim runs in its own container and is reached over
+//! a Docker Compose network instead of localhost (see vettd-scanner-suite#12).
+//!
 //! Like `parity-adapter`, this crate lives outside the scanner library to
 //! preserve that crate's zero-I/O guarantee.
 
@@ -13,8 +18,8 @@ mod routes;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-/// Loopback only — the shim is a sidecar, never an externally reachable service.
-const BIND_ADDR: &str = "127.0.0.1";
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
+const BIND_ENV: &str = "VETTD_SHIM_BIND";
 const DEFAULT_PORT: u16 = 8788;
 const PORT_ENV: &str = "VETTD_SHIM_PORT";
 
@@ -31,7 +36,9 @@ async fn main() -> ExitCode {
         Err(_) => DEFAULT_PORT,
     };
 
-    let addr: SocketAddr = match format!("{BIND_ADDR}:{port}").parse() {
+    let bind_addr = std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+
+    let addr: SocketAddr = match format!("{bind_addr}:{port}").parse() {
         Ok(addr) => addr,
         Err(e) => {
             eprintln!("http-shim: invalid bind address: {e}");
