@@ -1,14 +1,15 @@
 # ──────────────────────────────────────────────────────────────────────
-# Publish http-shim (vettd-scanner-suite#15) — builds and pushes the
-# http-shim image to ECR so vettd-scanner-suite's remote dev deployment
-# can pull a published tag instead of building from a sibling checkout
-# (the local Compose behavior). This repo does not deploy anywhere
-# itself — vettd-scanner-suite's own deploy-dev workflow consumes the
-# `dev-latest` tag this publishes. See docs in vettd-scanner-suite for
-# the full picture.
+# Publish http-shim (vettd-scanner-suite#15, #2) — builds and pushes the
+# http-shim image to ECR so vettd-scanner-suite can pull a published tag
+# instead of building from a sibling checkout (the local Compose
+# behavior). This repo does not deploy anywhere itself.
 #
-# Runs off `main` (this repo has no dev/main split) — every push that
-# touches the shim rebuilds and republishes `dev-latest`.
+# Two triggers, two roles:
+#   - push to `main` (path-filtered)  -> dev-<sha> + dev-latest, via
+#     vettd-deploy-dev. Consumed by vettd-scanner-suite's dev deploy.
+#   - push of a `v*` tag              -> dev-<sha> + <tag> + dev-latest,
+#     via vettd-deploy (prod role). The `<tag>` image is what
+#     vettd-scanner-suite's prod task definition pins to.
 # ──────────────────────────────────────────────────────────────────────
 
 name: Publish http-shim
@@ -75,10 +76,19 @@ jobs:
               with:
                   max-cache-size-mb: "10240"
 
+            - name: Select IAM role
+              id: select-role
+              run: |
+                  if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+                      echo "role=vettd-deploy" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "role=vettd-deploy-dev" >> "$GITHUB_OUTPUT"
+                  fi
+
             - name: Configure AWS credentials (OIDC)
               uses: aws-actions/configure-aws-credentials@fb7eb401298e393da51cdcb2feb1ed0183619014 # v6
               with:
-                  role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/vettd-deploy-dev
+                  role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ steps.select-role.outputs.role }}
                   aws-region: ${{ env.AWS_REGION }}
 
             - name: Login to Amazon ECR
