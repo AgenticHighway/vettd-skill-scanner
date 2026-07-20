@@ -7,9 +7,8 @@ output — all inputs are pre-loaded by the caller. That boundary is intentional
 the scanner is designed to be embedded by any consumer (CLI, service, WASM
 module) without modification.
 
-**Status:** private repo. Source-available vs. open-source licensing is an
-open decision — the `license` field is intentionally left unset until that's
-resolved.
+**Status:** private repo, licensed under Apache License 2.0 (see
+[LICENSE](LICENSE)).
 
 ## Contents
 
