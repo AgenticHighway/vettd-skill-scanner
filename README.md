@@ -7,9 +7,6 @@ output — all inputs are pre-loaded by the caller. That boundary is intentional
 the scanner is designed to be embedded by any consumer (CLI, service, WASM
 module) without modification.
 
-**Status:** private repo, licensed under Apache License 2.0 (see
-[LICENSE](LICENSE)).
-
 ## Contents
 
 | Path | What it is |
