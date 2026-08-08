@@ -6,12 +6,21 @@
 
 use std::collections::HashMap;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION;
 use vettd_skill_scanner::{scan_skill, Finding};
+
+// axum's Json extractor defaults to a 2 MiB request body cap, which real
+// skill directories blow past easily (e.g. pbakaus/impeccable bundles ~3 MiB
+// of detector scripts per skill.md, duplicated across ~20 agent-CLI path
+// conventions — every one 413'd). The suite's GitHub fetcher already caps
+// total text content at 10 MiB (vettd packages/api github-skill-fetcher), so
+// 100 MiB leaves generous headroom without removing the cap altogether.
+const MAX_SCAN_BODY_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +51,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/scan", post(scan))
+        .layer(DefaultBodyLimit::max(MAX_SCAN_BODY_BYTES))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -195,5 +205,24 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["hasSkillMd"], false);
         assert_eq!(json["fileCount"], 0);
+    }
+
+    // Regression test for a real-world 413: pbakaus/impeccable's skill
+    // bundles are ~3 MiB of detector scripts, well past axum's 2 MiB
+    // default Json body limit. A single oversized file here reproduces
+    // that failure mode without needing the full multi-file payload.
+    #[tokio::test]
+    async fn scan_accepts_payloads_larger_than_axum_default_body_limit() {
+        let big_file = "x".repeat(3 * 1024 * 1024); // 3 MiB, exceeds axum's 2 MiB default
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"scripts/big.mjs": big_file},
+                "allPaths": ["scripts/big.mjs"],
+            })))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["fileCount"], 1);
     }
 }
