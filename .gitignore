@@ -9,3 +9,6 @@ target/
 ._*
 __pycache__/
 *.pyc
+
+.opencode/
+.claude/
