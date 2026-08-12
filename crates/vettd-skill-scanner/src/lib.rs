@@ -23,6 +23,14 @@
 
 pub mod consts;
 
+/// The scanner crate's own semantic version (from Cargo.toml), e.g. "0.1.4".
+///
+/// Distinct from [`consts::CURRENT_SCANNER_VERSION`], which is the findings
+/// *schema* version (currently `9`) used to detect stale scan results. This
+/// `VERSION` reports the crate's release so consumers like vettd-cli can surface
+/// it in `vettd --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod checks;
 mod finding;
 mod result;
