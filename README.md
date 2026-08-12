@@ -26,5 +26,5 @@ cargo test
 
 ## Consumers
 
-- `vettd-cli` depends on this crate directly via a pinned Cargo `git` dependency.
+- `vettd-cli` depends on this crate via a Cargo `git` dependency pinned by tag (see the crate's `pub const VERSION` for the current release).
 - The scanner suite (`vettd-scanner-suite`) calls the scanner through the `http-shim` crate — see AgenticHighway/vettd#643.
