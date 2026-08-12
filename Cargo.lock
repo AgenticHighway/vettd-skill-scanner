@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "http-shim"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "axum",
  "http-body-util",
@@ -281,7 +281,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "parity-adapter"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -550,7 +550,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vettd-skill-scanner"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "base64",
  "regex",
