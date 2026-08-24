@@ -1,8 +1,8 @@
 //! Router and handlers for the shim.
 //!
-//! The wire contract extends the parity-adapter envelope: the request is
-//! `{"textFiles": {...}, "allPaths": [...]}` (camelCase) and the response
-//! adds the structural flags and scanner version on top of `{"findings"}`.
+//! The wire contract: the request is `{"textFiles": {...}, "allPaths": [...]}`
+//! (camelCase) and the response carries the structural flags and scanner
+//! version alongside `{"findings"}`.
 
 use std::collections::HashMap;
 

@@ -10,8 +10,8 @@
 //! e.g. `0.0.0.0` when the shim runs in its own container and is reached over
 //! a Docker Compose network instead of localhost (see vettd-scanner-suite#12).
 //!
-//! Like `parity-adapter`, this crate lives outside the scanner library to
-//! preserve that crate's zero-I/O guarantee.
+//! This crate lives outside the scanner library to preserve that crate's
+//! zero-I/O guarantee.
 
 mod routes;
 

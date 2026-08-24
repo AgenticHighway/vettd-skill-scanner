@@ -167,6 +167,7 @@ pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) ->
                 name: "unknown".to_string(),
                 description: String::new(),
                 repository: String::new(),
+                frontmatter: yaml_rust2::Yaml::BadValue,
                 body: String::new(),
             });
 
