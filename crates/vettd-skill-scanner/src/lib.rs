@@ -36,8 +36,10 @@ mod finding;
 mod result;
 mod rules;
 mod scanner;
+mod signal;
 mod skill_md;
 
 pub use finding::{Finding, FindingCategory, Intent, Severity};
 pub use result::SkillScanResult;
 pub use scanner::scan_skill;
+pub use signal::Signal;

@@ -832,6 +832,7 @@ pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) ->
 
     SkillScanResult {
         findings,
+        signals: Vec::new(),
         has_skill_md,
         has_scripts,
         has_references,
