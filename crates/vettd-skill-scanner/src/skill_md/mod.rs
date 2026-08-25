@@ -259,10 +259,12 @@ mod tests {
     fn nested_objects_are_reachable() {
         // Public catalogs put author/version under `metadata:`. These parsed
         // as unreachable before, so nothing downstream could read them.
-        let input =
-            "---\nname: test\nmetadata:\n  author: jane\n  version: 1.2\n---\n# Body";
+        let input = "---\nname: test\nmetadata:\n  author: jane\n  version: 1.2\n---\n# Body";
         let parsed = parse_skill_md(input);
-        assert_eq!(parsed.frontmatter["metadata"]["author"].as_str(), Some("jane"));
+        assert_eq!(
+            parsed.frontmatter["metadata"]["author"].as_str(),
+            Some("jane")
+        );
         assert!(
             !parsed.frontmatter["metadata"]["version"].is_badvalue(),
             "nested version must be reachable, not absent"
@@ -275,7 +277,9 @@ mod tests {
         // pre-YAML scan flattened them into a single string.
         let input = "---\nname: test\ntools:\n  - Read\n  - Bash\nflow: [a, b]\n---\n";
         let parsed = parse_skill_md(input);
-        let tools = parsed.frontmatter["tools"].as_vec().expect("tools is a list");
+        let tools = parsed.frontmatter["tools"]
+            .as_vec()
+            .expect("tools is a list");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].as_str(), Some("Read"));
         assert_eq!(parsed.frontmatter["flow"].as_vec().map(Vec::len), Some(2));
@@ -330,7 +334,10 @@ mod tests {
             parsed.frontmatter.is_badvalue(),
             "no document is available when the block is not valid YAML"
         );
-        assert!(parsed.body.contains("Body"), "body extraction is unaffected");
+        assert!(
+            parsed.body.contains("Body"),
+            "body extraction is unaffected"
+        );
     }
 
     #[test]
