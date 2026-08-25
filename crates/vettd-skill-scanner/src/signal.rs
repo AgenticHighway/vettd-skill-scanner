@@ -34,10 +34,10 @@ fn is_false(b: &bool) -> bool {
 ///
 /// Four fields are REQUIRED on the wire: `dataCategory`, `sourceClass`,
 /// `ruleId`, `observedAt`. Subject identity (`subjectType`, `subjectId`,
-/// `relatedType`, `relatedId`) and `userId` are OPTIONAL — the emitter cannot
-/// fill them; vettd stamps them later. `observedAt` is a caller-supplied
-/// observation time carried unmodified as an ISO-8601 string; it represents
-/// "when observed", not write time.
+/// `relatedType`, `relatedId`) is OPTIONAL — the emitter cannot fill it; vettd
+/// stamps it later. `observedAt` is a caller-supplied observation time carried
+/// unmodified as an ISO-8601 string; it represents "when observed", not write
+/// time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Signal {
@@ -73,10 +73,6 @@ pub struct Signal {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_id: Option<String>,
-
-    /// Owning user, stamped server-side. OPTIONAL on the wire.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
 
     /// Severity. **Open string**, NOT the crate's `Severity` enum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,9 +118,9 @@ pub struct Signal {
     #[serde(default, skip_serializing_if = "is_false")]
     pub synthetic: bool,
 
-    /// Arbitrary structured payload.
+    /// Arbitrary structured payload (JSON object only, per the wire contract).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
+    pub payload: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +142,6 @@ mod tests {
             subject_id: None,
             related_type: None,
             related_id: None,
-            user_id: None,
             severity: None,
             label: None,
             detail: None,
