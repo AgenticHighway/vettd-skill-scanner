@@ -165,13 +165,31 @@ mod tests {
             ..minimal_signal()
         };
         let v = serde_json::to_value(&s).unwrap();
-        assert!(v.get("dataCategory").is_some(), "dataCategory key must be camelCase");
-        assert!(v.get("sourceClass").is_some(), "sourceClass key must be camelCase");
+        assert!(
+            v.get("dataCategory").is_some(),
+            "dataCategory key must be camelCase"
+        );
+        assert!(
+            v.get("sourceClass").is_some(),
+            "sourceClass key must be camelCase"
+        );
         assert!(v.get("ruleId").is_some(), "ruleId key must be camelCase");
-        assert!(v.get("observedAt").is_some(), "observedAt key must be camelCase");
-        assert!(v.get("valueText").is_some(), "valueText key must be camelCase");
-        assert!(v.get("data_category").is_none(), "snake_case must not appear");
-        assert!(v.get("source_class").is_none(), "snake_case must not appear");
+        assert!(
+            v.get("observedAt").is_some(),
+            "observedAt key must be camelCase"
+        );
+        assert!(
+            v.get("valueText").is_some(),
+            "valueText key must be camelCase"
+        );
+        assert!(
+            v.get("data_category").is_none(),
+            "snake_case must not appear"
+        );
+        assert!(
+            v.get("source_class").is_none(),
+            "snake_case must not appear"
+        );
         assert!(v.get("rule_id").is_none(), "snake_case must not appear");
         assert!(v.get("observed_at").is_none(), "snake_case must not appear");
     }
