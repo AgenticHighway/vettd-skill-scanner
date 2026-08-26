@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/vettd-skill-scanner",
-    "crates/parity-adapter",
     "crates/http-shim",
 ]
 
@@ -16,5 +15,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 base64 = "0.22"
+yaml-rust2 = { version = "0.12", default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }

@@ -19,13 +19,6 @@ safely in this repository.
 - `crates/http-shim/` — localhost HTTP sidecar (`GET /health` + `POST /scan`)
   through which the scanner suite calls the scanner; the production
   integration path for non-Rust consumers
-- `crates/parity-adapter/` — subprocess entry point used by the `parity/`
-  test harness only (stdin/stdout JSON protocol, documented in the crate's
-  `main.rs`) — see the gotcha under Notes for agents
-- `parity/` — temporary Rust-vs-TypeScript parity test harness; see
-  [AgenticHighway/vettd#642](https://github.com/AgenticHighway/vettd/issues/642)
-  for removal criteria. Do not extend this harness — it is not meant to
-  become permanent infrastructure.
 
 ## Working norms
 
@@ -133,8 +126,3 @@ cargo test
 - This crate is consumed by other repos at a pinned git revision — a
   breaking change here requires the consumer to bump its pin deliberately,
   it will not happen silently.
-- **Known gotcha:** `parity-adapter` and `parity/` are a testing tool only
-  (cross-language Rust-vs-TS output parity checks, see #642). They are not a
-  production integration path — do not treat this subprocess/JSON boundary
-  as how any real consumer (vettd-cli, the scanner suite) talks to this
-  crate in prod.

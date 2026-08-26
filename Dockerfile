@@ -1,6 +1,5 @@
 # Builds only the http-shim binary (crates/vettd-skill-scanner is a path
-# dependency of it; parity-adapter is an unrelated workspace member pulled in
-# just because cargo resolves the whole workspace manifest).
+# dependency of it).
 #
 # NOTE(vettd-scanner-suite#12): this is the seam for the future single-image
 # bundle — that image's build can COPY --from=this-image:tag
