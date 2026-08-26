@@ -1,6 +1,7 @@
 //! Output type for a single skill scan.
 
 use crate::finding::Finding;
+use crate::signal::Signal;
 
 /// The result of scanning one skill package.
 ///
@@ -16,6 +17,11 @@ pub struct SkillScanResult {
     /// If the caller computes a grade, it must do so *after* receiving this result
     /// (chain detection runs as the final step inside `scan_skill`).
     pub findings: Vec<Finding>,
+
+    /// Non-finding signals emitted by the engine (e.g. license, declared
+    /// capabilities). Travel separately from `findings`; empty for now — the
+    /// first engine-hosted signal rule (#915/#916) fills this.
+    pub signals: Vec<Signal>,
 
     /// Whether a `SKILL.md` or `skill.md` file exists at the package root.
     pub has_skill_md: bool,

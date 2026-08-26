@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION;
-use vettd_skill_scanner::{scan_skill, Finding};
+use vettd_skill_scanner::{scan_skill, Finding, Signal};
 
 // axum's Json extractor defaults to a 2 MiB request body cap, which real
 // skill directories blow past easily (e.g. pbakaus/impeccable bundles ~3 MiB
@@ -33,6 +33,10 @@ struct ScanRequest {
 #[serde(rename_all = "camelCase")]
 struct ScanResponse {
     findings: Vec<Finding>,
+    /// Non-finding signals. Omitted when empty so a zero-signal run is
+    /// byte-identical to the pre-signals response shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    signals: Vec<Signal>,
     has_skill_md: bool,
     has_scripts: bool,
     has_references: bool,
@@ -77,6 +81,7 @@ async fn scan(
         })?;
     Ok(Json(ScanResponse {
         findings: result.findings,
+        signals: result.signals,
         has_skill_md: result.has_skill_md,
         has_scripts: result.has_scripts,
         has_references: result.has_references,
@@ -172,6 +177,27 @@ mod tests {
                 "source should be omitted on the wire: {finding}"
             );
         }
+    }
+
+    // No signal rule exists yet (#915/#916 are other lanes), so every run
+    // carries an empty `signals` vector. It must be OMITTED from the response
+    // entirely — a zero-signal run stays byte-identical to the pre-signals
+    // shape so existing consumers keep parsing the same JSON.
+    #[tokio::test]
+    async fn scan_omits_signals_key_when_empty() {
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"SKILL.md": "# My Skill"},
+                "allPaths": ["SKILL.md"],
+            })))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(
+            json.get("signals").is_none(),
+            "the signals key must be ABSENT for a zero-signal run"
+        );
     }
 
     #[tokio::test]
