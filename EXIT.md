@@ -9,7 +9,7 @@ signal-emission work. This is the hand-off record for smoke testing.
 |---|---|---|---|---|
 | vettd-skill-scanner | `feat/scanner-signal-emission` | `main` | yes | `Signal` type (`crates/vettd-skill-scanner/src/signal.rs`), `SkillScanResult.signals`, HTTP shim `signals` field (omitted when empty → zero-signal runs byte-identical) |
 | vettd-scanner-suite | `feat/scanner-signal-emission` | `main` | yes | `AssetSignal` contract (`src/contract/asset-signal.ts`), `ScannerOutput.signals?` (`src/contract/scanner.ts`), vettd adapter passthrough (`src/adapters/vettd.ts`) |
-| vettd-cli | `feat/cli-scanner-field-gate` | `main` | yes | `BLOCKED.md` → now a decision record: #243 gate rule = **mechanism + recorded additive leaning**; mechanism NOT yet implemented (deferred) |
+| vettd-cli | `feat/cli-scanner-field-gate` | `main` | yes | #243 gate rule **implemented** (D4 ruling: mechanism + recorded additive leaning): `scanner-field-gate.json` manifest, `scripts/check-scanner-field-gate.sh`, CI gate step, pin documentation in `crates/vettd-cli/Cargo.toml`. Commit `4c03245` |
 
 ## Per-repo exit readiness
 
@@ -17,10 +17,11 @@ signal-emission work. This is the hand-off record for smoke testing.
   --all-targets -- -D warnings`, `cargo test`). Commits: `e59f952`, `5dcad9e`, `ad4c498`.
 - **vettd-scanner-suite — READY (YES).** CI green (`pnpm lint`, `pnpm typecheck`,
   `pnpm test` — 160 pass, `pnpm build`). Commits: `b5a50b9`, `4f11849`.
-- **vettd-cli — NOT-YET.** #243's gate rule is now DECIDED (mechanism + additive
-  leaning) but the mechanism itself is not implemented — deferred per follow-up scope
-  ("no new implementation"). The branch carries only the decision record. Smoke-testing
-  the signal path does not depend on the CLI branch.
+- **vettd-cli — READY (YES).** #243 gate mechanism implemented and pushed on
+  `feat/cli-scanner-field-gate` (commit `4c03245`): D4 ruling recorded on the issue,
+  gate enforced in CI. `cargo fmt --all --check`, `cargo clippy -- -D warnings`,
+  `cargo test` green. Smoke-testing the signal path does not depend on the CLI branch,
+  but the branch is now complete for review.
 
 ## Notes for the smoke-test pick-up
 
@@ -35,8 +36,14 @@ signal-emission work. This is the hand-off record for smoke testing.
   `origin` in vettd-skill-scanner and vettd-scanner-suite with identical trees (the
   earlier naming). Left untouched per no-branch-deletion rule; can be cleaned up by a
   human if desired.
-- **Release order:** not yet documented anywhere (remaining #925 AC). The additive
-  optional `signals` shape is forward/backward compatible: vettd deploys first or the
-  crate first, neither side breaks — but the AC wants this written down.
+- **Release order:** documented on AgenticHighway/vettd#925 (comment, satisfies the
+  remaining AC). The additive optional `signals` shape is forward/backward compatible:
+  vettd deploys first or the crate first, neither side breaks; the only constraint is
+  a real signal rule must not reach a production consumer before the ingest side that
+  persists signals is deployed.
+- **vettd-cli#243 gate:** a tag bump of the `vettd-skill-scanner` pin in
+  `vettd-cli` now fails CI unless every new `SkillScanResult` field is classified
+  (surface|gate) in `scanner-field-gate.json`. D4 ruling + implementation recorded on
+  the issue.
 - No containers or long-running processes were started by this work; shared dev
   Postgres (`vettd-wt-signals-db`) untouched.
