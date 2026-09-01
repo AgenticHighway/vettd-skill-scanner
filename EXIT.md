@@ -7,7 +7,7 @@ signal-emission work. This is the hand-off record for smoke testing.
 
 | Repo | Branch | Base | Pushed | Content |
 |---|---|---|---|---|
-| vettd-skill-scanner | `feat/scanner-signal-emission` | `main` | yes | `Signal` type (`crates/vettd-skill-scanner/src/signal.rs`), `SkillScanResult.signals`, HTTP shim `signals` field (omitted when empty → zero-signal runs byte-identical) |
+| vettd-skill-scanner | `feat/pass-one-signal-emission` | `main` | yes | `Signal` type (`crates/vettd-skill-scanner/src/signal.rs`), `SkillScanResult.signals` (emitted for every scanned asset), `SkillScanResult.coverage` attestations, HTTP shim `signals` + `coverage` fields (`coverage` omitted when empty so zero-coverage runs stay byte-identical) |
 | vettd-scanner-suite | `feat/scanner-signal-emission` | `main` | yes | `AssetSignal` contract (`src/contract/asset-signal.ts`), `ScannerOutput.signals?` (`src/contract/scanner.ts`), vettd adapter passthrough (`src/adapters/vettd.ts`) |
 | vettd-cli | `feat/cli-scanner-field-gate` | `main` | yes | #243 gate rule **implemented** (D4 ruling: mechanism + recorded additive leaning): `scanner-field-gate.json` manifest, `scripts/check-scanner-field-gate.sh`, CI gate step, pin documentation in `crates/vettd-cli/Cargo.toml`. Commit `4c03245` |
 
@@ -25,9 +25,11 @@ signal-emission work. This is the hand-off record for smoke testing.
 
 ## Notes for the smoke-test pick-up
 
-- **Zero-signal byte-identity** is the key AC to verify: a run with no signals must omit
-  the `signals` key at the shim (`skip_serializing_if = "Vec::is_empty"`) and at the
-  suite (`signals?: AssetSignal[]`, adapter only copies `body.signals` when present).
+- **Signals and coverage shape** is the key AC to verify: every scanned asset now
+  carries signals (`signals` always present on a scan), while the `coverage` key
+  stays omitted at the shim (`skip_serializing_if = "Vec::is_empty"`) until the
+  coverage channel has entries — so zero-coverage runs keep the pre-signals
+  response byte-identical.
 - **Field mapping** matches the vettd wire contract: 4 required fields `dataCategory`,
   `sourceClass`, `ruleId`, `observedAt`; everything else optional; open strings, no
   closed enums; `observedAt` survives unmodified (never converted to a Date in the

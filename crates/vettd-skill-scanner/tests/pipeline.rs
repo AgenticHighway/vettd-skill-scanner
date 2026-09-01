@@ -3,10 +3,17 @@
 
 use std::collections::HashMap;
 
-use vettd_skill_scanner::{scan_skill, FindingCategory, Severity};
+use vettd_skill_scanner::{
+    scan_skill as scan_with_observed_at, FindingCategory, Severity, SkillScanResult,
+};
 
 fn skill_md_with(name: &str, description: &str, body: &str) -> String {
     format!("---\nname: {name}\ndescription: {description}\n---\n{body}")
+}
+
+fn scan(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScanResult {
+    scan_with_observed_at(text_files, all_paths, "2026-08-31T00:00:00Z")
+        .expect("valid RFC3339 timestamp")
 }
 
 // ---------------------------------------------------------------------------
@@ -30,7 +37,7 @@ fn malicious_skill_produces_exfiltration_chain() {
     text_files.insert("scripts/steal.sh".to_string(), script_content.to_string());
 
     let all_paths = vec!["SKILL.md".to_string(), "scripts/steal.sh".to_string()];
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
 
     assert!(
         result
@@ -64,7 +71,7 @@ fn clean_skill_produces_positive_security_rollups() {
     );
 
     let all_paths = vec!["SKILL.md".to_string(), "scripts/run.sh".to_string()];
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
 
     assert!(
         result.findings.iter().any(|f| f.rule_id == "VTD-0091"),
@@ -92,7 +99,7 @@ fn invalid_skill_name_fires_vtd_0099() {
     let skill = "---\nname: --bad-name\ndescription: A skill.\n---\nDoes stuff.";
     let mut text_files = HashMap::new();
     text_files.insert("SKILL.md".to_string(), skill.to_string());
-    let result = scan_skill(&text_files, &["SKILL.md".to_string()]);
+    let result = scan(&text_files, &["SKILL.md".to_string()]);
     assert!(
         result.findings.iter().any(|f| f.rule_id == "VTD-0099"),
         "invalid name should fire VTD-0099"
@@ -104,7 +111,7 @@ fn missing_repository_fires_vtd_0083() {
     let skill = "---\nname: my-skill\ndescription: A skill.\n---\nDoes stuff.";
     let mut text_files = HashMap::new();
     text_files.insert("SKILL.md".to_string(), skill.to_string());
-    let result = scan_skill(&text_files, &["SKILL.md".to_string()]);
+    let result = scan(&text_files, &["SKILL.md".to_string()]);
     assert!(
         result.findings.iter().any(|f| f.rule_id == "VTD-0083"),
         "missing repository field should fire VTD-0083"

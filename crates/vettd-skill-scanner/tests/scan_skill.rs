@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use vettd_skill_scanner::{scan_skill, FindingCategory, Severity};
+use vettd_skill_scanner::{
+    scan_skill as scan_with_observed_at, FindingCategory, Severity, SkillScanResult,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -49,27 +51,32 @@ fn with_evals() -> (HashMap<String, String>, Vec<String>) {
     (text_files, all_paths)
 }
 
+fn scan(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScanResult {
+    scan_with_observed_at(text_files, all_paths, "2026-08-31T00:00:00Z")
+        .expect("valid RFC3339 timestamp")
+}
+
 // ---------------------------------------------------------------------------
 // Structural flag tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn no_skill_md_sets_flag_false() {
-    let result = scan_skill(&HashMap::new(), &[]);
+    let result = scan(&HashMap::new(), &[]);
     assert!(!result.has_skill_md);
 }
 
 #[test]
 fn skill_md_in_text_files_sets_flag_true() {
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     assert!(result.has_skill_md);
 }
 
 #[test]
 fn skill_md_in_all_paths_only_sets_flag_true() {
     // SKILL.md may be detected from all_paths even if content was not read.
-    let result = scan_skill(&HashMap::new(), &["SKILL.md".to_string()]);
+    let result = scan(&HashMap::new(), &["SKILL.md".to_string()]);
     assert!(result.has_skill_md);
 }
 
@@ -77,7 +84,7 @@ fn skill_md_in_all_paths_only_sets_flag_true() {
 fn scripts_dir_detected_from_all_paths() {
     let (text_files, mut all_paths) = with_skill_md();
     all_paths.push("scripts/deploy.sh".to_string());
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     assert!(result.has_scripts);
 }
 
@@ -85,14 +92,14 @@ fn scripts_dir_detected_from_all_paths() {
 fn references_dir_detected() {
     let (text_files, mut all_paths) = with_skill_md();
     all_paths.push("references/guide.md".to_string());
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     assert!(result.has_references);
 }
 
 #[test]
 fn evals_dir_detected() {
     let (text_files, all_paths) = with_evals();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     assert!(result.has_evals);
 }
 
@@ -100,7 +107,7 @@ fn evals_dir_detected() {
 fn file_count_reflects_all_paths_length() {
     let (text_files, all_paths) = with_skill_md();
     let n = all_paths.len();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     assert_eq!(result.file_count, n);
 }
 
@@ -112,7 +119,7 @@ fn file_count_reflects_all_paths_length() {
 fn missing_skill_md_emits_critical_structure_finding() {
     // Without SKILL.md, the skill is malformed — scanner must flag it critical
     // so the grade formula produces F.
-    let result = scan_skill(&HashMap::new(), &[]);
+    let result = scan(&HashMap::new(), &[]);
     let f = result
         .findings
         .iter()
@@ -127,7 +134,7 @@ fn missing_skill_md_emits_critical_structure_finding() {
 #[test]
 fn present_skill_md_emits_info_structure_finding() {
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     let f = result
         .findings
         .iter()
@@ -145,7 +152,7 @@ fn present_skill_md_emits_info_structure_finding() {
 #[test]
 fn findings_span_multiple_categories() {
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
 
     let categories: std::collections::HashSet<String> = result
         .findings
@@ -172,12 +179,12 @@ fn findings_span_multiple_categories() {
 fn findings_span_multiple_severities() {
     // A well-formed skill produces info-only findings.
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     let has_info = result.findings.iter().any(|f| f.severity == Severity::Info);
     assert!(has_info, "missing info findings");
 
     // A skill with no SKILL.md must produce a critical finding.
-    let bad = scan_skill(&HashMap::new(), &[]);
+    let bad = scan(&HashMap::new(), &[]);
     let has_critical = bad
         .findings
         .iter()
@@ -191,7 +198,7 @@ fn findings_span_multiple_severities() {
 #[test]
 fn scripts_category_present_when_scripts_dir_exists() {
     let (text_files, all_paths) = with_scripts();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     let has_scripts_finding = result
         .findings
         .iter()
@@ -205,7 +212,7 @@ fn scripts_category_present_when_scripts_dir_exists() {
 #[test]
 fn evals_category_present_when_evals_dir_exists() {
     let (text_files, all_paths) = with_evals();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     let has_evals_finding = result
         .findings
         .iter()
@@ -223,7 +230,7 @@ fn evals_category_present_when_evals_dir_exists() {
 #[test]
 fn empty_inputs_returns_well_formed_result() {
     // 0-files edge case: scanner must not panic and must return a valid result.
-    let result = scan_skill(&HashMap::new(), &[]);
+    let result = scan(&HashMap::new(), &[]);
     assert!(!result.has_skill_md);
     assert!(!result.has_scripts);
     assert!(!result.has_references);
@@ -237,7 +244,7 @@ fn empty_inputs_returns_well_formed_result() {
 fn all_findings_have_non_empty_label_and_detail() {
     // Guard that no finding slips through with blank display text.
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     for f in &result.findings {
         assert!(!f.label.is_empty(), "finding has empty label: {:?}", f);
         assert!(!f.detail.is_empty(), "finding has empty detail: {:?}", f);
@@ -247,7 +254,7 @@ fn all_findings_have_non_empty_label_and_detail() {
 #[test]
 fn all_findings_have_valid_source() {
     let (text_files, all_paths) = with_skill_md();
-    let result = scan_skill(&text_files, &all_paths);
+    let result = scan(&text_files, &all_paths);
     for f in &result.findings {
         assert!(!f.source.is_empty(), "finding has empty source: {:?}", f);
     }

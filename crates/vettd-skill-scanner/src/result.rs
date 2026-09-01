@@ -1,5 +1,6 @@
 //! Output type for a single skill scan.
 
+use crate::coverage::CoverageEntry;
 use crate::finding::Finding;
 use crate::signal::Signal;
 
@@ -22,6 +23,10 @@ pub struct SkillScanResult {
     /// capabilities). Travel separately from `findings`; empty for now — the
     /// first engine-hosted signal rule (#915/#916) fills this.
     pub signals: Vec<Signal>,
+
+    /// Scan attestations and coverage notices. These describe the analysis,
+    /// rather than the asset, so they never travel in `findings` or `signals`.
+    pub coverage: Vec<CoverageEntry>,
 
     /// Whether a `SKILL.md` or `skill.md` file exists at the package root.
     pub has_skill_md: bool,
