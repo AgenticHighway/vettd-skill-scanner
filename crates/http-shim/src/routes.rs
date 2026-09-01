@@ -11,8 +11,10 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION;
-use vettd_skill_scanner::{scan_skill, Finding, Signal};
+use vettd_skill_scanner::{scan_skill, CoverageEntry, Finding, Signal};
 
 // axum's Json extractor defaults to a 2 MiB request body cap, which real
 // skill directories blow past easily (e.g. pbakaus/impeccable bundles ~3 MiB
@@ -37,6 +39,10 @@ struct ScanResponse {
     /// byte-identical to the pre-signals response shape.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     signals: Vec<Signal>,
+    /// Coverage and attestation facts about the scanner run, omitted when
+    /// empty so existing response bytes remain unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    coverage: Vec<CoverageEntry>,
     has_skill_md: bool,
     has_scripts: bool,
     has_references: bool,
@@ -68,20 +74,26 @@ async fn scan(
     // scan_skill is CPU-bound and infallible by signature; spawn_blocking
     // keeps the runtime responsive and converts a panic into a JoinError,
     // which becomes a clean 500 instead of a hung connection.
-    let result = tokio::task::spawn_blocking(move || scan_skill(&req.text_files, &req.all_paths))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    ok: false,
-                    error: format!("scan panicked: {e}"),
-                }),
-            )
-        })?;
+    let observed_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting does not fail for UTC timestamps");
+    let result = tokio::task::spawn_blocking(move || {
+        scan_skill(&req.text_files, &req.all_paths, &observed_at)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                ok: false,
+                error: format!("scan panicked: {e}"),
+            }),
+        )
+    })?;
     Ok(Json(ScanResponse {
         findings: result.findings,
         signals: result.signals,
+        coverage: result.coverage,
         has_skill_md: result.has_skill_md,
         has_scripts: result.has_scripts,
         has_references: result.has_references,
@@ -179,12 +191,8 @@ mod tests {
         }
     }
 
-    // No signal rule exists yet (#915/#916 are other lanes), so every run
-    // carries an empty `signals` vector. It must be OMITTED from the response
-    // entirely — a zero-signal run stays byte-identical to the pre-signals
-    // shape so existing consumers keep parsing the same JSON.
     #[tokio::test]
-    async fn scan_omits_signals_key_when_empty() {
+    async fn scan_emits_signals_for_every_asset() {
         let response = router()
             .oneshot(scan_request(serde_json::json!({
                 "textFiles": {"SKILL.md": "# My Skill"},
@@ -195,8 +203,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert!(
-            json.get("signals").is_none(),
-            "the signals key must be ABSENT for a zero-signal run"
+            json["signals"].is_array(),
+            "every scanned asset has signals"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_omits_coverage_key_when_empty() {
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"config.txt": "api_key = \"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX\""},
+                "allPaths": ["config.txt"],
+            })))
+            .await
+            .expect("response");
+        let json = body_json(response).await;
+        assert!(
+            json.get("coverage").is_none(),
+            "the coverage key must be absent when the scanner produced none"
         );
     }
 

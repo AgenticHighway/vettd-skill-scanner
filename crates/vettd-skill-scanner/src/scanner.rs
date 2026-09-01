@@ -13,6 +13,9 @@ use crate::consts::{
     DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES, EVAL_JSON_CANDIDATES,
     SKILL_MD_BODY_MAX_LINES,
 };
+use crate::emission::{
+    coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
+};
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
@@ -32,6 +35,8 @@ use crate::skill_md::{parse_skill_md, ParsedSkillMd};
 ///   appear in `all_paths`.
 /// - `all_paths` — complete list of normalized relative paths in the package,
 ///   including binary files. Used for structural presence checks.
+/// - `observed_at` — caller-supplied RFC3339 time at which this bundle was
+///   observed. Signals carry it unmodified; the pure scanner never reads a clock.
 ///
 /// This function performs no filesystem I/O. The caller is responsible for
 /// loading files from disk (or a zip, or a network source) and building the
@@ -42,7 +47,11 @@ use crate::skill_md::{parse_skill_md, ParsedSkillMd};
 /// Chain detection runs as the final internal step and may mutate `severity` on
 /// existing findings. The returned `SkillScanResult.findings` slice already
 /// reflects any chain-detection mutations; callers must not reorder this step.
-pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScanResult {
+pub fn scan_skill(
+    text_files: &HashMap<String, String>,
+    all_paths: &[String],
+    observed_at: &str,
+) -> SkillScanResult {
     let mut findings: Vec<Finding> = Vec::new();
 
     // ── Structural presence flags ────────────────────────────────────────────
@@ -78,7 +87,30 @@ pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) ->
         };
     }
 
+    let skill_key = if text_files.contains_key("SKILL.md") {
+        "SKILL.md"
+    } else {
+        "skill.md"
+    };
+    let parsed = text_files
+        .get(skill_key)
+        .map(|content| parse_skill_md(content))
+        .unwrap_or_else(|| ParsedSkillMd {
+            name: "unknown".to_string(),
+            description: String::new(),
+            repository: String::new(),
+            frontmatter: yaml_rust2::Yaml::BadValue,
+            body: String::new(),
+        });
+
     // ── Structure checks ─────────────────────────────────────────────────────
+    //
+    // #941 audit: existing info findings remain during the migration to the
+    // dedicated coverage channel. VTD-0091/0092/0093/0099-pass are attestations
+    // and are also emitted as coverage entries below. VTD-0095–0098 and VTD-0118
+    // are structural coverage notices already represented by result flags. The
+    // remaining info findings are neutral quality notices. Do not delete any of
+    // these findings until downstream coverage wiring is validated.
 
     findings.push(if has_skill_md {
         f!(
@@ -155,22 +187,6 @@ pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) ->
     // ── SKILL.md-gated checks ────────────────────────────────────────────────
 
     if has_skill_md {
-        let skill_key = if text_files.contains_key("SKILL.md") {
-            "SKILL.md"
-        } else {
-            "skill.md"
-        };
-        let parsed = text_files
-            .get(skill_key)
-            .map(|c| parse_skill_md(c))
-            .unwrap_or_else(|| ParsedSkillMd {
-                name: "unknown".to_string(),
-                description: String::new(),
-                repository: String::new(),
-                frontmatter: yaml_rust2::Yaml::BadValue,
-                body: String::new(),
-            });
-
         check_typosquat(&parsed.name, &mut findings);
 
         if let Some(err) = validate_name(&parsed.name) {
@@ -817,23 +833,21 @@ pub fn scan_skill(text_files: &HashMap<String, String>, all_paths: &[String]) ->
     detect_exfiltration_chains(&mut findings, text_files);
     detect_malicious_activity_chains(&mut findings);
     let description_for_mismatch = if has_skill_md {
-        let key = if text_files.contains_key("SKILL.md") {
-            "SKILL.md"
-        } else {
-            "skill.md"
-        };
-        text_files
-            .get(key)
-            .map(|c| parse_skill_md(c).description)
-            .unwrap_or_default()
+        parsed.description.clone()
     } else {
         String::new()
     };
     check_description_behavior_mismatch(&description_for_mismatch, &mut findings);
 
+    let clean_internal_references = has_internal_references(&parsed.body)
+        && !has_unresolvable_internal_references(&parsed.body, all_paths);
+    let signals = emit_signals(&parsed, all_paths, observed_at);
+    let coverage = coverage_entries(&findings, clean_internal_references);
+
     SkillScanResult {
         findings,
-        signals: Vec::new(),
+        signals,
+        coverage,
         has_skill_md,
         has_scripts,
         has_references,
