@@ -13,6 +13,7 @@ fn skill_md_with(name: &str, description: &str, body: &str) -> String {
 
 fn scan(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScanResult {
     scan_with_observed_at(text_files, all_paths, "2026-08-31T00:00:00Z")
+        .expect("valid RFC3339 timestamp")
 }
 
 // ---------------------------------------------------------------------------

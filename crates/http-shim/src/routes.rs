@@ -11,10 +11,8 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 use vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION;
-use vettd_skill_scanner::{scan_skill, CoverageEntry, Finding, Signal};
+use vettd_skill_scanner::{now_utc_rfc3339, scan_skill, CoverageEntry, Finding, Signal};
 
 // axum's Json extractor defaults to a 2 MiB request body cap, which real
 // skill directories blow past easily (e.g. pbakaus/impeccable bundles ~3 MiB
@@ -71,12 +69,11 @@ async fn health() -> Json<serde_json::Value> {
 async fn scan(
     Json(req): Json<ScanRequest>,
 ) -> Result<Json<ScanResponse>, (StatusCode, Json<ErrorBody>)> {
-    // scan_skill is CPU-bound and infallible by signature; spawn_blocking
-    // keeps the runtime responsive and converts a panic into a JoinError,
-    // which becomes a clean 500 instead of a hung connection.
-    let observed_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .expect("RFC3339 formatting does not fail for UTC timestamps");
+    // scan_skill is CPU-bound; spawn_blocking keeps the runtime responsive and
+    // converts a panic into a JoinError, which becomes a clean 500 instead of
+    // a hung connection. The timestamp the shim supplies is always valid, so
+    // the inner ScanError arm is defensive only.
+    let observed_at = now_utc_rfc3339();
     let result = tokio::task::spawn_blocking(move || {
         scan_skill(&req.text_files, &req.all_paths, &observed_at)
     })
@@ -87,6 +84,15 @@ async fn scan(
             Json(ErrorBody {
                 ok: false,
                 error: format!("scan panicked: {e}"),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                ok: false,
+                error: format!("scan failed: {e}"),
             }),
         )
     })?;

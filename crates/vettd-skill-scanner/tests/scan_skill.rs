@@ -53,6 +53,7 @@ fn with_evals() -> (HashMap<String, String>, Vec<String>) {
 
 fn scan(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScanResult {
     scan_with_observed_at(text_files, all_paths, "2026-08-31T00:00:00Z")
+        .expect("valid RFC3339 timestamp")
 }
 
 // ---------------------------------------------------------------------------

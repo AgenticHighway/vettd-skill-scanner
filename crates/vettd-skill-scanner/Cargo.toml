@@ -13,3 +13,6 @@ regex = { workspace = true }
 base64 = { workspace = true }
 yaml-rust2 = { workspace = true }
 tiktoken-rs = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

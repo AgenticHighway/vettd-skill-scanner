@@ -9,6 +9,7 @@ use yaml_rust2::Yaml;
 
 use crate::consts::DEFAULT_SOURCE;
 use crate::coverage::CoverageEntry;
+use crate::finding::Severity;
 use crate::language::language_for_path;
 use crate::signal::Signal;
 use crate::signal_rules::*;
@@ -21,7 +22,22 @@ pub(crate) fn emit_signals(
     all_paths: &[String],
     observed_at: &str,
 ) -> Vec<Signal> {
-    let mut signals = vec![
+    let mut signals = emit_scalar_signals(parsed, all_paths, observed_at);
+    signals.extend(emit_declared_claims(parsed, observed_at));
+    signals.extend(internal_reference_signal(
+        &parsed.body,
+        all_paths,
+        observed_at,
+    ));
+    signals
+}
+
+fn emit_scalar_signals(
+    parsed: &ParsedSkillMd,
+    all_paths: &[String],
+    observed_at: &str,
+) -> Vec<Signal> {
+    vec![
         fact(
             DECLARED_LICENSE,
             "Declared license",
@@ -36,100 +52,103 @@ pub(crate) fn emit_signals(
             scalar(&parsed.frontmatter, "compatibility"),
             observed_at,
         ),
-    ];
-
-    signals.extend(list_claims(
-        DECLARED_EXTERNAL_SERVICES,
-        "Declared external service",
-        "declared_external_service",
-        FRONTMATTER_DECLARED_SERVICES,
-        values_for_keys(
-            &parsed.frontmatter,
-            &["services", "external-services", "external_services"],
-        ),
-        observed_at,
-    ));
-    signals.extend(list_claims(
-        DECLARED_REQUIRED_TOOLS,
-        "Declared required tool",
-        "declared_tool",
-        FRONTMATTER_ALLOWED_TOOLS,
-        declared_tools(&parsed.frontmatter),
-        observed_at,
-    ));
-    signals.extend(list_claims(
-        DECLARED_MCP_SERVERS,
-        "Declared MCP server",
-        "declared_mcp_server",
-        FRONTMATTER_MCP_DECLARATIONS,
-        values_for_keys(
-            &parsed.frontmatter,
-            &["mcp", "mcp-servers", "mcp_servers", "mcpServers"],
-        ),
-        observed_at,
-    ));
-    signals.extend(list_claims(
-        DECLARED_HARNESS_TARGETS,
-        "Declared harness target",
-        "declared_harness_target",
-        FRONTMATTER_HARNESS_DECLARATIONS,
-        yaml_values(&parsed.frontmatter["metadata"]["surface"]),
-        observed_at,
-    ));
-    signals.extend(list_claims(
-        DECLARED_NAME,
-        "Declared skill name",
-        "declared_skill_name",
-        FRONTMATTER_NAME,
-        non_unknown_name(&parsed.name),
-        observed_at,
-    ));
-
-    signals.extend(unresolvable_internal_references(
-        &parsed.body,
-        all_paths,
-        observed_at,
-    ));
-    signals
+    ]
 }
+
+fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal> {
+    let claims: [(&str, &str, &str, &str, Vec<String>); 5] = [
+        (
+            DECLARED_EXTERNAL_SERVICES,
+            "Declared external service",
+            "declared_external_service",
+            FRONTMATTER_DECLARED_SERVICES,
+            declared_external_services(&parsed.frontmatter),
+        ),
+        (
+            DECLARED_REQUIRED_TOOLS,
+            "Declared required tool",
+            "declared_tool",
+            FRONTMATTER_ALLOWED_TOOLS,
+            declared_tools(&parsed.frontmatter),
+        ),
+        (
+            DECLARED_MCP_SERVERS,
+            "Declared MCP server",
+            "declared_mcp_server",
+            FRONTMATTER_MCP_DECLARATIONS,
+            values_for_keys(
+                &parsed.frontmatter,
+                &["mcp", "mcp-servers", "mcp_servers", "mcpServers"],
+            ),
+        ),
+        (
+            DECLARED_HARNESS_TARGETS,
+            "Declared harness target",
+            "declared_harness_target",
+            FRONTMATTER_HARNESS_DECLARATIONS,
+            yaml_values(&parsed.frontmatter["metadata"]["surface"]),
+        ),
+        (
+            DECLARED_NAME,
+            "Declared skill name",
+            "declared_skill_name",
+            FRONTMATTER_NAME,
+            declared_name(parsed),
+        ),
+    ];
+    claims
+        .into_iter()
+        .flat_map(|(rule_id, label, related_type, method, values)| {
+            list_claims(rule_id, label, related_type, method, values, observed_at)
+        })
+        .collect()
+}
+
+/// Attestation entries for the four absence checks whose pass finding is
+/// already an `Info` finding. `#941` audit: these are emitted on the coverage
+/// channel (they describe the analysis, not the asset) and are duplicated by
+/// the existing findings only until the findings are removed in a follow-up.
+const ATTESTATIONS: [(&str, &str, &str); 4] = [
+    (
+        "VTD-0091",
+        "Secrets scan passed",
+        "No secrets or unsafe code patterns were detected.",
+    ),
+    (
+        "VTD-0092",
+        "Behavioral scan passed",
+        "No prompt-injection or jailbreak signals were detected.",
+    ),
+    (
+        "VTD-0093",
+        "External URL scan passed",
+        "No external URLs were found in scanned skill text.",
+    ),
+    (
+        "VTD-0099",
+        "Name validation passed",
+        "The declared skill name follows the supported naming rules.",
+    ),
+];
 
 pub(crate) fn coverage_entries(
     findings: &[crate::finding::Finding],
     clean_internal_references: bool,
 ) -> Vec<CoverageEntry> {
-    if findings.iter().any(|finding| {
-        finding.rule_id == "VTD-0095" && finding.severity == crate::finding::Severity::Critical
-    }) {
+    if findings
+        .iter()
+        .any(|finding| finding.rule_id == "VTD-0095" && finding.severity == Severity::Critical)
+    {
         // A package without its required definition is not a completed skill
         // scan. Do not attest partial checks or emit coverage for it.
         return Vec::new();
     }
     let mut entries = Vec::new();
-    for (rule_id, label, detail) in [
-        (
-            "VTD-0091",
-            "Secrets scan passed",
-            "No secrets or unsafe code patterns were detected.",
-        ),
-        (
-            "VTD-0092",
-            "Behavioral scan passed",
-            "No prompt-injection or jailbreak signals were detected.",
-        ),
-        (
-            "VTD-0093",
-            "External URL scan passed",
-            "No external URLs were found in scanned skill text.",
-        ),
-        (
-            "VTD-0099",
-            "Name validation passed",
-            "The declared skill name follows the supported naming rules.",
-        ),
-    ] {
-        if findings.iter().any(|finding| {
-            finding.rule_id == rule_id && finding.severity == crate::finding::Severity::Info
-        }) {
+    for (rule_id, label, detail) in ATTESTATIONS {
+        if findings
+            .iter()
+            .any(|finding| finding.rule_id == rule_id && finding.severity == Severity::Info)
+        {
             entries.push(CoverageEntry {
                 kind: "attestation".to_string(),
                 rule_id: rule_id.to_string(),
@@ -249,17 +268,8 @@ fn list_claims(
         .collect()
 }
 
-fn unresolvable_internal_references(
-    body: &str,
-    all_paths: &[String],
-    observed_at: &str,
-) -> Vec<Signal> {
-    let referenced = internal_references(body);
-    let available: BTreeSet<&str> = all_paths.iter().map(String::as_str).collect();
-    let missing: Vec<String> = referenced
-        .into_iter()
-        .filter(|path| !available.contains(path.as_str()))
-        .collect();
+fn internal_reference_signal(body: &str, all_paths: &[String], observed_at: &str) -> Vec<Signal> {
+    let missing = missing_internal_references(body, all_paths);
     if missing.is_empty() {
         return Vec::new();
     }
@@ -277,8 +287,19 @@ fn unresolvable_internal_references(
     }]
 }
 
+/// Paths referenced in the SKILL.md body under `references/`, `scripts/`, or
+/// `assets/` that are absent from `all_paths`, in deterministic order.
+pub(crate) fn missing_internal_references(body: &str, all_paths: &[String]) -> Vec<String> {
+    let referenced = internal_references(body);
+    let available: BTreeSet<&str> = all_paths.iter().map(String::as_str).collect();
+    referenced
+        .into_iter()
+        .filter(|path| !available.contains(path.as_str()))
+        .collect()
+}
+
 pub(crate) fn has_unresolvable_internal_references(body: &str, all_paths: &[String]) -> bool {
-    !unresolvable_internal_references(body, all_paths, "").is_empty()
+    !missing_internal_references(body, all_paths).is_empty()
 }
 
 pub(crate) fn has_internal_references(body: &str) -> bool {
@@ -292,7 +313,18 @@ fn internal_references(body: &str) -> Vec<String> {
             .expect("valid internal-reference regex")
     });
     re.find_iter(body)
-        .map(|matched| matched.as_str().trim_end_matches('/').to_string())
+        .map(|matched| {
+            matched
+                .as_str()
+                .trim_end_matches('/')
+                .trim_end_matches(|c: char| {
+                    matches!(
+                        c,
+                        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+                    )
+                })
+                .to_string()
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -308,6 +340,42 @@ fn values_for_keys(frontmatter: &Yaml, keys: &[&str]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Declared external service dependencies from every recognized source:
+/// dedicated `services` keys and `required_environment_variables` names.
+fn declared_external_services(frontmatter: &Yaml) -> Vec<String> {
+    let mut services = values_for_keys(
+        frontmatter,
+        &["services", "external-services", "external_services"],
+    );
+    services.extend(env_var_names(frontmatter));
+    services
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Names from `required_environment_variables`, a list of maps each carrying a
+/// `name` field (e.g. an API token the skill needs). Bare string entries are
+/// accepted too.
+fn env_var_names(frontmatter: &Yaml) -> Vec<String> {
+    let value = &frontmatter["required_environment_variables"];
+    match value {
+        Yaml::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Yaml::Hash(_) => yaml_scalar(&item["name"]),
+                other => yaml_scalar(other),
+            })
+            .filter(|name| !name.is_empty())
+            .collect(),
+        value => yaml_scalar(value)
+            .filter(|name| !name.is_empty())
+            .into_iter()
+            .collect(),
+    }
 }
 
 fn declared_tools(frontmatter: &Yaml) -> Vec<String> {
@@ -329,10 +397,24 @@ fn yaml_values(value: &Yaml) -> Vec<String> {
             .filter_map(yaml_scalar)
             .filter(|value| !value.is_empty())
             .collect(),
+        // Map-shaped declarations: the keys are the declared items (e.g.
+        // `services: {stripe: true, sentry: false}`).
+        Yaml::Hash(_) => yaml_keys(value),
         value => yaml_scalar(value)
             .filter(|value| !value.is_empty())
             .into_iter()
             .collect(),
+    }
+}
+
+fn yaml_keys(value: &Yaml) -> Vec<String> {
+    match value {
+        Yaml::Hash(map) => map
+            .keys()
+            .filter_map(yaml_scalar)
+            .filter(|key| !key.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -378,6 +460,20 @@ fn push_tool(values: &mut Vec<String>, current: &mut String) {
         values.push(value.to_string());
     }
     current.clear();
+}
+
+/// The declared skill name, emitted as a claim row. Key presence in real
+/// frontmatter is authoritative — even a literal `"unknown"` is a declared
+/// name. Only the lenient (invalid-YAML) fallback treats the `"unknown"`
+/// sentinel as "absent".
+fn declared_name(parsed: &ParsedSkillMd) -> Vec<String> {
+    if matches!(parsed.frontmatter, Yaml::Hash(_)) {
+        return yaml_scalar(&parsed.frontmatter["name"])
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect();
+    }
+    non_unknown_name(&parsed.name)
 }
 
 fn non_unknown_name(name: &str) -> Vec<String> {

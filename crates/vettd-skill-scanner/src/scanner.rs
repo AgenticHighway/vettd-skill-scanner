@@ -26,6 +26,32 @@ use crate::skill_md::body::{
 use crate::skill_md::validate::validate_name;
 use crate::skill_md::{parse_skill_md, ParsedSkillMd};
 
+/// Error returned when a scan cannot be performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+    /// The caller-supplied `observed_at` is not a valid RFC 3339 timestamp.
+    ///
+    /// The value is copied onto every emitted signal, where a malformed value
+    /// would fail validation of the entire scanner job response. The shim
+    /// supplies its own valid timestamp; a first-party CLI supplies its own.
+    InvalidObservedAt(String),
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanError::InvalidObservedAt(value) => {
+                write!(
+                    f,
+                    "observed_at is not a valid RFC 3339 timestamp: {value:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
 /// Scan a single skill package and return findings.
 ///
 /// # Arguments
@@ -51,7 +77,10 @@ pub fn scan_skill(
     text_files: &HashMap<String, String>,
     all_paths: &[String],
     observed_at: &str,
-) -> SkillScanResult {
+) -> Result<SkillScanResult, ScanError> {
+    if !crate::rfc3339::is_valid_rfc3339(observed_at) {
+        return Err(ScanError::InvalidObservedAt(observed_at.to_string()));
+    }
     let mut findings: Vec<Finding> = Vec::new();
 
     // ── Structural presence flags ────────────────────────────────────────────
@@ -844,7 +873,7 @@ pub fn scan_skill(
     let signals = emit_signals(&parsed, all_paths, observed_at);
     let coverage = coverage_entries(&findings, clean_internal_references);
 
-    SkillScanResult {
+    Ok(SkillScanResult {
         findings,
         signals,
         coverage,
@@ -853,5 +882,5 @@ pub fn scan_skill(
         has_references,
         has_evals,
         file_count: all_paths.len(),
-    }
+    })
 }
