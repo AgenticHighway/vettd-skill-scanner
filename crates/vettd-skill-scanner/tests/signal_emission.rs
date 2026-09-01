@@ -101,31 +101,101 @@ fn list_claims_emit_items_or_exactly_one_zero_marker() {
 }
 
 #[test]
-fn external_services_read_env_vars_and_map_shaped_declarations() {
+fn service_keys_stay_services_and_env_var_names_are_a_separate_rule() {
     let result = scan(
         "---\nname: svc\nservices:\n  stripe: true\n  sentry: false\nrequired_environment_variables:\n  - name: USDA_API_KEY\n    prompt: USDA key\n  - name: SHOPIFY_ACCESS_TOKEN\n    required_for: checkout\n---\nUse it.",
         &["SKILL.md"],
     );
-    let rows: Vec<_> = result
+    let services: Vec<_> = result
         .signals
         .iter()
         .filter(|signal| signal.rule_id == "cost/declared-external-services")
         .collect();
-    assert_eq!(rows.len(), 4, "map keys and env var names are all items");
-    let ids: Vec<_> = rows
+    assert_eq!(
+        services.len(),
+        2,
+        "map-shaped service keys are the only external-service items"
+    );
+    let service_ids: Vec<_> = services
         .iter()
         .map(|signal| signal.related_id.as_deref().unwrap_or_default())
         .collect();
-    for expected in ["stripe", "sentry", "USDA_API_KEY", "SHOPIFY_ACCESS_TOKEN"] {
+    for expected in ["stripe", "sentry"] {
         assert!(
-            ids.contains(&expected),
+            service_ids.contains(&expected),
             "missing declared service {expected}"
         );
     }
-    assert!(rows.iter().all(|signal| {
+    assert!(services.iter().all(|signal| {
         signal.related_type.as_deref() == Some("declared_external_service")
+            && signal.method.as_deref() == Some("frontmatter-declared-services")
             && signal.value_num == Some(1.0)
     }));
+
+    let env_vars: Vec<_> = result
+        .signals
+        .iter()
+        .filter(|signal| signal.rule_id == "cost/declared-required-env-vars")
+        .collect();
+    assert_eq!(
+        env_vars.len(),
+        2,
+        "required_environment_variables names land on their own rule"
+    );
+    let env_ids: Vec<_> = env_vars
+        .iter()
+        .map(|signal| signal.related_id.as_deref().unwrap_or_default())
+        .collect();
+    for expected in ["USDA_API_KEY", "SHOPIFY_ACCESS_TOKEN"] {
+        assert!(
+            env_ids.contains(&expected),
+            "missing declared required env var {expected}"
+        );
+    }
+    assert!(env_vars.iter().all(|signal| {
+        signal.related_type.as_deref() == Some("declared_required_env_var")
+            && signal.method.as_deref() == Some("frontmatter-required-env-vars")
+            && signal.value_num == Some(1.0)
+    }));
+}
+
+#[test]
+fn runtime_env_vars_are_required_env_vars_not_external_services() {
+    // DEBUG and OUTPUT_DIR are environment knobs the skill reads, not external
+    // services the cost model bills against — they must never surface under
+    // cost/declared-external-services.
+    let result = scan(
+        "---\nname: svc\nservices: [stripe]\nrequired_environment_variables:\n  - name: DEBUG\n  - name: OUTPUT_DIR\n---\nUse it.",
+        &["SKILL.md"],
+    );
+    let service_ids: Vec<_> = result
+        .signals
+        .iter()
+        .filter(|signal| signal.rule_id == "cost/declared-external-services")
+        .map(|signal| signal.related_id.as_deref().unwrap_or_default())
+        .collect();
+    assert_eq!(service_ids, vec!["stripe"]);
+    assert!(
+        !service_ids.iter().any(|id| *id == "DEBUG"),
+        "DEBUG is an env var, not an external service"
+    );
+    assert!(
+        !service_ids.iter().any(|id| *id == "OUTPUT_DIR"),
+        "OUTPUT_DIR is an env var, not an external service"
+    );
+
+    let env_var_ids: Vec<_> = result
+        .signals
+        .iter()
+        .filter(|signal| signal.rule_id == "cost/declared-required-env-vars")
+        .map(|signal| signal.related_id.as_deref().unwrap_or_default())
+        .collect();
+    for expected in ["DEBUG", "OUTPUT_DIR"] {
+        assert!(
+            env_var_ids.contains(&expected),
+            "missing declared required env var {expected}"
+        );
+    }
 }
 
 #[test]

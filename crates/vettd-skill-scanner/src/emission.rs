@@ -56,13 +56,20 @@ fn emit_scalar_signals(
 }
 
 fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal> {
-    let claims: [(&str, &str, &str, &str, Vec<String>); 5] = [
+    let claims: [(&str, &str, &str, &str, Vec<String>); 6] = [
         (
             DECLARED_EXTERNAL_SERVICES,
             "Declared external service",
             "declared_external_service",
             FRONTMATTER_DECLARED_SERVICES,
             declared_external_services(&parsed.frontmatter),
+        ),
+        (
+            DECLARED_REQUIRED_ENV_VARS,
+            "Declared required environment variable",
+            "declared_required_env_var",
+            FRONTMATTER_REQUIRED_ENV_VARS,
+            env_var_names(&parsed.frontmatter),
         ),
         (
             DECLARED_REQUIRED_TOOLS,
@@ -372,24 +379,20 @@ fn values_for_keys(frontmatter: &Yaml, keys: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Declared external service dependencies from every recognized source:
-/// dedicated `services` keys and `required_environment_variables` names.
+/// Declared external service dependencies from explicit `services`-family
+/// frontmatter keys only. `required_environment_variables` names are a separate
+/// claim emitted under `cost/declared-required-env-vars` — an env var a skill
+/// needs is not itself an external service the cost model bills against.
 fn declared_external_services(frontmatter: &Yaml) -> Vec<String> {
-    let mut services = values_for_keys(
+    values_for_keys(
         frontmatter,
         &["services", "external-services", "external_services"],
-    );
-    services.extend(env_var_names(frontmatter));
-    services
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    )
 }
 
 /// Names from `required_environment_variables`, a list of maps each carrying a
 /// `name` field (e.g. an API token the skill needs). Bare string entries are
-/// accepted too.
+/// accepted too. Emitted as `cost/declared-required-env-vars` items.
 fn env_var_names(frontmatter: &Yaml) -> Vec<String> {
     let value = &frontmatter["required_environment_variables"];
     match value {
