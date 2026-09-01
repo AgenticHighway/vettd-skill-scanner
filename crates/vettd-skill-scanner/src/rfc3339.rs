@@ -52,17 +52,21 @@ pub fn now_utc_rfc3339() -> String {
 /// validation of the entire scanner job response. This is a boundary guard,
 /// not a parser — it rejects empty and clearly-invalid strings while
 /// accepting anything the shim (or a first-party CLI) produces.
+///
+/// The check is calendar-aware: the day must exist in the actual month of the
+/// given year (leap years included), and the UTC offset must fall within the
+/// RFC 3339 `time-numoffset` range (hours 00-23, minutes 00-59).
 pub fn is_valid_rfc3339(value: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+        Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$")
             .expect("valid RFC3339 regex")
     });
     if !re.is_match(value) || value.len() < 19 {
         return false;
     }
     // Coarse range checks on the fixed-width date/time fields. Fractional
-    // seconds and the offset are validated by the regex alone.
+    // seconds are validated by the regex alone; the offset is checked below.
     let date = &value[..10];
     let time = &value[11..19];
     let (Ok(year), Ok(month), Ok(day)) = (
@@ -79,12 +83,39 @@ pub fn is_valid_rfc3339(value: &str) -> bool {
     ) else {
         return false;
     };
-    year >= 0
-        && (1..=12).contains(&month)
-        && (1..=31).contains(&day)
-        && hour <= 23
-        && minute <= 59
-        && second <= 59
+    if year < 0 || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+        return false;
+    }
+    if value.ends_with('Z') {
+        return true;
+    }
+    // The offset is the trailing fixed-width `±hh:mm` the regex already
+    // matched; only its magnitude still needs range checking.
+    let offset = &value[value.len() - 6..];
+    let (Ok(offset_hour), Ok(offset_minute)) =
+        (offset[1..3].parse::<u32>(), offset[4..6].parse::<u32>())
+    else {
+        return false;
+    };
+    offset_hour <= 23 && offset_minute <= 59
+}
+
+/// Days in `month` of `year`, Gregorian calendar, leap years included.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 #[cfg(test)]
@@ -107,6 +138,16 @@ mod tests {
             "2026-08-31T14:05:00.123Z",
             "2026-08-31T14:05:00+02:00",
             "2026-01-01T23:59:59-05:00",
+            "2026-08-31T14:05:00.123+02:00",
+            // Calendar boundary: the day exists in its month.
+            "2024-02-29T12:00:00Z",
+            "2026-02-28T12:00:00Z",
+            "2026-12-31T12:00:00Z",
+            // RFC 3339 `time-numoffset` permits offsets through +23:59.
+            "2026-08-31T14:05:00+23:59",
+            "2026-08-31T14:05:00-23:59",
+            "2026-08-31T14:05:00+00:00",
+            "2026-08-31T14:05:00-00:00",
         ] {
             assert!(is_valid_rfc3339(value), "expected valid: {value}");
         }
@@ -123,6 +164,48 @@ mod tests {
             "2026-08-32T00:00:00Z",
             "2026-08-31T24:00:00Z",
             "2026-08-31T00:60:00Z",
+        ] {
+            assert!(!is_valid_rfc3339(value), "expected invalid: {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_calendar_impossible_dates() {
+        // The day must exist in the actual month of the given year. 2026 is
+        // not a leap year; 1900 is a century year (no leap), 2000 is
+        // divisible by 400 (leap).
+        for value in [
+            // 2026-02-29 does not exist (2026 is not a leap year).
+            "2026-02-29T00:00:00Z",
+            // 30/31-day months that only have 30/28 days.
+            "2026-04-31T00:00:00Z",
+            "2026-06-31T00:00:00Z",
+            "2026-09-31T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            // 1900-02-29 does not exist (divisible by 100, not 400).
+            "1900-02-29T00:00:00Z",
+        ] {
+            assert!(!is_valid_rfc3339(value), "expected invalid: {value}");
+        }
+        assert!(
+            is_valid_rfc3339("2000-02-29T00:00:00Z"),
+            "400-year leap day is valid"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_utc_offsets() {
+        // RFC 3339 `time-numoffset` bounds the offset to hours 00-23 and
+        // minutes 00-59. Anything beyond is not a real time offset.
+        for value in [
+            "2026-08-31T00:00:00+24:00",
+            "2026-08-31T00:00:00-24:00",
+            "2026-08-31T00:00:00+23:60",
+            "2026-08-31T00:00:00-23:60",
+            "2026-08-31T00:00:00+70:00",
+            "2026-08-31T00:00:00.5+24:00",
+            "2026-08-31T00:00:00Z+02:00",
         ] {
             assert!(!is_valid_rfc3339(value), "expected invalid: {value}");
         }

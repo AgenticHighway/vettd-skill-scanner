@@ -871,7 +871,11 @@ pub fn scan_skill(
     let clean_internal_references = has_internal_references(&parsed.body)
         && !has_unresolvable_internal_references(&parsed.body, all_paths);
     let signals = emit_signals(&parsed, all_paths, observed_at);
-    let coverage = coverage_entries(&findings, clean_internal_references);
+    let coverage = coverage_entries(
+        &findings,
+        clean_internal_references,
+        text_files.contains_key(skill_key),
+    );
 
     Ok(SkillScanResult {
         findings,

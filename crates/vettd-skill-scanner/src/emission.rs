@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use regex::Regex;
-use tiktoken_rs::cl100k_base;
+use tiktoken_rs::cl100k_base_singleton;
 use yaml_rust2::Yaml;
 
 use crate::consts::DEFAULT_SOURCE;
@@ -134,6 +134,7 @@ const ATTESTATIONS: [(&str, &str, &str); 4] = [
 pub(crate) fn coverage_entries(
     findings: &[crate::finding::Finding],
     clean_internal_references: bool,
+    skill_md_content_present: bool,
 ) -> Vec<CoverageEntry> {
     if findings
         .iter()
@@ -145,6 +146,12 @@ pub(crate) fn coverage_entries(
     }
     let mut entries = Vec::new();
     for (rule_id, label, detail) in ATTESTATIONS {
+        if rule_id == "VTD-0099" && !skill_md_content_present {
+            // A SKILL.md detected only through `all_paths` carries no content
+            // and no declared name; the fallback sentinel name is not a name
+            // to validate. Do not attest name validation in that case.
+            continue;
+        }
         if findings
             .iter()
             .any(|finding| finding.rule_id == rule_id && finding.severity == Severity::Info)
@@ -230,8 +237,9 @@ fn primary_language(all_paths: &[String], observed_at: &str) -> Signal {
 }
 
 fn static_context_tokens(body: &str, observed_at: &str) -> Signal {
-    let token_count = cl100k_base()
-        .expect("cl100k_base tokenizer must initialise from embedded ranks")
+    // Reuse the crate-provided, lazily-initialised singleton tokenizer instead
+    // of rebuilding the embedded ranks on every scanned skill.
+    let token_count = cl100k_base_singleton()
         .encode_with_special_tokens(body)
         .len();
     Signal {
@@ -313,6 +321,7 @@ fn internal_references(body: &str) -> Vec<String> {
             .expect("valid internal-reference regex")
     });
     re.find_iter(body)
+        .filter(|matched| is_standalone_internal_reference(body, matched))
         .map(|matched| {
             matched
                 .as_str()
@@ -328,6 +337,27 @@ fn internal_references(body: &str) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// A regex hit is an internal reference only when it is the whole token and is
+/// not part of an external URL:
+///
+/// - a match that continues a longer identifier (`myassets/logo`,
+///   `x-references/guide`) is a substring, not a reference to that path;
+/// - a match inside a `scheme://` URL (`https://host/references/guide.md`)
+///   belongs to the external resource, not the bundle.
+fn is_standalone_internal_reference(body: &str, matched: &regex::Match<'_>) -> bool {
+    let before = &body[..matched.start()];
+    if let Some(previous) = before.chars().last() {
+        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '-' {
+            return false;
+        }
+    }
+    let line_start = before
+        .rfind(['\n', '\r', ' '])
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    !before[line_start..].contains("://")
 }
 
 fn scalar(frontmatter: &Yaml, key: &str) -> String {
@@ -480,4 +510,66 @@ fn non_unknown_name(name: &str) -> Vec<String> {
     (name != "unknown" && !name.is_empty())
         .then(|| vec![name.to_string()])
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_references;
+
+    #[test]
+    fn internal_references_ignores_external_urls() {
+        // `references/` inside an external URL is part of the remote resource,
+        // not a bundle path — it must not be flagged as an internal reference.
+        for body in [
+            "Fetch https://example.com/references/guide.md for context.",
+            "See [docs](https://example.com/references/guide.md) for context.",
+            "The <https://example.com/assets/logo.png> asset is remote.",
+            "Download https://example.com/scripts/setup.sh first.",
+        ] {
+            assert!(
+                internal_references(body).is_empty(),
+                "external URL must not yield internal references: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_references_ignores_prefix_substrings() {
+        // A match continuing a longer identifier is a different token
+        // (`myassets/logo`, `x-references/guide`, `shellscripts/run`) — the
+        // regex hit is only a substring of it, not a reference to that
+        // path. Excluding it prevents false "unresolvable reference" signals.
+        for body in [
+            "Check myassets/logo.png for the mark.",
+            "See x-references/guide.md for details.",
+            "Run shellscripts/run.sh to install.",
+            "Consult src_assets/template.json.",
+        ] {
+            assert!(
+                internal_references(body).is_empty(),
+                "prefix substring must not yield internal references: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_references_still_matches_standalone_paths() {
+        // Real bundle paths keep resolving, including relative and
+        // nested-directory forms, and punctuation-padded sentence positions.
+        let referenced = internal_references(
+            "Read `references/guide.md`, then run scripts/setup.sh and ./assets/logo.png.",
+        );
+        for expected in ["references/guide.md", "scripts/setup.sh", "assets/logo.png"] {
+            assert!(
+                referenced.contains(&expected.to_string()),
+                "missing internal reference {expected}: {referenced:?}"
+            );
+        }
+        let nested = internal_references("See src/references/tips.md for notes.");
+        assert_eq!(nested, vec!["references/tips.md".to_string()]);
+        // A multi-byte character immediately before the match must not panic
+        // (byte-offset slicing) and is not an identifier continuation.
+        let runic = internal_references("ᚠᛇᚻreferences/guide.md");
+        assert_eq!(runic, vec!["references/guide.md".to_string()]);
+    }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use vettd_skill_scanner::{scan_skill, SkillScanResult};
+use vettd_skill_scanner::{scan_skill, Severity, SkillScanResult};
 
 const OBSERVED_AT: &str = "2026-08-31T00:00:00Z";
 
@@ -368,4 +368,51 @@ fn scan_skill_rejects_invalid_observed_at() {
     assert!(scan_skill(&text_files, &paths, "").is_err());
     assert!(scan_skill(&text_files, &paths, "not-a-timestamp").is_err());
     assert!(scan_skill(&text_files, &paths, "2026-08-31T00:00:00Z").is_ok());
+}
+
+#[test]
+fn external_urls_and_prefix_substrings_are_not_internal_references() {
+    // A SKILL.md body that cites external URLs and longer identifiers whose
+    // tokens merely contain `references/`/`scripts/`/`assets/` must not trip
+    // the unresolved-internal-reference signal.
+    let result = scan(
+        "---\nname: links\n---\nFetch https://example.com/references/guide.md, \
+         see myassets/logo.png, and run shellscripts/run.sh.",
+        &["SKILL.md"],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "external URLs and prefix substrings must not be flagged as internal references"
+    );
+    assert!(result
+        .coverage
+        .iter()
+        .all(|entry| { entry.rule_id != "reliability/unresolvable-internal-references" }));
+}
+
+#[test]
+fn path_only_skill_md_does_not_attest_name_validation() {
+    // When SKILL.md is only visible through all_paths there is no content and
+    // no declared name to validate — the name-validation coverage attestation
+    // must not be emitted, even though the VTD-0099 info finding still fires
+    // on the fallback sentinel name.
+    let text_files = HashMap::new();
+    let paths = ["SKILL.md".to_string()];
+    let result = scan_skill(&text_files, &paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+
+    assert!(result.has_skill_md, "path-only SKILL.md sets the flag");
+    assert!(result
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "VTD-0099" && finding.severity == Severity::Info));
+    assert!(
+        !result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "VTD-0099"),
+        "name validation was not attested without content or a declared name"
+    );
 }
