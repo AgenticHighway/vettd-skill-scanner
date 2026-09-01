@@ -21,9 +21,12 @@ pub(crate) fn emit_signals(
     parsed: &ParsedSkillMd,
     all_paths: &[String],
     observed_at: &str,
+    skill_md_content_present: bool,
 ) -> Vec<Signal> {
-    let mut signals = emit_scalar_signals(parsed, all_paths, observed_at);
-    signals.extend(emit_declared_claims(parsed, observed_at));
+    let mut signals = emit_scalar_signals(parsed, all_paths, observed_at, skill_md_content_present);
+    if skill_md_content_present {
+        signals.extend(emit_declared_claims(parsed, observed_at));
+    }
     signals.extend(internal_reference_signal(
         &parsed.body,
         all_paths,
@@ -36,7 +39,15 @@ fn emit_scalar_signals(
     parsed: &ParsedSkillMd,
     all_paths: &[String],
     observed_at: &str,
+    skill_md_content_present: bool,
 ) -> Vec<Signal> {
+    if !skill_md_content_present {
+        // A SKILL.md detected only through `all_paths` carries no content, so
+        // frontmatter-derived facts and the body token measurement would
+        // falsely claim declarations were inspected. The only bundle-derived
+        // signal then is the path-derived primary language.
+        return vec![primary_language(all_paths, observed_at)];
+    }
     vec![
         fact(
             DECLARED_LICENSE,
@@ -330,8 +341,8 @@ fn internal_references(body: &str) -> Vec<String> {
     re.find_iter(body)
         .filter(|matched| is_standalone_internal_reference(body, matched))
         .map(|matched| {
-            matched
-                .as_str()
+            let start = path_token_start(body, matched.start());
+            body[start..matched.end()]
                 .trim_end_matches('/')
                 .trim_end_matches(|c: char| {
                     matches!(
@@ -339,11 +350,32 @@ fn internal_references(body: &str) -> Vec<String> {
                         '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
                     )
                 })
+                .trim_start_matches("./")
+                .trim_start_matches('/')
                 .to_string()
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// The start of the path token containing `match_start`. Parent directories
+/// (`src/` in `src/references/tips.md`) belong to a nested reference: walking
+/// left over path characters recovers the full token instead of truncating the
+/// match to its `references`/`scripts`/`assets` segment. A leading `./` or `/`
+/// is a relative/absolute marker, not part of the bundle-relative path.
+fn path_token_start(body: &str, match_start: usize) -> usize {
+    let before = &body[..match_start];
+    before
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !is_path_character(*character))
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0)
+}
+
+fn is_path_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '/' | '-')
 }
 
 /// A regex hit is an internal reference only when it is the whole token and is
@@ -568,8 +600,10 @@ mod tests {
                 "missing internal reference {expected}: {referenced:?}"
             );
         }
+        // A `src/` parent directory belongs to the nested reference — truncating
+        // it to `references/tips.md` would falsely report a present file missing.
         let nested = internal_references("See src/references/tips.md for notes.");
-        assert_eq!(nested, vec!["references/tips.md".to_string()]);
+        assert_eq!(nested, vec!["src/references/tips.md".to_string()]);
         // A multi-byte character immediately before the match must not panic
         // (byte-offset slicing) and is not an identifier continuation.
         let runic = internal_references("ᚠᛇᚻreferences/guide.md");

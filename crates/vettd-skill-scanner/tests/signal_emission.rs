@@ -486,3 +486,73 @@ fn path_only_skill_md_does_not_attest_name_validation() {
         "name validation was not attested without content or a declared name"
     );
 }
+
+#[test]
+fn path_only_skill_md_emits_no_frontmatter_derived_signals() {
+    // When SKILL.md is only visible through all_paths there is no content and
+    // no frontmatter. License/environment facts, declared claims, their zero
+    // markers, and the body token measurement would falsely claim declarations
+    // were inspected; only the path-derived primary-language signal may remain.
+    let text_files = HashMap::new();
+    let paths = ["SKILL.md".to_string(), "src/tool.ts".to_string()];
+    let result = scan_skill(&text_files, &paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+
+    for rule_id in [
+        "characteristics/declared-license",
+        "performance/static-context-tokens",
+        "compatibility/declared-environment-assumptions",
+        "cost/declared-external-services",
+        "cost/declared-required-env-vars",
+        "compatibility/declared-required-tools",
+        "compatibility/declared-mcp-servers",
+        "compatibility/declared-harness-targets",
+        "compatibility/declared-name",
+    ] {
+        assert!(
+            !result
+                .signals
+                .iter()
+                .any(|signal| signal.rule_id == rule_id),
+            "path-only SKILL.md must not emit {rule_id}"
+        );
+    }
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.value_num == Some(0.0)),
+        "no zero markers when there is no content to inspect"
+    );
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|signal| { signal.rule_id == "characteristics/primary-language" }),
+        "path-derived primary-language is preserved"
+    );
+}
+
+#[test]
+fn nested_internal_paths_resolve_against_the_complete_bundle_path() {
+    // `src/references/tips.md` in the body must resolve against the complete
+    // nested all_paths entry. Truncating it to `references/tips.md` would
+    // falsely report the present file missing as a medium-reliability signal.
+    let result = scan(
+        "---\nname: nested\n---\nSee src/references/tips.md for notes.",
+        &["SKILL.md", "src/references/tips.md"],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "a nested path present in the bundle is not an unresolvable reference"
+    );
+    assert!(
+        result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "reliability/unresolvable-internal-references"),
+        "clean nested references are attested on the coverage channel"
+    );
+}
