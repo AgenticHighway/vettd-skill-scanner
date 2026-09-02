@@ -199,27 +199,35 @@ fn runtime_env_vars_are_required_env_vars_not_external_services() {
 }
 
 #[test]
-fn explicitly_declared_unknown_name_is_an_item_not_a_marker() {
+fn explicitly_declared_name_is_a_scalar_fact() {
     let result = scan("---\nname: unknown\n---\nBody.", &["SKILL.md"]);
     let rows: Vec<_> = result
         .signals
         .iter()
         .filter(|signal| signal.rule_id == "compatibility/declared-name")
         .collect();
-    assert_eq!(rows.len(), 1, "an explicit name is one claim row");
-    assert_eq!(rows[0].related_id.as_deref(), Some("unknown"));
-    assert_eq!(rows[0].value_num, Some(1.0));
+    assert_eq!(rows.len(), 1, "an explicit name is one scalar fact");
+    assert_eq!(rows[0].value_text.as_deref(), Some("unknown"));
+    assert_eq!(rows[0].derivation.as_deref(), Some("read"));
+    assert_eq!(rows[0].value_num, None, "a fact is not a measurement");
+    assert_eq!(
+        rows[0].related_type, None,
+        "a fact has no related identity (not a list item)"
+    );
+    assert_eq!(
+        rows[0].related_id, None,
+        "a fact has no related identity (not a list item)"
+    );
 
-    // Absence of the key yields the zero marker instead.
+    // A fact is scalar — absence of the key is simply no row, never a zero
+    // marker.
     let absent = scan("---\ndescription: no name\n---\nBody.", &["SKILL.md"]);
     let absent_rows: Vec<_> = absent
         .signals
         .iter()
         .filter(|signal| signal.rule_id == "compatibility/declared-name")
         .collect();
-    assert_eq!(absent_rows.len(), 1);
-    assert_eq!(absent_rows[0].value_num, Some(0.0));
-    assert!(absent_rows[0].related_id.is_none());
+    assert!(absent_rows.is_empty(), "no declared name means no fact row");
 }
 
 #[test]
@@ -280,7 +288,7 @@ fn unresolved_internal_paths_are_signals_not_findings_and_clean_paths_are_covere
 }
 
 #[test]
-fn declared_name_claim_does_not_change_vtd_0100() {
+fn declared_name_fact_does_not_change_vtd_0100() {
     let result = scan("---\nname: pdf\n---\nUse PDFs.", &["SKILL.md"]);
     let collisions: Vec<_> = result
         .findings
@@ -300,9 +308,17 @@ fn declared_name_claim_does_not_change_vtd_0100() {
     assert!(collision.filepath.is_none());
 
     let name = signal(&result, "compatibility/declared-name");
-    assert_eq!(name.related_type.as_deref(), Some("declared_skill_name"));
-    assert_eq!(name.related_id.as_deref(), Some("pdf"));
-    assert_eq!(name.value_num, Some(1.0));
+    assert_eq!(name.value_text.as_deref(), Some("pdf"));
+    assert_eq!(name.derivation.as_deref(), Some("read"));
+    assert_eq!(name.value_num, None, "a fact is not a measurement");
+    assert_eq!(
+        name.related_type, None,
+        "a fact has no related identity (not a list item)"
+    );
+    assert_eq!(
+        name.related_id, None,
+        "a fact has no related identity (not a list item)"
+    );
 }
 
 #[test]

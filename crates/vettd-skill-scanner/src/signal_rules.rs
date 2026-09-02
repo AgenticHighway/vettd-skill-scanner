@@ -21,4 +21,3 @@ pub(crate) const FRONTMATTER_REQUIRED_ENV_VARS: &str = "frontmatter-required-env
 pub(crate) const FRONTMATTER_ALLOWED_TOOLS: &str = "frontmatter-allowed-tools";
 pub(crate) const FRONTMATTER_MCP_DECLARATIONS: &str = "frontmatter-mcp-declarations";
 pub(crate) const FRONTMATTER_HARNESS_DECLARATIONS: &str = "frontmatter-harness-declarations";
-pub(crate) const FRONTMATTER_NAME: &str = "frontmatter-name";

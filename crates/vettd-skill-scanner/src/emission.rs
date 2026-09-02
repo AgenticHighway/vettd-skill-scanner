@@ -67,7 +67,7 @@ fn emit_scalar_signals(
 }
 
 fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal> {
-    let claims: [(&str, &str, &str, &str, Vec<String>); 6] = [
+    let claims: [(&str, &str, &str, &str, Vec<String>); 5] = [
         (
             DECLARED_EXTERNAL_SERVICES,
             "Declared external service",
@@ -106,20 +106,28 @@ fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal
             FRONTMATTER_HARNESS_DECLARATIONS,
             yaml_values(&parsed.frontmatter["metadata"]["surface"]),
         ),
-        (
-            DECLARED_NAME,
-            "Declared skill name",
-            "declared_skill_name",
-            FRONTMATTER_NAME,
-            declared_name(parsed),
-        ),
     ];
-    claims
+    let mut signals: Vec<Signal> = claims
         .into_iter()
         .flat_map(|(rule_id, label, related_type, method, values)| {
             list_claims(rule_id, label, related_type, method, values, observed_at)
         })
-        .collect()
+        .collect();
+
+    // After the list_claims block: the declared name is a scalar fact, not a
+    // list item — frontmatter declares at most one name, so there is no list
+    // to measure. A name present is one `read` fact row; a name absent is no
+    // row at all (no zero marker).
+    let name_values = declared_name(parsed);
+    if !name_values.is_empty() {
+        signals.push(fact(
+            DECLARED_NAME,
+            "Declared skill name",
+            name_values.into_iter().next().unwrap(),
+            observed_at,
+        ));
+    }
+    signals
 }
 
 /// Attestation entries for the four absence checks whose pass finding is
@@ -527,7 +535,7 @@ fn push_tool(values: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-/// The declared skill name, emitted as a claim row. Key presence in real
+/// The declared skill name, emitted as a scalar fact row. Key presence in real
 /// frontmatter is authoritative — even a literal `"unknown"` is a declared
 /// name. Only the lenient (invalid-YAML) fallback treats the `"unknown"`
 /// sentinel as "absent".
