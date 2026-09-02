@@ -67,33 +67,29 @@ fn emit_scalar_signals(
 }
 
 fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal> {
-    let claims: [(&str, &str, &str, &str, Vec<String>); 5] = [
+    let claims: [(&str, &str, &str, Vec<String>); 5] = [
         (
             DECLARED_EXTERNAL_SERVICES,
             "Declared external service",
             "declared_external_service",
-            FRONTMATTER_DECLARED_SERVICES,
             declared_external_services(&parsed.frontmatter),
         ),
         (
             DECLARED_REQUIRED_ENV_VARS,
             "Declared required environment variable",
             "declared_required_env_var",
-            FRONTMATTER_REQUIRED_ENV_VARS,
             env_var_names(&parsed.frontmatter),
         ),
         (
             DECLARED_REQUIRED_TOOLS,
             "Declared required tool",
             "declared_tool",
-            FRONTMATTER_ALLOWED_TOOLS,
             declared_tools(&parsed.frontmatter),
         ),
         (
             DECLARED_MCP_SERVERS,
             "Declared MCP server",
             "declared_mcp_server",
-            FRONTMATTER_MCP_DECLARATIONS,
             values_for_keys(
                 &parsed.frontmatter,
                 &["mcp", "mcp-servers", "mcp_servers", "mcpServers"],
@@ -103,14 +99,13 @@ fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal
             DECLARED_HARNESS_TARGETS,
             "Declared harness target",
             "declared_harness_target",
-            FRONTMATTER_HARNESS_DECLARATIONS,
             yaml_values(&parsed.frontmatter["metadata"]["surface"]),
         ),
     ];
     let mut signals: Vec<Signal> = claims
         .into_iter()
-        .flat_map(|(rule_id, label, related_type, method, values)| {
-            list_claims(rule_id, label, related_type, method, values, observed_at)
+        .flat_map(|(rule_id, label, related_type, values)| {
+            list_claims(rule_id, label, related_type, values, observed_at)
         })
         .collect();
 
@@ -279,14 +274,16 @@ fn list_claims(
     rule_id: &str,
     label: &str,
     related_type: &str,
-    method: &str,
     values: Vec<String>,
     observed_at: &str,
 ) -> Vec<Signal> {
     if values.is_empty() {
+        // A declaration absent from frontmatter is a fact list with no
+        // items: exactly one marker row — derivation "read" with the empty
+        // identity and no value columns, mirroring vettd's fact-list marker
+        // convention.
         return vec![Signal {
-            value_num: Some(0.0),
-            method: Some(method.to_string()),
+            derivation: Some("read".to_string()),
             ..base_signal(rule_id, observed_at, label)
         }];
     }
@@ -294,9 +291,9 @@ fn list_claims(
         .into_iter()
         .map(|value| Signal {
             related_type: Some(related_type.to_string()),
-            related_id: Some(value),
-            value_num: Some(1.0),
-            method: Some(method.to_string()),
+            related_id: Some(value.clone()),
+            value_text: Some(value),
+            derivation: Some("read".to_string()),
             ..base_signal(rule_id, observed_at, label)
         })
         .collect()

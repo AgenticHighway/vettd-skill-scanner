@@ -85,18 +85,25 @@ fn list_claims_emit_items_or_exactly_one_zero_marker() {
         signal.rule_id == "cost/declared-external-services"
             && signal.related_type.as_deref() == Some("declared_external_service")
             && signal.related_id.as_deref() == Some("stripe")
-            && signal.value_num == Some(1.0)
+            && signal.value_text.as_deref() == Some("stripe")
+            && signal.derivation.as_deref() == Some("read")
+            && signal.value_num.is_none()
+            && signal.method.is_none()
     }));
     assert!(result.signals.iter().any(|signal| {
         signal.rule_id == "compatibility/declared-harness-targets"
             && signal.related_type.as_deref() == Some("declared_harness_target")
             && signal.related_id.as_deref() == Some("claude")
+            && signal.value_text.as_deref() == Some("claude")
+            && signal.derivation.as_deref() == Some("read")
     }));
     assert!(result.signals.iter().any(|signal| {
         signal.rule_id == "compatibility/declared-mcp-servers"
             && signal.related_type.is_none()
             && signal.related_id.is_none()
-            && signal.value_num == Some(0.0)
+            && signal.derivation.as_deref() == Some("read")
+            && signal.value_text.is_none()
+            && signal.value_num.is_none()
     }));
 }
 
@@ -128,8 +135,10 @@ fn service_keys_stay_services_and_env_var_names_are_a_separate_rule() {
     }
     assert!(services.iter().all(|signal| {
         signal.related_type.as_deref() == Some("declared_external_service")
-            && signal.method.as_deref() == Some("frontmatter-declared-services")
-            && signal.value_num == Some(1.0)
+            && signal.value_text.as_deref() == signal.related_id.as_deref()
+            && signal.derivation.as_deref() == Some("read")
+            && signal.value_num.is_none()
+            && signal.method.is_none()
     }));
 
     let env_vars: Vec<_> = result
@@ -154,8 +163,10 @@ fn service_keys_stay_services_and_env_var_names_are_a_separate_rule() {
     }
     assert!(env_vars.iter().all(|signal| {
         signal.related_type.as_deref() == Some("declared_required_env_var")
-            && signal.method.as_deref() == Some("frontmatter-required-env-vars")
-            && signal.value_num == Some(1.0)
+            && signal.value_text.as_deref() == signal.related_id.as_deref()
+            && signal.derivation.as_deref() == Some("read")
+            && signal.value_num.is_none()
+            && signal.method.is_none()
     }));
 }
 
@@ -346,10 +357,20 @@ fn every_emitted_signal_satisfies_shape_obligations() {
         // Fact/Classification rows carry valueText; Measurement rows must not.
         match signal.derivation.as_deref() {
             Some("read") => {
-                assert!(
-                    signal.value_text.is_some(),
-                    "fact needs value_text: {signal:?}"
-                );
+                // A fact-list marker (empty identity with no value columns)
+                // is a valid read row, not a malformed fact — scalar facts
+                // carry value_text, markers deliberately do not.
+                let is_marker = signal.related_type.is_none()
+                    && signal.related_id.is_none()
+                    && signal.value_text.is_none()
+                    && signal.value_num.is_none()
+                    && signal.method.is_none();
+                if !is_marker {
+                    assert!(
+                        signal.value_text.is_some(),
+                        "fact needs value_text: {signal:?}"
+                    );
+                }
                 assert!(
                     signal.value_num.is_none(),
                     "fact must not set value_num: {signal:?}"
@@ -405,18 +426,18 @@ fn every_emitted_signal_satisfies_shape_obligations() {
                 "finding must be scalar: {signal:?}"
             );
         }
-        // List semantics: markers carry the empty identity, items carry a
-        // non-empty related identity with value_num 1.
-        if signal.value_num == Some(0.0) {
-            assert!(
-                signal.related_type.is_none() && signal.related_id.is_none(),
-                "marker has empty identity: {signal:?}"
-            );
-        } else if signal.related_type.is_some() {
+        // Fact-list semantics: markers carry the empty identity with derivation
+        // "read" and no value columns; items carry a non-empty related
+        // identity with a value_text fact value and derivation "read".
+        if signal.related_type.is_some() {
             assert_eq!(
-                signal.value_num,
-                Some(1.0),
-                "item row is a single claim: {signal:?}"
+                signal.derivation.as_deref(),
+                Some("read"),
+                "item row is a read fact: {signal:?}"
+            );
+            assert!(
+                signal.value_text.is_some(),
+                "item row needs value_text: {signal:?}"
             );
             assert!(
                 signal.related_id.as_deref().map(str::is_empty) == Some(false),
@@ -425,14 +446,23 @@ fn every_emitted_signal_satisfies_shape_obligations() {
         }
     }
 
-    // A marker serializes with its related identity omitted, so vettd's
-    // normalizeIdentityParticipant lands it on "" — the contract's empty id.
+    // A marker serializes with its related identity and value columns
+    // omitted, so vettd's normalizeIdentityParticipant lands it on "" — the
+    // contract's empty id — and the fact value stays empty.
     let marker = result
         .signals
         .iter()
         .find(|signal| signal.rule_id == "compatibility/declared-mcp-servers")
         .expect("mcp-servers marker row");
-    assert_eq!(marker.value_num, Some(0.0));
+    assert_eq!(marker.derivation.as_deref(), Some("read"));
+    assert!(
+        marker.value_text.is_none(),
+        "marker has no fact value: {marker:?}"
+    );
+    assert!(
+        marker.value_num.is_none(),
+        "marker must not be a measurement: {marker:?}"
+    );
     let json = serde_json::to_value(marker).expect("signal serializes");
     assert!(
         json.get("relatedType").is_none(),
@@ -441,6 +471,10 @@ fn every_emitted_signal_satisfies_shape_obligations() {
     assert!(
         json.get("relatedId").is_none(),
         "marker omits relatedId: {json}"
+    );
+    assert!(
+        json.get("valueNum").is_none(),
+        "marker omits valueNum: {json}"
     );
 }
 
@@ -506,9 +540,10 @@ fn path_only_skill_md_does_not_attest_name_validation() {
 #[test]
 fn path_only_skill_md_emits_no_frontmatter_derived_signals() {
     // When SKILL.md is only visible through all_paths there is no content and
-    // no frontmatter. License/environment facts, declared claims, their zero
-    // markers, and the body token measurement would falsely claim declarations
-    // were inspected; only the path-derived primary-language signal may remain.
+    // no frontmatter. License/environment facts, declared claims, their
+    // fact-list markers, and the body token measurement would falsely claim
+    // declarations were inspected; only the path-derived primary-language
+    // signal may remain.
     let text_files = HashMap::new();
     let paths = ["SKILL.md".to_string(), "src/tool.ts".to_string()];
     let result = scan_skill(&text_files, &paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
@@ -538,6 +573,16 @@ fn path_only_skill_md_emits_no_frontmatter_derived_signals() {
             .iter()
             .any(|signal| signal.value_num == Some(0.0)),
         "no zero markers when there is no content to inspect"
+    );
+    assert!(
+        !result.signals.iter().any(|signal| {
+            signal.derivation.as_deref() == Some("read")
+                && signal.related_type.is_none()
+                && signal.related_id.is_none()
+                && signal.value_text.is_none()
+                && signal.value_num.is_none()
+        }),
+        "no fact-list markers when there is no content to inspect"
     );
     assert!(
         result
