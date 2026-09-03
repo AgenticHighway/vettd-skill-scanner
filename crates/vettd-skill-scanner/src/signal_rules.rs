@@ -16,9 +16,3 @@ pub(crate) const DECLARED_NAME: &str = "compatibility/declared-name";
 
 pub(crate) const BUNDLE_EXTENSION_SHARE: &str = "bundle-extension-share";
 pub(crate) const CL100K_SKILL_MD_BODY: &str = "tiktoken/cl100k_base/skill-md-body";
-pub(crate) const FRONTMATTER_DECLARED_SERVICES: &str = "frontmatter-declared-services";
-pub(crate) const FRONTMATTER_REQUIRED_ENV_VARS: &str = "frontmatter-required-env-vars";
-pub(crate) const FRONTMATTER_ALLOWED_TOOLS: &str = "frontmatter-allowed-tools";
-pub(crate) const FRONTMATTER_MCP_DECLARATIONS: &str = "frontmatter-mcp-declarations";
-pub(crate) const FRONTMATTER_HARNESS_DECLARATIONS: &str = "frontmatter-harness-declarations";
-pub(crate) const FRONTMATTER_NAME: &str = "frontmatter-name";
