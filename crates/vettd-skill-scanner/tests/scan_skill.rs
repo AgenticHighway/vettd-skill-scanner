@@ -263,6 +263,6 @@ fn all_findings_have_valid_source() {
 #[test]
 fn scanner_version_const_is_nonzero() {
     // Sanity check that CURRENT_SCANNER_VERSION is set to a real value.
-    // Must stay in sync with skill-analyzer.ts's CURRENT_SCANNER_VERSION.
+    // Must stay in sync with scanner-version.ts's CURRENT_SCANNER_VERSION.
     assert_ne!(vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION, 0);
 }

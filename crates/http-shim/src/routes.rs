@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["ok"], true);
-        assert_eq!(json["scannerVersion"], 9);
+        assert_eq!(json["scannerVersion"], super::CURRENT_SCANNER_VERSION);
     }
 
     #[tokio::test]
@@ -167,7 +167,7 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["hasSkillMd"], true);
         assert_eq!(json["fileCount"], 1);
-        assert_eq!(json["scannerVersion"], 9);
+        assert_eq!(json["scannerVersion"], super::CURRENT_SCANNER_VERSION);
         assert!(json["findings"].is_array());
     }
 
