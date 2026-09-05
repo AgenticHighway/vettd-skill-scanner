@@ -99,15 +99,9 @@ pub(crate) const RULE_DESCRIPTION_BEHAVIOR_MISMATCH: &str = "VTD-0087";
 pub(crate) const RULE_EXTERNAL_URL_REFERENCE: &str = "VTD-0088";
 pub(crate) const RULE_CREDENTIAL_EXFILTRATION_CHAIN: &str = "VTD-0089";
 pub(crate) const RULE_MALICIOUS_ACTIVITY_CHAIN: &str = "VTD-0090";
-pub(crate) const RULE_NO_SECRETS_DETECTED: &str = "VTD-0091";
-pub(crate) const RULE_NO_BEHAVIORAL_SIGNALS: &str = "VTD-0092";
-pub(crate) const RULE_NO_EXTERNAL_URLS: &str = "VTD-0093";
 
 // Structure
 pub(crate) const RULE_SKILL_MD: &str = "VTD-0095";
-pub(crate) const RULE_SCRIPTS_DIRECTORY: &str = "VTD-0096";
-pub(crate) const RULE_REFERENCES_DIRECTORY: &str = "VTD-0097";
-pub(crate) const RULE_ASSETS_DIRECTORY: &str = "VTD-0098";
 pub(crate) const RULE_SKILL_NAME_VALIDITY: &str = "VTD-0099";
 pub(crate) const RULE_SKILL_NAME_COLLISION: &str = "VTD-0100";
 
@@ -135,7 +129,6 @@ pub(crate) const RULE_SCRIPT_STRUCTURED_OUTPUT: &str = "VTD-0116";
 pub(crate) const RULE_SCRIPT_DEPENDENCY_PINNING: &str = "VTD-0117";
 
 // Evals
-pub(crate) const RULE_EVALS_PRESENT: &str = "VTD-0118";
 pub(crate) const RULE_EVALS_TEST_CASE_COUNT: &str = "VTD-0119";
 pub(crate) const RULE_EVALS_ASSERTIONS: &str = "VTD-0120";
 pub(crate) const RULE_EVALS_MIN_COUNT: &str = "VTD-0121";

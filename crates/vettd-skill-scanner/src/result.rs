@@ -40,6 +40,9 @@ pub struct SkillScanResult {
     /// Whether an `evals/` directory or `evals.json` exists in the package.
     pub has_evals: bool,
 
+    /// Whether an `assets/` directory exists in the package.
+    pub has_assets: bool,
+
     /// Total number of paths in the package (text + binary).
     pub file_count: usize,
 }

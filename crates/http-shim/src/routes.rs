@@ -60,6 +60,7 @@ struct ScanResponse {
     has_scripts: bool,
     has_references: bool,
     has_evals: bool,
+    has_assets: bool,
     file_count: usize,
     scanner_version: u32,
 }
@@ -123,6 +124,7 @@ async fn scan(
         has_scripts: result.has_scripts,
         has_references: result.has_references,
         has_evals: result.has_evals,
+        has_assets: result.has_assets,
         file_count: result.file_count,
         scanner_version: CURRENT_SCANNER_VERSION,
     }))
