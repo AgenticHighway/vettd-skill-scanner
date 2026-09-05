@@ -30,7 +30,6 @@ pub const DETAIL_DETECTED_IN_PREFIX: &str = "Detected in ";
 pub const DESCRIPTION_MAX_LENGTH: usize = 1024;
 pub const EVALS_MIN_TEST_CASES: usize = 3;
 pub const SKILL_NAME_MAX_LENGTH: usize = 64;
-pub const SKILL_MD_BODY_MAX_LINES: usize = 500;
 pub const NEGATION_LOOKBACK_CHARS: usize = 40;
 
 // ── Eval file candidates ──────────────────────────────────────────────────────

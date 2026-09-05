@@ -93,7 +93,6 @@ pub(crate) const RULE_OBFUSCATED_EXTERNAL_URL: &str = "VTD-0079";
 pub(crate) const RULE_BASE64_IN_MARKDOWN: &str = "VTD-0080";
 pub(crate) const RULE_HIDDEN_UNICODE_CHARACTER: &str = "VTD-0081";
 pub(crate) const RULE_POSSIBLE_TYPOSQUATTING: &str = "VTD-0082";
-pub(crate) const RULE_NO_REPOSITORY_LINK: &str = "VTD-0083";
 pub(crate) const RULE_SYSTEM_PROMPT_LEAKAGE: &str = "VTD-0085";
 pub(crate) const RULE_DESCRIPTION_BEHAVIOR_MISMATCH: &str = "VTD-0087";
 pub(crate) const RULE_EXTERNAL_URL_REFERENCE: &str = "VTD-0088";
@@ -105,31 +104,8 @@ pub(crate) const RULE_SKILL_MD: &str = "VTD-0095";
 pub(crate) const RULE_SKILL_NAME_VALIDITY: &str = "VTD-0099";
 pub(crate) const RULE_SKILL_NAME_COLLISION: &str = "VTD-0100";
 
-// Best practices
-pub(crate) const RULE_SKILL_MD_BODY_LENGTH: &str = "VTD-0101";
-pub(crate) const RULE_GOTCHAS_SECTION: &str = "VTD-0102";
-pub(crate) const RULE_EXAMPLES_PRESENT: &str = "VTD-0103";
-pub(crate) const RULE_CHECKLIST_PRESENT: &str = "VTD-0104";
-pub(crate) const RULE_VALIDATION_LOOP: &str = "VTD-0105";
-pub(crate) const RULE_WORKFLOW_STRUCTURE: &str = "VTD-0106";
-pub(crate) const RULE_PROGRESSIVE_DISCLOSURE: &str = "VTD-0107";
-pub(crate) const RULE_GENERIC_INSTRUCTION: &str = "VTD-0108";
-
-// Description
-pub(crate) const RULE_DESCRIPTION_PRESENT: &str = "VTD-0109";
-pub(crate) const RULE_DESCRIPTION_LENGTH: &str = "VTD-0110";
-pub(crate) const RULE_DESCRIPTION_CONTEXT: &str = "VTD-0111";
-pub(crate) const RULE_DESCRIPTION_BREVITY: &str = "VTD-0112";
-pub(crate) const RULE_DESCRIPTION_SCOPE: &str = "VTD-0113";
-
-// Scripts
-pub(crate) const RULE_SCRIPT_CLI_HELP: &str = "VTD-0114";
-pub(crate) const RULE_SCRIPT_INTERACTIVE_PROMPTS: &str = "VTD-0115";
-pub(crate) const RULE_SCRIPT_STRUCTURED_OUTPUT: &str = "VTD-0116";
-pub(crate) const RULE_SCRIPT_DEPENDENCY_PINNING: &str = "VTD-0117";
-
-// Evals
-pub(crate) const RULE_EVALS_TEST_CASE_COUNT: &str = "VTD-0119";
-pub(crate) const RULE_EVALS_ASSERTIONS: &str = "VTD-0120";
-pub(crate) const RULE_EVALS_MIN_COUNT: &str = "VTD-0121";
-pub(crate) const RULE_EVAL_FILES_FOUND: &str = "VTD-0123";
+// The VTD-0101..0123 best-practices/description/scripts/evals findings were
+// reclassified onto the signal channel (see signal_rules.rs) and their
+// RULE_* constants pruned. VTD-0101 (body line count) was removed entirely,
+// superseded by performance/static-context-tokens. Remaining VTD IDs above
+// are the genuine safety/trust findings that still travel on this channel.

@@ -123,13 +123,41 @@ fn invalid_skill_name_fires_vtd_0099() {
 }
 
 #[test]
-fn missing_repository_fires_vtd_0083() {
+fn missing_repository_emits_repository_link_absent_fact() {
+    // VTD-0083 is a characteristics fact now, not a security finding: a skill
+    // without a verifiable source repository is observable, not flagged — the
+    // repository link travels on the signal channel so it never lands in the
+    // Safety drawer.
     let skill = "---\nname: my-skill\ndescription: A skill.\n---\nDoes stuff.";
     let mut text_files = HashMap::new();
     text_files.insert("SKILL.md".to_string(), skill.to_string());
     let result = scan(&text_files, &["SKILL.md".to_string()]);
     assert!(
-        result.findings.iter().any(|f| f.rule_id == "VTD-0083"),
-        "missing repository field should fire VTD-0083"
+        !result.findings.iter().any(|f| f.rule_id == "VTD-0083"),
+        "VTD-0083 must not fire on the finding channel"
     );
+    let link = result
+        .signals
+        .iter()
+        .find(|s| s.rule_id == "characteristics/repository-link")
+        .expect("repository-link fact must be emitted");
+    assert_eq!(link.value_text.as_deref(), Some("absent"));
+    assert_eq!(link.derivation.as_deref(), Some("read"));
+    assert_eq!(link.severity, None, "a fact carries no severity");
+    assert_eq!(link.value_num, None, "a fact is not a measurement");
+}
+
+#[test]
+fn declared_repository_emits_repository_link_present_fact() {
+    let skill = "---\nname: my-skill\ndescription: A skill.\nrepository: https://github.com/acme/my-skill\n---\nDoes stuff.";
+    let mut text_files = HashMap::new();
+    text_files.insert("SKILL.md".to_string(), skill.to_string());
+    let result = scan(&text_files, &["SKILL.md".to_string()]);
+    let link = result
+        .signals
+        .iter()
+        .find(|s| s.rule_id == "characteristics/repository-link")
+        .expect("repository-link fact must be emitted");
+    assert_eq!(link.value_text.as_deref(), Some("present"));
+    assert_eq!(link.derivation.as_deref(), Some("read"));
 }
