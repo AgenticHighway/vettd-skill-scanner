@@ -2,7 +2,12 @@
 //!
 //! The wire contract: the request is `{"textFiles": {...}, "allPaths": [...]}`
 //! (camelCase) and the response carries the structural flags and scanner
-//! version alongside `{"findings"}`.
+//! version alongside `{"findings"}`. `bundlePath` and `repoPaths` are
+//! optional additions (vettd#1011 follow-up) that let a GitHub-directory
+//! import resolve internal references against the wider repository, not
+//! just the skill's own subtree — omitting them is equivalent to a bare zip
+//! upload with no repository context, and behaves exactly as before they
+//! existed.
 
 use std::collections::HashMap;
 
@@ -12,7 +17,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use vettd_skill_scanner::consts::CURRENT_SCANNER_VERSION;
-use vettd_skill_scanner::{now_utc_rfc3339, scan_skill, CoverageEntry, Finding, Signal};
+use vettd_skill_scanner::{
+    now_utc_rfc3339, scan_skill_with_repo_context, CoverageEntry, Finding, RepoContext, Signal,
+};
 
 // axum's Json extractor defaults to a 2 MiB request body cap, which real
 // skill directories blow past easily (e.g. pbakaus/impeccable bundles ~3 MiB
@@ -27,6 +34,14 @@ const MAX_SCAN_BODY_BYTES: usize = 100 * 1024 * 1024;
 struct ScanRequest {
     text_files: HashMap<String, String>,
     all_paths: Vec<String>,
+    /// This skill's own directory, relative to the repository root. Absent (or omitted) for a
+    /// caller with no repository concept — a bare zip upload.
+    #[serde(default)]
+    bundle_path: String,
+    /// Every path in the repository, relative to the repository root. Absent (or omitted) makes
+    /// internal-reference resolution behave exactly as it did before this field existed.
+    #[serde(default)]
+    repo_paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -75,7 +90,11 @@ async fn scan(
     // the inner ScanError arm is defensive only.
     let observed_at = now_utc_rfc3339();
     let result = tokio::task::spawn_blocking(move || {
-        scan_skill(&req.text_files, &req.all_paths, &observed_at)
+        let repo_context = RepoContext {
+            bundle_path: &req.bundle_path,
+            repo_paths: &req.repo_paths,
+        };
+        scan_skill_with_repo_context(&req.text_files, &req.all_paths, &repo_context, &observed_at)
     })
     .await
     .map_err(|e| {
@@ -227,6 +246,52 @@ mod tests {
         assert!(
             json.get("coverage").is_none(),
             "the coverage key must be absent when the scanner produced none"
+        );
+    }
+
+    // vettd#1011 follow-up: a `../`-relative reference absent from the skill's own subtree
+    // resolves once `bundlePath`/`repoPaths` supply the wider repository.
+    #[tokio::test]
+    async fn scan_resolves_internal_references_against_repo_context() {
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"SKILL.md": "---\nname: pdf-tool\n---\nLoad `../../references/shared.md` first."},
+                "allPaths": ["SKILL.md"],
+                "bundlePath": "skills/pdf-tool",
+                "repoPaths": ["SKILL.md", "references/shared.md", "skills/pdf-tool/SKILL.md"],
+            })))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let signals = json["signals"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s["ruleId"] == "reliability/unresolvable-internal-references"),
+            "a real repo-root file reached via `..` must resolve: {signals:?}"
+        );
+    }
+
+    // Omitting bundlePath/repoPaths entirely (a bare zip upload, or any pre-existing caller) must
+    // behave exactly as before this wire addition existed — same reference, still unresolvable.
+    #[tokio::test]
+    async fn scan_without_repo_context_still_flags_the_same_dot_dot_reference() {
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"SKILL.md": "---\nname: pdf-tool\n---\nLoad `../../references/shared.md` first."},
+                "allPaths": ["SKILL.md"],
+            })))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let signals = json["signals"].as_array().cloned().unwrap_or_default();
+        assert!(
+            signals
+                .iter()
+                .any(|s| s["ruleId"] == "reliability/unresolvable-internal-references"),
+            "without repo context, an out-of-bundle reference is still reported missing: {signals:?}"
         );
     }
 

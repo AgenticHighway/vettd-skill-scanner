@@ -46,8 +46,9 @@ mod signal_rules;
 mod skill_md;
 
 pub use coverage::CoverageEntry;
+pub use emission::RepoContext;
 pub use finding::{Finding, FindingCategory, Intent, Severity};
 pub use result::SkillScanResult;
 pub use rfc3339::{is_valid_rfc3339, now_utc_rfc3339};
-pub use scanner::{scan_skill, ScanError};
+pub use scanner::{scan_skill, scan_skill_with_repo_context, ScanError};
 pub use signal::Signal;

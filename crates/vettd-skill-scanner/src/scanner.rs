@@ -15,6 +15,7 @@ use crate::consts::{
 };
 use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
+    RepoContext,
 };
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
 use crate::result::SkillScanResult;
@@ -76,6 +77,21 @@ impl std::error::Error for ScanError {}
 pub fn scan_skill(
     text_files: &HashMap<String, String>,
     all_paths: &[String],
+    observed_at: &str,
+) -> Result<SkillScanResult, ScanError> {
+    scan_skill_with_repo_context(text_files, all_paths, &RepoContext::default(), observed_at)
+}
+
+/// Same as [`scan_skill`], but also resolves internal references that fall outside the skill's
+/// own bundle against the wider repository (see [`RepoContext`]) — shared content several skills
+/// draw from that lives above or alongside the skill's own directory rather than inside it. Use
+/// this when the caller knows the skill's position within a larger repository (a GitHub directory
+/// import); use [`scan_skill`] when it doesn't (a bare zip upload, a local directory with no repo
+/// concept) — passing [`RepoContext::default`] here is equivalent to calling [`scan_skill`].
+pub fn scan_skill_with_repo_context(
+    text_files: &HashMap<String, String>,
+    all_paths: &[String],
+    repo_context: &RepoContext<'_>,
     observed_at: &str,
 ) -> Result<SkillScanResult, ScanError> {
     if !crate::rfc3339::is_valid_rfc3339(observed_at) {
@@ -869,10 +885,11 @@ pub fn scan_skill(
     check_description_behavior_mismatch(&description_for_mismatch, &mut findings);
 
     let clean_internal_references = has_internal_references(&parsed.body)
-        && !has_unresolvable_internal_references(&parsed.body, all_paths);
+        && !has_unresolvable_internal_references(&parsed.body, all_paths, repo_context);
     let signals = emit_signals(
         &parsed,
         all_paths,
+        repo_context,
         observed_at,
         text_files.contains_key(skill_key),
     );
