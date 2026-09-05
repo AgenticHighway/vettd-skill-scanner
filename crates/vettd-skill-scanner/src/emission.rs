@@ -325,8 +325,29 @@ pub(crate) fn missing_internal_references(body: &str, all_paths: &[String]) -> V
     let available: BTreeSet<&str> = all_paths.iter().map(String::as_str).collect();
     referenced
         .into_iter()
-        .filter(|path| !available.contains(path.as_str()))
+        .filter(|path| !resolves_against_bundle(path, &available))
         .collect()
+}
+
+/// Whether a referenced path resolves against the bundle: present verbatim, or present once a
+/// redundant outer prefix is discarded.
+///
+/// `all_paths` is always bundle-root-relative (the fetcher strips the skill's own directory
+/// before handing paths to the scanner). Authors commonly write references as they appear
+/// browsing the full repository instead — e.g. `skills/pdf-tool/references/guide.md` for a file
+/// that is `references/guide.md` from the bundle root — because that's the natural way to write
+/// or copy a path while looking at the whole repo tree. `path_token_start` (below) correctly walks
+/// left to capture that whole token, including the segment(s) the fetcher already stripped, so the
+/// literal string can never equal a bundle-relative `all_paths` entry. A referenced path that ends
+/// with an available entry on a path boundary (`/`) is that entry with a redundant prefix, not a
+/// missing file — the same reasoning that already lets `src/references/tips.md` resolve against a
+/// nested `all_paths` entry, generalized to the case where the extra segment is the outer prefix
+/// rather than something inside the bundle.
+fn resolves_against_bundle(path: &str, available: &BTreeSet<&str>) -> bool {
+    available.contains(path)
+        || available
+            .iter()
+            .any(|entry| path.ends_with(&format!("/{entry}")))
 }
 
 pub(crate) fn has_unresolvable_internal_references(body: &str, all_paths: &[String]) -> bool {

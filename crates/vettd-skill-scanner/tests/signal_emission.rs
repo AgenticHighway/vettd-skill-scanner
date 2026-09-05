@@ -617,3 +617,46 @@ fn nested_internal_paths_resolve_against_the_complete_bundle_path() {
         "clean nested references are attested on the coverage channel"
     );
 }
+
+#[test]
+fn internal_paths_resolve_despite_a_redundant_repo_relative_prefix() {
+    // Authors often write a reference as it appears browsing the whole repository
+    // (`skills/pdf-tool/references/guide.md`) rather than bundle-root-relative
+    // (`references/guide.md`, what `all_paths` uses post-fetch — the fetcher already
+    // stripped the skill's own directory). The extra leading segment isn't itself part
+    // of the bundle, so a present file must not be reported missing just because the
+    // body's copy of the path is longer than the bundle-relative form.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee skills/pdf-tool/references/guide.md for notes.",
+        &["SKILL.md", "references/guide.md"],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "a redundant repo-relative prefix must not make a present file look missing"
+    );
+    assert!(
+        result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "reliability/unresolvable-internal-references"),
+        "clean redundant-prefix references are attested on the coverage channel"
+    );
+}
+
+#[test]
+fn genuinely_missing_paths_are_still_reported_despite_the_suffix_match() {
+    // The suffix-match relief above must not swallow a real miss: a referenced path with
+    // no matching bundle entry at all — by exact match or by suffix — is still reported.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee skills/pdf-tool/references/guide.md for notes.",
+        &["SKILL.md"],
+    );
+    let finding = signal(&result, "reliability/unresolvable-internal-references");
+    assert_eq!(
+        finding.detail.as_deref(),
+        Some("Unresolvable internal path(s): skills/pdf-tool/references/guide.md")
+    );
+}
