@@ -660,3 +660,20 @@ fn genuinely_missing_paths_are_still_reported_despite_the_suffix_match() {
         Some("Unresolvable internal path(s): skills/pdf-tool/references/guide.md")
     );
 }
+
+#[test]
+fn an_unrelated_files_matching_basename_does_not_suppress_a_real_miss() {
+    // references/guide.md is genuinely missing. The bundle happens to contain an unrelated
+    // top-level file that just shares the basename "guide.md" — this must NOT count as a match.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee references/guide.md for notes.",
+        &["SKILL.md", "guide.md"],
+    );
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "an unrelated file sharing a basename must not suppress a genuinely missing reference"
+    );
+}

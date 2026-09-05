@@ -343,11 +343,22 @@ pub(crate) fn missing_internal_references(body: &str, all_paths: &[String]) -> V
 /// missing file — the same reasoning that already lets `src/references/tips.md` resolve against a
 /// nested `all_paths` entry, generalized to the case where the extra segment is the outer prefix
 /// rather than something inside the bundle.
+///
+/// The suffix candidate must itself live under `references/`, `scripts/`, or `assets/` — the same
+/// constraint `internal_references` already applies when reading the body. Without it, any bundle
+/// file sharing a basename with a genuinely missing reference (e.g. a root-level `guide.md`
+/// alongside a missing `references/guide.md`) would falsely resolve, silently swallowing a real
+/// finding instead of only forgiving a redundant outer prefix.
 fn resolves_against_bundle(path: &str, available: &BTreeSet<&str>) -> bool {
     available.contains(path)
         || available
             .iter()
+            .filter(|entry| is_internal_reference_path(entry))
             .any(|entry| path.ends_with(&format!("/{entry}")))
+}
+
+fn is_internal_reference_path(path: &str) -> bool {
+    path.starts_with("references/") || path.starts_with("scripts/") || path.starts_with("assets/")
 }
 
 pub(crate) fn has_unresolvable_internal_references(body: &str, all_paths: &[String]) -> bool {
