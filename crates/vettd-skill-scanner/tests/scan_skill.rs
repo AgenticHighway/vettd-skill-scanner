@@ -64,6 +64,7 @@ fn scan(text_files: &HashMap<String, String>, all_paths: &[String]) -> SkillScan
 fn no_skill_md_sets_flag_false() {
     let result = scan(&HashMap::new(), &[]);
     assert!(!result.has_skill_md);
+    assert!(!result.has_assets);
 }
 
 #[test]
@@ -101,6 +102,14 @@ fn evals_dir_detected() {
     let (text_files, all_paths) = with_evals();
     let result = scan(&text_files, &all_paths);
     assert!(result.has_evals);
+}
+
+#[test]
+fn assets_dir_detected() {
+    let (text_files, mut all_paths) = with_skill_md();
+    all_paths.push("assets/template.json".to_string());
+    let result = scan(&text_files, &all_paths);
+    assert!(result.has_assets);
 }
 
 #[test]

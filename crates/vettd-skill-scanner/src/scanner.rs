@@ -822,6 +822,7 @@ pub fn scan_skill_with_repo_context(
         has_scripts,
         has_references,
         has_evals,
+        has_assets,
         file_count: all_paths.len(),
     })
 }
