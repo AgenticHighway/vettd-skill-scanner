@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use vettd_skill_scanner::{scan_skill, Severity, SkillScanResult};
+use vettd_skill_scanner::{
+    scan_skill, scan_skill_with_repo_context, RepoContext, Severity, SkillScanResult,
+};
 
 const OBSERVED_AT: &str = "2026-08-31T00:00:00Z";
 
@@ -14,6 +16,27 @@ fn scan(skill_md: &str, paths: &[&str]) -> SkillScanResult {
             .iter()
             .map(|path| (*path).to_string())
             .collect::<Vec<_>>(),
+        OBSERVED_AT,
+    )
+    .expect("valid RFC3339 timestamp")
+}
+
+fn scan_with_repo(
+    skill_md: &str,
+    paths: &[&str],
+    bundle_path: &str,
+    repo_paths: &[&str],
+) -> SkillScanResult {
+    let text_files = HashMap::from([("SKILL.md".to_string(), skill_md.to_string())]);
+    let all_paths: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
+    let repo_paths: Vec<String> = repo_paths.iter().map(|path| (*path).to_string()).collect();
+    scan_skill_with_repo_context(
+        &text_files,
+        &all_paths,
+        &RepoContext {
+            bundle_path,
+            repo_paths: &repo_paths,
+        },
         OBSERVED_AT,
     )
     .expect("valid RFC3339 timestamp")
@@ -616,4 +639,164 @@ fn nested_internal_paths_resolve_against_the_complete_bundle_path() {
             .any(|entry| entry.rule_id == "reliability/unresolvable-internal-references"),
         "clean nested references are attested on the coverage channel"
     );
+}
+
+#[test]
+fn internal_paths_resolve_despite_a_redundant_repo_relative_prefix() {
+    // Authors often write a reference as it appears browsing the whole repository
+    // (`skills/pdf-tool/references/guide.md`) rather than bundle-root-relative
+    // (`references/guide.md`, what `all_paths` uses post-fetch — the fetcher already
+    // stripped the skill's own directory). The extra leading segment isn't itself part
+    // of the bundle, so a present file must not be reported missing just because the
+    // body's copy of the path is longer than the bundle-relative form.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee skills/pdf-tool/references/guide.md for notes.",
+        &["SKILL.md", "references/guide.md"],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "a redundant repo-relative prefix must not make a present file look missing"
+    );
+    assert!(
+        result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "reliability/unresolvable-internal-references"),
+        "clean redundant-prefix references are attested on the coverage channel"
+    );
+}
+
+#[test]
+fn genuinely_missing_paths_are_still_reported_despite_the_suffix_match() {
+    // The suffix-match relief above must not swallow a real miss: a referenced path with
+    // no matching bundle entry at all — by exact match or by suffix — is still reported.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee skills/pdf-tool/references/guide.md for notes.",
+        &["SKILL.md"],
+    );
+    let finding = signal(&result, "reliability/unresolvable-internal-references");
+    assert_eq!(
+        finding.detail.as_deref(),
+        Some("Unresolvable internal path(s): skills/pdf-tool/references/guide.md")
+    );
+}
+
+#[test]
+fn an_unrelated_files_matching_basename_does_not_suppress_a_real_miss() {
+    // references/guide.md is genuinely missing. The bundle happens to contain an unrelated
+    // top-level file that just shares the basename "guide.md" — this must NOT count as a match.
+    let result = scan(
+        "---\nname: pdf-tool\n---\nSee references/guide.md for notes.",
+        &["SKILL.md", "guide.md"],
+    );
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "an unrelated file sharing a basename must not suppress a genuinely missing reference"
+    );
+}
+
+#[test]
+fn dot_dot_references_resolve_against_a_shared_repo_root_folder() {
+    // A repo-root `references/` folder several skills draw from, reached from
+    // `skills/ai-research-explore/` via `../../references/...` — the real shape found in
+    // lllllllama/rigorpilot-skills. Bundle-only resolution can never see this file: the fetcher
+    // scopes `all_paths` to the skill's own subtree, so it's absent there by construction.
+    let result = scan_with_repo(
+        "---\nname: ai-research-explore\n---\nLoad `../../references/agent-operating-principles.md` first.",
+        &["SKILL.md"],
+        "skills/ai-research-explore",
+        &[
+            "SKILL.md",
+            "references/agent-operating-principles.md",
+            "skills/ai-research-explore/SKILL.md",
+        ],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "a `..`-relative reference to a real repo-root file must resolve, not be flagged missing"
+    );
+}
+
+#[test]
+fn bare_paths_resolve_against_the_repo_root_when_absent_from_the_bundle() {
+    // A reference written as if relative to the repository root, with no `../` decoration at all
+    // — the real shape of `shared/scripts/lessons_store.py` in rigorpilot-skills'
+    // ai-research-reproduction skill. Indistinguishable in spelling from a bundle-relative
+    // reference, so it's checked against the repo root only after bundle resolution fails.
+    let result = scan_with_repo(
+        "---\nname: ai-research-reproduction\n---\nRecorded via `shared/scripts/lessons_store.py`.",
+        &["SKILL.md"],
+        "skills/ai-research-reproduction",
+        &["SKILL.md", "shared/scripts/lessons_store.py"],
+    );
+    assert!(
+        !result
+            .signals
+            .iter()
+            .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"),
+        "a bare reference matching a real repo-root path must resolve, not be flagged missing"
+    );
+}
+
+#[test]
+fn repo_context_still_reports_a_reference_missing_from_bundle_and_repo_alike() {
+    let result = scan_with_repo(
+        "---\nname: ai-research-explore\n---\nLoad `../../references/does-not-exist.md` first.",
+        &["SKILL.md"],
+        "skills/ai-research-explore",
+        &[
+            "SKILL.md",
+            "references/agent-operating-principles.md",
+            "skills/ai-research-explore/SKILL.md",
+        ],
+    );
+    let finding = signal(&result, "reliability/unresolvable-internal-references");
+    assert_eq!(
+        finding.detail.as_deref(),
+        Some("Unresolvable internal path(s): ../../references/does-not-exist.md")
+    );
+}
+
+#[test]
+fn dot_dot_navigating_above_the_repository_root_does_not_panic_or_falsely_resolve() {
+    // More `..` segments than the bundle path has — an author error, not a valid reference to
+    // anything. Must fail closed (reported missing), not panic on an out-of-bounds pop.
+    let result = scan_with_repo(
+        "---\nname: root-skill\n---\nLoad `../../references/x.md` first.",
+        &["SKILL.md"],
+        "skill", // one segment; two ".." exceeds it
+        &["SKILL.md", "references/x.md"],
+    );
+    let finding = signal(&result, "reliability/unresolvable-internal-references");
+    assert_eq!(
+        finding.detail.as_deref(),
+        Some("Unresolvable internal path(s): ../../references/x.md")
+    );
+}
+
+#[test]
+fn default_repo_context_behaves_exactly_like_scan_skill() {
+    // RepoContext::default() (bare zip upload, vettd-cli scanning a local directory — no repo
+    // concept) must be a true no-op: identical signals to plain scan_skill for the same input.
+    let skill_md = "---\nname: pdf-tool\n---\nSee references/guide.md for notes.";
+    let paths = &["SKILL.md"];
+    let via_scan_skill = scan(skill_md, paths);
+    let via_default_context = scan_with_repo(skill_md, paths, "", &[]);
+    assert_eq!(
+        via_scan_skill.signals.len(),
+        via_default_context.signals.len()
+    );
+    assert!(via_default_context
+        .signals
+        .iter()
+        .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"));
 }

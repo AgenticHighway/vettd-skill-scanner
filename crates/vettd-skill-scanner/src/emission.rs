@@ -17,9 +17,28 @@ use crate::skill_md::ParsedSkillMd;
 
 const SCAN_SOURCE_CLASS: &str = "scan";
 
+/// Extra context for resolving internal references that point outside the skill's own bundle —
+/// shared content that lives elsewhere in the same repository (e.g. a repo-root `references/`
+/// folder several skills draw from via `../../references/x.md`, or a bare repo-root-relative
+/// reference like `shared/scripts/x.py`). A caller with no repository concept (a bare zip upload,
+/// vettd-cli scanning a local directory) uses [`RepoContext::default`], and resolution falls back
+/// to bundle-only matching exactly as it was before this type existed.
+#[derive(Default)]
+pub struct RepoContext<'a> {
+    /// This skill's own directory, relative to the repository root (e.g. `"skills/pdf-tool"`).
+    /// Empty when the skill IS the repository root.
+    pub bundle_path: &'a str,
+    /// Every path in the repository, relative to the repository root — NOT scoped to this
+    /// skill's own subtree. Used only to resolve references that fall outside the bundle; never
+    /// influences structural presence flags (hasScripts/hasReferences/hasEvals), which stay
+    /// scoped to `all_paths` alone.
+    pub repo_paths: &'a [String],
+}
+
 pub(crate) fn emit_signals(
     parsed: &ParsedSkillMd,
     all_paths: &[String],
+    repo_context: &RepoContext<'_>,
     observed_at: &str,
     skill_md_content_present: bool,
 ) -> Vec<Signal> {
@@ -30,6 +49,7 @@ pub(crate) fn emit_signals(
     signals.extend(internal_reference_signal(
         &parsed.body,
         all_paths,
+        repo_context,
         observed_at,
     ));
     signals
@@ -299,8 +319,13 @@ fn list_claims(
         .collect()
 }
 
-fn internal_reference_signal(body: &str, all_paths: &[String], observed_at: &str) -> Vec<Signal> {
-    let missing = missing_internal_references(body, all_paths);
+fn internal_reference_signal(
+    body: &str,
+    all_paths: &[String],
+    repo_context: &RepoContext<'_>,
+    observed_at: &str,
+) -> Vec<Signal> {
+    let missing = missing_internal_references(body, all_paths, repo_context);
     if missing.is_empty() {
         return Vec::new();
     }
@@ -318,19 +343,102 @@ fn internal_reference_signal(body: &str, all_paths: &[String], observed_at: &str
     }]
 }
 
-/// Paths referenced in the SKILL.md body under `references/`, `scripts/`, or
-/// `assets/` that are absent from `all_paths`, in deterministic order.
-pub(crate) fn missing_internal_references(body: &str, all_paths: &[String]) -> Vec<String> {
+/// Paths referenced in the SKILL.md body under `references/`, `scripts/`, or `assets/` that
+/// resolve against neither the bundle nor (when `repo_context` carries one) the wider repository,
+/// in deterministic order.
+pub(crate) fn missing_internal_references(
+    body: &str,
+    all_paths: &[String],
+    repo_context: &RepoContext<'_>,
+) -> Vec<String> {
     let referenced = internal_references(body);
     let available: BTreeSet<&str> = all_paths.iter().map(String::as_str).collect();
+    let repo_paths: BTreeSet<&str> = repo_context.repo_paths.iter().map(String::as_str).collect();
     referenced
         .into_iter()
-        .filter(|path| !available.contains(path.as_str()))
+        .filter(|path| {
+            !resolves_against_bundle(path, &available)
+                && !resolves_against_repo(path, repo_context.bundle_path, &repo_paths)
+        })
         .collect()
 }
 
-pub(crate) fn has_unresolvable_internal_references(body: &str, all_paths: &[String]) -> bool {
-    !missing_internal_references(body, all_paths).is_empty()
+/// Whether a referenced path that failed bundle-relative resolution instead resolves against the
+/// wider repository: either by navigating `..` segments up from the skill's own directory (a
+/// folder shared by several skills, above the skill's own), or as a path already written relative
+/// to the repository root with no `../` decoration at all — some skills reference shared content
+/// that way, indistinguishable from a bundle-relative reference by spelling alone. An empty
+/// `repo_paths` (no repository context — a zip upload, vettd-cli scanning a bare directory) makes
+/// this a no-op, so resolution is unchanged for every caller without a repository to check.
+fn resolves_against_repo(path: &str, bundle_path: &str, repo_paths: &BTreeSet<&str>) -> bool {
+    if repo_paths.is_empty() {
+        return false;
+    }
+    repo_paths.contains(path)
+        || resolve_relative_to_bundle(bundle_path, path)
+            .is_some_and(|resolved| repo_paths.contains(resolved.as_str()))
+}
+
+/// Resolves `reference` against `bundle_path` the way a filesystem would: `..` pops the last
+/// segment, `.` and empty segments are no-ops, anything else is pushed. Returns `None` if the
+/// reference navigates above the repository root (more `..` segments than `bundle_path` has) —
+/// that can never be a valid repository-relative path.
+fn resolve_relative_to_bundle(bundle_path: &str, reference: &str) -> Option<String> {
+    let mut segments: Vec<&str> = if bundle_path.is_empty() {
+        Vec::new()
+    } else {
+        bundle_path.split('/').collect()
+    };
+    for part in reference.split('/') {
+        match part {
+            ".." => {
+                segments.pop()?;
+            }
+            "." | "" => {}
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// Whether a referenced path resolves against the bundle: present verbatim, or present once a
+/// redundant outer prefix is discarded.
+///
+/// `all_paths` is always bundle-root-relative (the fetcher strips the skill's own directory
+/// before handing paths to the scanner). Authors commonly write references as they appear
+/// browsing the full repository instead — e.g. `skills/pdf-tool/references/guide.md` for a file
+/// that is `references/guide.md` from the bundle root — because that's the natural way to write
+/// or copy a path while looking at the whole repo tree. `path_token_start` (below) correctly walks
+/// left to capture that whole token, including the segment(s) the fetcher already stripped, so the
+/// literal string can never equal a bundle-relative `all_paths` entry. A referenced path that ends
+/// with an available entry on a path boundary (`/`) is that entry with a redundant prefix, not a
+/// missing file — the same reasoning that already lets `src/references/tips.md` resolve against a
+/// nested `all_paths` entry, generalized to the case where the extra segment is the outer prefix
+/// rather than something inside the bundle.
+///
+/// The suffix candidate must itself live under `references/`, `scripts/`, or `assets/` — the same
+/// constraint `internal_references` already applies when reading the body. Without it, any bundle
+/// file sharing a basename with a genuinely missing reference (e.g. a root-level `guide.md`
+/// alongside a missing `references/guide.md`) would falsely resolve, silently swallowing a real
+/// finding instead of only forgiving a redundant outer prefix.
+fn resolves_against_bundle(path: &str, available: &BTreeSet<&str>) -> bool {
+    available.contains(path)
+        || available
+            .iter()
+            .filter(|entry| is_internal_reference_path(entry))
+            .any(|entry| path.ends_with(&format!("/{entry}")))
+}
+
+fn is_internal_reference_path(path: &str) -> bool {
+    path.starts_with("references/") || path.starts_with("scripts/") || path.starts_with("assets/")
+}
+
+pub(crate) fn has_unresolvable_internal_references(
+    body: &str,
+    all_paths: &[String],
+    repo_context: &RepoContext<'_>,
+) -> bool {
+    !missing_internal_references(body, all_paths, repo_context).is_empty()
 }
 
 pub(crate) fn has_internal_references(body: &str) -> bool {
