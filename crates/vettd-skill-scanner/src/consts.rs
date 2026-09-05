@@ -6,7 +6,7 @@
 /// Scanner version. Must stay in sync with `CURRENT_SCANNER_VERSION` in the
 /// vettd web app's `scanner-version.ts`. The server uses this value to detect
 /// stale scan results and trigger re-scans.
-pub const CURRENT_SCANNER_VERSION: u32 = 10;
+pub const CURRENT_SCANNER_VERSION: u32 = 11;
 
 /// Default `source` value for findings produced by this scanner.
 pub const DEFAULT_SOURCE: &str = "vettd";
