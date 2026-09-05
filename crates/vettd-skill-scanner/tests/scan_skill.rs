@@ -132,17 +132,20 @@ fn missing_skill_md_emits_critical_structure_finding() {
 }
 
 #[test]
-fn present_skill_md_emits_info_structure_finding() {
+fn present_skill_md_emits_no_structure_finding() {
+    // A present SKILL.md is a structural *positive* and travels on the
+    // `has_skill_md` result flag (and the coverage channel), not the finding
+    // channel. Only the missing-SKILL.md critical finding remains.
     let (text_files, all_paths) = with_skill_md();
     let result = scan(&text_files, &all_paths);
-    let f = result
-        .findings
-        .iter()
-        .find(|f| {
-            f.category == FindingCategory::Structure && f.label.to_lowercase().contains("skill.md")
-        })
-        .expect("should emit a structure finding about SKILL.md");
-    assert_eq!(f.severity, Severity::Info);
+    assert!(result.has_skill_md);
+    assert!(
+        !result
+            .findings
+            .iter()
+            .any(|f| f.category == FindingCategory::Structure),
+        "present SKILL.md must not emit structure findings"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -160,10 +163,9 @@ fn findings_span_multiple_categories() {
         .map(|f| f.category.as_str().to_string())
         .collect();
 
-    assert!(
-        categories.contains("structure"),
-        "missing structure findings"
-    );
+    // A well-formed skill emits quality findings across security, best
+    // practices, and description. No structure info findings are emitted —
+    // structural presence travels on the result flags and coverage channel.
     assert!(categories.contains("security"), "missing security findings");
     assert!(
         categories.contains("best-practices"),
@@ -172,6 +174,10 @@ fn findings_span_multiple_categories() {
     assert!(
         categories.contains("description"),
         "missing description findings"
+    );
+    assert!(
+        !categories.contains("structure"),
+        "structure findings must not be emitted for a present SKILL.md"
     );
 }
 

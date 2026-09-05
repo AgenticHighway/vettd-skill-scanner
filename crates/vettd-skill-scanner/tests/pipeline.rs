@@ -53,9 +53,11 @@ fn malicious_skill_produces_exfiltration_chain() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn clean_skill_produces_positive_security_rollups() {
-    // A well-formed skill with no malicious content should get the "no secrets"
-    // and "no behavioral signals" green-light findings.
+fn clean_skill_attests_security_checks_on_coverage_channel() {
+    // A well-formed skill with no malicious content gets the "no secrets"
+    // and "no behavioral signals" pass signals. These travel on the coverage
+    // channel as attestations, not as duplicate info findings on the finding
+    // channel.
     let body = "## Usage\nUse this skill to format JSON.\n\n## Steps\n1. Input your JSON.\n2. Get formatted output.\n\n## Examples\n```json\n{}\n```\n\n## Gotchas\nMake sure input is valid JSON.\n\n- [ ] Validate input\n- [ ] Check output";
     let skill = skill_md_with(
         "json-formatter",
@@ -74,12 +76,26 @@ fn clean_skill_produces_positive_security_rollups() {
     let result = scan(&text_files, &all_paths);
 
     assert!(
-        result.findings.iter().any(|f| f.rule_id == "VTD-0091"),
-        "clean skill should produce VTD-0091 (no secrets detected)"
+        result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "VTD-0091"),
+        "clean skill should attest VTD-0091 (no secrets detected) on the coverage channel"
     );
     assert!(
-        result.findings.iter().any(|f| f.rule_id == "VTD-0092"),
-        "clean skill should produce VTD-0092 (no behavioral signals)"
+        !result.findings.iter().any(|f| f.rule_id == "VTD-0091"),
+        "VTD-0091 must not be duplicated as a finding"
+    );
+    assert!(
+        result
+            .coverage
+            .iter()
+            .any(|entry| entry.rule_id == "VTD-0092"),
+        "clean skill should attest VTD-0092 (no behavioral signals) on the coverage channel"
+    );
+    assert!(
+        !result.findings.iter().any(|f| f.rule_id == "VTD-0092"),
+        "VTD-0092 must not be duplicated as a finding"
     );
     assert!(
         !result

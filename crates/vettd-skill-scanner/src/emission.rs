@@ -9,7 +9,6 @@ use yaml_rust2::Yaml;
 
 use crate::consts::DEFAULT_SOURCE;
 use crate::coverage::CoverageEntry;
-use crate::finding::Severity;
 use crate::language::language_for_path;
 use crate::signal::Signal;
 use crate::signal_rules::*;
@@ -145,58 +144,52 @@ fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal
     signals
 }
 
-/// Attestation entries for the four absence checks whose pass finding is
-/// already an `Info` finding. `#941` audit: these are emitted on the coverage
-/// channel (they describe the analysis, not the asset) and are duplicated by
-/// the existing findings only until the findings are removed in a follow-up.
-const ATTESTATIONS: [(&str, &str, &str); 4] = [
-    (
-        "VTD-0091",
-        "Secrets scan passed",
-        "No secrets or unsafe code patterns were detected.",
-    ),
-    (
-        "VTD-0092",
-        "Behavioral scan passed",
-        "No prompt-injection or jailbreak signals were detected.",
-    ),
-    (
-        "VTD-0093",
-        "External URL scan passed",
-        "No external URLs were found in scanned skill text.",
-    ),
-    (
-        "VTD-0099",
-        "Name validation passed",
-        "The declared skill name follows the supported naming rules.",
-    ),
-];
-
 pub(crate) fn coverage_entries(
-    findings: &[crate::finding::Finding],
-    clean_internal_references: bool,
+    has_skill_md: bool,
     skill_md_content_present: bool,
+    secrets_check_passed: bool,
+    behavioral_check_passed: bool,
+    external_urls_clean: bool,
+    name_valid: bool,
+    clean_internal_references: bool,
 ) -> Vec<CoverageEntry> {
-    if findings
-        .iter()
-        .any(|finding| finding.rule_id == "VTD-0095" && finding.severity == Severity::Critical)
-    {
+    if !has_skill_md {
         // A package without its required definition is not a completed skill
         // scan. Do not attest partial checks or emit coverage for it.
         return Vec::new();
     }
     let mut entries = Vec::new();
-    for (rule_id, label, detail) in ATTESTATIONS {
-        if rule_id == "VTD-0099" && !skill_md_content_present {
+    let attestation_flags: [(&str, &str, &str, bool); 4] = [
+        (
+            "VTD-0091",
+            "Secrets scan passed",
+            "No secrets or unsafe code patterns were detected.",
+            secrets_check_passed,
+        ),
+        (
+            "VTD-0092",
+            "behavioral scan passed",
+            "No prompt-injection or jailbreak signals were detected.",
+            behavioral_check_passed,
+        ),
+        (
+            "VTD-0093",
+            "External URL scan passed",
+            "No external URLs were found in scanned skill text.",
+            external_urls_clean,
+        ),
+        (
+            "VTD-0099",
+            "Name validation passed",
+            "The declared skill name follows the supported naming rules.",
             // A SKILL.md detected only through `all_paths` carries no content
             // and no declared name; the fallback sentinel name is not a name
             // to validate. Do not attest name validation in that case.
-            continue;
-        }
-        if findings
-            .iter()
-            .any(|finding| finding.rule_id == rule_id && finding.severity == Severity::Info)
-        {
+            name_valid && skill_md_content_present,
+        ),
+    ];
+    for (rule_id, label, detail, passed) in attestation_flags {
+        if passed {
             entries.push(CoverageEntry {
                 kind: "attestation".to_string(),
                 rule_id: rule_id.to_string(),

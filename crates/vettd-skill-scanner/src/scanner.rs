@@ -150,84 +150,25 @@ pub fn scan_skill_with_repo_context(
 
     // ── Structure checks ─────────────────────────────────────────────────────
     //
-    // #941 audit: existing info findings remain during the migration to the
-    // dedicated coverage channel. VTD-0091/0092/0093/0099-pass are attestations
-    // and are also emitted as coverage entries below. VTD-0095–0098 and VTD-0118
-    // are structural coverage notices already represented by result flags. The
-    // remaining info findings are neutral quality notices. Do not delete any of
-    // these findings until downstream coverage wiring is validated.
+    // #941 audit: the pass/info variants of these checks travel on the
+    // coverage channel and result flags instead of the finding channel.
+    // VTD-0091/0092/0093/0099-pass are attestations emitted as coverage
+    // entries below. VTD-0095–0098 and VTD-0118 are structural coverage notices
+    // already represented by result flags (has_skill_md / has_scripts /
+    // has_references / has_assets / has_evals) and the failures of VTD-0095 /
+    // VTD-0099 remain real findings. The duplicated info findings were removed
+    // once downstream coverage wiring was validated.
 
-    findings.push(if has_skill_md {
-        f!(
-            RULE_SKILL_MD,
-            FindingCategory::Structure,
-            Severity::Info,
-            "SKILL.md present",
-            "Required skill definition file found".to_string()
-        )
-    } else {
-        f!(
+    if !has_skill_md {
+        findings.push(f!(
             RULE_SKILL_MD,
             FindingCategory::Structure,
             Severity::Critical,
             "SKILL.md missing",
             "Every skill must contain a SKILL.md file with YAML frontmatter and instructions"
                 .to_string()
-        )
-    });
-
-    findings.push(if has_scripts {
-        f!(
-            RULE_SCRIPTS_DIRECTORY,
-            FindingCategory::Structure,
-            Severity::Info,
-            "scripts/ directory present",
-            "Bundled executable scripts found".to_string()
-        )
-    } else {
-        f!(
-            RULE_SCRIPTS_DIRECTORY,
-            FindingCategory::Structure,
-            Severity::Info,
-            "No scripts/ directory",
-            "Consider bundling reusable scripts for validation and automation".to_string()
-        )
-    });
-
-    if has_references {
-        findings.push(f!(
-            RULE_REFERENCES_DIRECTORY,
-            FindingCategory::Structure,
-            Severity::Info,
-            "references/ directory present",
-            "Additional documentation files available for progressive disclosure".to_string()
         ));
     }
-
-    if has_assets {
-        findings.push(f!(
-            RULE_ASSETS_DIRECTORY,
-            FindingCategory::Structure,
-            Severity::Info,
-            "assets/ directory present",
-            "Static resources (templates, schemas, etc.) found".to_string()
-        ));
-    }
-
-    findings.push(if has_evals {
-        f!(
-            RULE_EVALS_PRESENT,
-            FindingCategory::Evals,
-            Severity::Info,
-            "Evaluation test cases found",
-            "evals/ directory or evals.json present for testing skill quality".to_string()
-        )
-    } else {
-        f!(RULE_EVALS_PRESENT, FindingCategory::Evals, Severity::Info,
-           "No evaluation test cases",
-           "Add an evals/ directory with test prompts and expected outputs to measure skill quality"
-               .to_string())
-    });
 
     // ── SKILL.md-gated checks ────────────────────────────────────────────────
 
@@ -242,18 +183,9 @@ pub fn scan_skill_with_repo_context(
                 "Invalid name field",
                 err.to_string()
             ));
-        } else {
-            findings.push(f!(
-                RULE_SKILL_NAME_VALIDITY,
-                FindingCategory::Structure,
-                Severity::Info,
-                "Valid name field",
-                format!(
-                    "Name {:?} follows spec (lowercase, hyphens, \u{2264}64 chars)",
-                    parsed.name
-                )
-            ));
         }
+        // A valid name is a pass attestation on the coverage channel
+        // (VTD-0099), not a finding — see coverage_entries().
 
         // Name collision check (VTD-0100)
         const WELL_KNOWN_SKILL_NAMES: &[&str] = &[
@@ -679,36 +611,18 @@ pub fn scan_skill_with_repo_context(
     let (base64_secrets_failed, base64_behavioral_failed) =
         check_base64_payloads(text_files, &mut findings);
 
-    if !secrets_check_failed && !base64_secrets_failed {
-        findings.push(f!(
-            RULE_NO_SECRETS_DETECTED,
-            FindingCategory::Security,
-            Severity::Info,
-            "No secrets or unsafe code patterns detected",
-            "Scanned all files for credentials, private keys, and code-level risks \
-             (eval, shell exec, destructive ops)"
-                .to_string()
-        ));
-    }
+    let secrets_check_passed = !secrets_check_failed && !base64_secrets_failed;
 
     let (behavioral_findings, behavioral_check_failed) = scan_behavioral_patterns(text_files);
     findings.extend(behavioral_findings);
 
-    if !behavioral_check_failed && !base64_behavioral_failed {
-        findings.push(f!(
-            RULE_NO_BEHAVIORAL_SIGNALS,
-            FindingCategory::Security,
-            Severity::Info,
-            "No prompt injection or jailbreak signals detected",
-            "Scanned text content for instruction override, jailbreak framing, credential \
-             solicitation, and embedded injection markers"
-                .to_string()
-        ));
-    }
+    let behavioral_check_passed = !behavioral_check_failed && !base64_behavioral_failed;
 
     scan_hidden_unicode(text_files, &mut findings);
 
-    // External URL check
+    // External URL check. A found external URL stays a Medium finding; a clean
+    // scan is a pass attestation on the coverage channel (VTD-0093), not a
+    // finding — see coverage_entries().
     let url_target_files: Vec<(&str, &str)> = {
         let mut targets: Vec<(&str, &str)> = Vec::new();
         for name in &["SKILL.md", "skill.md"] {
@@ -726,7 +640,9 @@ pub fn scan_skill_with_repo_context(
         targets
     };
 
-    if !url_target_files.is_empty() {
+    let external_urls_clean = if url_target_files.is_empty() {
+        false
+    } else {
         let url_file = url_target_files.iter().find(|(_, c)| has_external_url(c));
         if let Some((path, _)) = url_file {
             findings.push(Finding {
@@ -744,16 +660,11 @@ pub fn scan_skill_with_repo_context(
                 intent: None,
                 source: DEFAULT_SOURCE.to_string(),
             });
+            false
         } else {
-            findings.push(f!(
-                RULE_NO_EXTERNAL_URLS,
-                FindingCategory::Security,
-                Severity::Info,
-                "No external URLs in skill definition",
-                "SKILL.md and references/ files do not reference external URLs".to_string()
-            ));
+            true
         }
-    }
+    };
 
     // ── Evals quality check ──────────────────────────────────────────────────
 
@@ -894,9 +805,13 @@ pub fn scan_skill_with_repo_context(
         text_files.contains_key(skill_key),
     );
     let coverage = coverage_entries(
-        &findings,
-        clean_internal_references,
+        has_skill_md,
         text_files.contains_key(skill_key),
+        secrets_check_passed,
+        behavioral_check_passed,
+        external_urls_clean,
+        validate_name(&parsed.name).is_none(),
+        clean_internal_references,
     );
 
     Ok(SkillScanResult {
