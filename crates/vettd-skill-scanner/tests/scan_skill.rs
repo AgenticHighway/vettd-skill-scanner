@@ -162,43 +162,36 @@ fn present_skill_md_emits_no_structure_finding() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn findings_span_multiple_categories() {
+fn benign_skill_emits_no_findings_quality_lives_on_signals() {
+    // The reclassification moved every non-safety finding (VTD-0083..0123)
+    // onto the signal channel, so a well-formed skill produces NO findings:
+    // the finding channel now carries only genuine safety/structural issues.
+    // The quality observations (body facts, description findings) must surface
+    // as signals instead — that is where this test's successors assert them.
     let (text_files, all_paths) = with_skill_md();
     let result = scan(&text_files, &all_paths);
 
-    let categories: std::collections::HashSet<String> = result
-        .findings
-        .iter()
-        .map(|f| f.category.as_str().to_string())
-        .collect();
-
-    // A well-formed skill emits quality findings across security, best
-    // practices, and description. No structure info findings are emitted —
-    // structural presence travels on the result flags and coverage channel.
-    assert!(categories.contains("security"), "missing security findings");
     assert!(
-        categories.contains("best-practices"),
-        "missing best-practices findings"
+        result.findings.is_empty(),
+        "a benign skill must not produce findings: {:?}",
+        result
+            .findings
+            .iter()
+            .map(|f| (&f.rule_id, &f.label))
+            .collect::<Vec<_>>()
     );
     assert!(
-        categories.contains("description"),
-        "missing description findings"
-    );
-    assert!(
-        !categories.contains("structure"),
-        "structure findings must not be emitted for a present SKILL.md"
+        result
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "reliability/examples"),
+        "body quality is observable on the signal channel"
     );
 }
 
 #[test]
 fn findings_span_multiple_severities() {
-    // A well-formed skill produces info-only findings.
-    let (text_files, all_paths) = with_skill_md();
-    let result = scan(&text_files, &all_paths);
-    let has_info = result.findings.iter().any(|f| f.severity == Severity::Info);
-    assert!(has_info, "missing info findings");
-
-    // A skill with no SKILL.md must produce a critical finding.
+    // A skill with no SKILL.md produces a critical structure finding.
     let bad = scan(&HashMap::new(), &[]);
     let has_critical = bad
         .findings
@@ -208,33 +201,78 @@ fn findings_span_multiple_severities() {
         has_critical,
         "missing critical finding when SKILL.md absent"
     );
-}
 
-#[test]
-fn scripts_category_present_when_scripts_dir_exists() {
-    let (text_files, all_paths) = with_scripts();
+    // Severity *variety* on the finding channel now comes from genuine
+    // safety issues only; the old info/low/high quality findings are signals.
+    let (text_files, all_paths) = with_skill_md();
     let result = scan(&text_files, &all_paths);
-    let has_scripts_finding = result
-        .findings
-        .iter()
-        .any(|f| f.category == FindingCategory::Scripts);
     assert!(
-        has_scripts_finding,
-        "no scripts category finding when scripts/ is present"
+        result.findings.is_empty(),
+        "a benign skill carries no findings of any severity"
     );
 }
 
 #[test]
-fn evals_category_present_when_evals_dir_exists() {
+fn scripts_dir_emits_script_signals_not_scripts_findings() {
+    // The script-derived rules (VTD-0114..0117) are compatibility signals now:
+    // a scripts/ dir with a plain CLI script yields the cli-help and
+    // structured-output facts (aggregated "absent"), and no findings — the
+    // interactive/unpinned failure branches only fire when actually present.
+    let (text_files, all_paths) = with_scripts();
+    let result = scan(&text_files, &all_paths);
+    assert!(
+        !result
+            .findings
+            .iter()
+            .any(|f| f.category == FindingCategory::Scripts),
+        "scripts/ must not produce findings after the reclassification"
+    );
+    assert_eq!(
+        result
+            .signals
+            .iter()
+            .filter(|s| s.rule_id == "compatibility/cli-help")
+            .count(),
+        1,
+        "cli-help fact must be emitted for the analyzed script"
+    );
+    let cli_help = result
+        .signals
+        .iter()
+        .find(|s| s.rule_id == "compatibility/cli-help")
+        .expect("cli-help fact");
+    assert_eq!(cli_help.value_text.as_deref(), Some("absent"));
+    assert_eq!(cli_help.derivation.as_deref(), Some("read"));
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "compatibility/structured-output"),
+        "structured-output fact must be emitted alongside cli-help"
+    );
+}
+
+#[test]
+fn evals_dir_emits_eval_signals_not_evals_findings() {
+    // The eval rules (VTD-0119..0123) are signals now: a non-JSON eval file in
+    // evals/ surfaces as the characteristics/eval-file-format fact ("present"),
+    // and no evals-category findings are emitted.
     let (text_files, all_paths) = with_evals();
     let result = scan(&text_files, &all_paths);
-    let has_evals_finding = result
-        .findings
-        .iter()
-        .any(|f| f.category == FindingCategory::Evals);
     assert!(
-        has_evals_finding,
-        "no evals category finding when evals/ is present"
+        !result
+            .findings
+            .iter()
+            .any(|f| f.category == FindingCategory::Evals),
+        "evals/ must not produce findings after the reclassification"
+    );
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "characteristics/eval-file-format"
+                && s.value_text.as_deref() == Some("present")),
+        "a non-JSON eval file is a present eval-file-format fact"
     );
 }
 

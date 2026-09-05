@@ -9,15 +9,12 @@ use crate::checks::description::check_description_behavior_mismatch;
 use crate::checks::encoding::{check_base64_payloads, scan_hidden_unicode};
 use crate::checks::sensitive::{scan_entropy, scan_env_files, scan_sensitive_patterns};
 use crate::checks::typosquat::check_typosquat;
-use crate::consts::{
-    DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES, EVAL_JSON_CANDIDATES,
-    SKILL_MD_BODY_MAX_LINES,
-};
+use crate::consts::{DEFAULT_SOURCE, EVAL_JSON_CANDIDATES};
 use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
-    RepoContext,
+    ReclassifiedAnalysis, RepoContext,
 };
-use crate::finding::{Finding, FindingCategory, Intent, Severity};
+use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
 use crate::skill_md::body::{
@@ -98,6 +95,12 @@ pub fn scan_skill_with_repo_context(
         return Err(ScanError::InvalidObservedAt(observed_at.to_string()));
     }
     let mut findings: Vec<Finding> = Vec::new();
+    // Analysis values feeding the reclassified quality/characteristics/
+    // compatibility signals — computed where the old finding pushes lived so
+    // the emission step stays a pure render of these booleans/counts. All
+    // signals gate on content presence at emission time, so the defaults here
+    // are harmless for path-only SKILL.md scans.
+    let mut reclassified = ReclassifiedAnalysis::default();
 
     // ── Structural presence flags ────────────────────────────────────────────
 
@@ -231,23 +234,10 @@ pub fn scan_skill_with_repo_context(
             ));
         }
 
-        // Repository link check (VTD-0083)
-        if parsed.repository.is_empty() {
-            findings.push(Finding {
-                rule_id: RULE_NO_REPOSITORY_LINK.to_string(),
-                category: FindingCategory::Security,
-                severity: Severity::Info,
-                label: "No repository link".to_string(),
-                detail: "No repository field found in SKILL.md frontmatter. Skills without a \
-                         verifiable source repository cannot be externally audited."
-                    .to_string(),
-                filepath: None,
-                owasp_llm_category: None,
-                chain_id: None,
-                intent: Some(Intent::Negligent),
-                source: DEFAULT_SOURCE.to_string(),
-            });
-        }
+        // Repository link check (VTD-0083 → characteristics/repository-link fact).
+        // The absent state ("no repository field") is a fact now, not an info
+        // finding — presence itself is characteristic information.
+        reclassified.repository_present = !parsed.repository.is_empty();
 
         // System prompt leakage check (VTD-0085)
         {
@@ -274,70 +264,13 @@ pub fn scan_skill_with_repo_context(
             }
         }
 
-        // Description checks
-        if parsed.description.is_empty() {
-            findings.push(f!(
-                RULE_DESCRIPTION_PRESENT,
-                FindingCategory::Description,
-                Severity::Info,
-                "Missing description field",
-                "The description field is required and should describe what the skill \
-                 does and when to use it"
-                    .to_string()
-            ));
-        } else {
-            let char_count = parsed.description.chars().count();
-            findings.push(if char_count > DESCRIPTION_MAX_LENGTH {
-                f!(
-                    RULE_DESCRIPTION_LENGTH,
-                    FindingCategory::Description,
-                    Severity::Info,
-                    "Description exceeds 1024-character limit",
-                    format!(
-                        "Description is {char_count} characters (max: {DESCRIPTION_MAX_LENGTH})"
-                    )
-                )
-            } else {
-                f!(
-                    RULE_DESCRIPTION_LENGTH,
-                    FindingCategory::Description,
-                    Severity::Info,
-                    "Description within character limit",
-                    format!("{char_count}/{DESCRIPTION_MAX_LENGTH} characters used")
-                )
-            });
-
-            findings.push(if has_usage_context(&parsed.description) {
-                f!(
-                    RULE_DESCRIPTION_CONTEXT,
-                    FindingCategory::Description,
-                    Severity::Info,
-                    "Description includes usage context",
-                    "Good: description explains when to activate the skill".to_string()
-                )
-            } else {
-                f!(
-                    RULE_DESCRIPTION_CONTEXT,
-                    FindingCategory::Description,
-                    Severity::Info,
-                    "Description lacks usage context",
-                    "Add context like \"Use this skill when...\" to help agents know \
-                    when to activate it"
-                        .to_string()
-                )
-            });
-
-            if parsed.description.split_whitespace().count() < 5 {
-                findings.push(f!(
-                    RULE_DESCRIPTION_BREVITY,
-                    FindingCategory::Description,
-                    Severity::Info,
-                    "Description too brief",
-                    "A few sentences covering scope and trigger conditions improves \
-                    activation accuracy"
-                        .to_string()
-                ));
-            }
+        // Description checks (VTD-0109..0113 → reclassified signals).
+        // The analysis still runs here; the emitters consume the results.
+        reclassified.description_present = !parsed.description.is_empty();
+        if !parsed.description.is_empty() {
+            reclassified.description_char_count = parsed.description.chars().count();
+            reclassified.description_usage_context = has_usage_context(&parsed.description);
+            reclassified.description_word_count = parsed.description.split_whitespace().count();
 
             {
                 static OVERCLAIM_RE: OnceLock<Regex> = OnceLock::new();
@@ -345,106 +278,21 @@ pub fn scan_skill_with_repo_context(
                     Regex::new(r"(?i)\b(?:anything|everything|all\s+(?:files?|data|tasks?|requests?|inputs?|things?)|any\s+(?:file|task|request|input|thing)|whatever)\b")
                         .expect("bad overclaim re")
                 });
-                if overclaim_re.is_match(&parsed.description) {
-                    findings.push(f!(
-                        RULE_DESCRIPTION_SCOPE,
-                        FindingCategory::Description,
-                        Severity::Low,
-                        "Description overclaims scope",
-                        "Broad trigger words (anything, everything, all files, etc.) widen attack surface — narrow to specific use cases"
-                            .to_string()
-                    ));
-                }
+                reclassified.description_overclaimed = overclaim_re.is_match(&parsed.description);
             }
         }
 
-        // Body quality checks
+        // Body quality checks (VTD-0101 removed; VTD-0102..0108 → reclassified
+        // signals). Body *line* count (VTD-0101) is superseded by the
+        // performance/static-context-tokens measurement, so it is dropped
+        // entirely.
         if !parsed.body.trim().is_empty() {
-            let body_lines = parsed.body.split('\n').count();
-
-            findings.push(if body_lines > SKILL_MD_BODY_MAX_LINES {
-                f!(RULE_SKILL_MD_BODY_LENGTH, FindingCategory::BestPractices, Severity::Info,
-                   "SKILL.md exceeds 500 lines",
-                   format!("{body_lines} lines — consider moving detailed reference material to references/"))
-            } else {
-                f!(RULE_SKILL_MD_BODY_LENGTH, FindingCategory::BestPractices, Severity::Info,
-                   "SKILL.md body length is reasonable",
-                   format!("{body_lines} lines (recommended: under 500)"))
-            });
-
-            if has_gotchas(&parsed.body) {
-                findings.push(f!(
-                    RULE_GOTCHAS_SECTION,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Gotchas section found",
-                    "Documents environment-specific facts and common pitfalls".to_string()
-                ));
-            }
-
-            findings.push(if has_examples(&parsed.body) {
-                f!(
-                    RULE_EXAMPLES_PRESENT,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Examples included",
-                    "Found code blocks, input/output samples, or an examples section — \
-                    concrete samples help agents pattern-match effectively"
-                        .to_string()
-                )
-            } else {
-                f!(
-                    RULE_EXAMPLES_PRESENT,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "No examples found",
-                    "Add code blocks, input/output samples, or before/after examples \
-                    to improve agent accuracy"
-                        .to_string()
-                )
-            });
-
-            if has_checklist(&parsed.body) {
-                findings.push(f!(
-                    RULE_CHECKLIST_PRESENT,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Checklist pattern found",
-                    "Explicit checklists help agents track progress in multi-step workflows"
-                        .to_string()
-                ));
-            }
-
-            findings.push(if has_workflow(&parsed.body) {
-                f!(
-                    RULE_WORKFLOW_STRUCTURE,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Step-by-step workflow found",
-                    "Structured procedures improve reliability for complex tasks".to_string()
-                )
-            } else {
-                f!(
-                    RULE_WORKFLOW_STRUCTURE,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "No clear workflow structure",
-                    "Consider adding numbered steps or a structured procedure for the \
-                    agent to follow"
-                        .to_string()
-                )
-            });
-
-            if has_validation(&parsed.body) {
-                findings.push(f!(
-                    RULE_VALIDATION_LOOP,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Validation loop referenced",
-                    "Instructions for the agent to validate its own work before proceeding"
-                        .to_string()
-                ));
-            }
+            reclassified.body_present = true;
+            reclassified.gotchas_section = has_gotchas(&parsed.body);
+            reclassified.examples = has_examples(&parsed.body);
+            reclassified.checklist_pattern = has_checklist(&parsed.body);
+            reclassified.step_by_step_workflow = has_workflow(&parsed.body);
+            reclassified.validation_loop = has_validation(&parsed.body);
 
             let body_refs_files = parsed.body.contains("references/")
                 || parsed.body.contains("scripts/")
@@ -455,18 +303,8 @@ pub fn scan_skill_with_repo_context(
                         .get_or_init(|| Regex::new(r"(?i)read.*\.md").expect("bad read md re"));
                     re.is_match(&parsed.body)
                 };
-            if body_refs_files && (has_references || has_scripts || has_assets) {
-                findings.push(f!(
-                    RULE_PROGRESSIVE_DISCLOSURE,
-                    FindingCategory::BestPractices,
-                    Severity::Info,
-                    "Progressive disclosure used",
-                    "SKILL.md body references files in references/, scripts/, or assets/ — \
-                     agents can load additional context on demand instead of consuming \
-                     everything upfront"
-                        .to_string()
-                ));
-            }
+            reclassified.progressive_disclosure =
+                body_refs_files && (has_references || has_scripts || has_assets);
 
             const GENERIC_PHRASES: &[&str] = &[
                 "follow best practices",
@@ -475,23 +313,21 @@ pub fn scan_skill_with_repo_context(
                 "ensure quality",
             ];
             let body_lower = parsed.body.to_lowercase();
-            for &phrase in GENERIC_PHRASES {
-                if body_lower.contains(phrase) {
-                    findings.push(f!(
-                        RULE_GENERIC_INSTRUCTION,
-                        FindingCategory::BestPractices,
-                        Severity::Info,
-                        "Generic instruction detected",
-                        format!(
-                            "\"{phrase}\" is too vague — provide specific, actionable guidance instead"
-                        )
-                    ));
-                }
-            }
+            // VTD-0108 fired once per matched phrase (0-4x). The signal is one
+            // row whose detail states the count — see emission.
+            reclassified.generic_instruction_count = GENERIC_PHRASES
+                .iter()
+                .filter(|phrase| body_lower.contains(**phrase))
+                .count();
         }
     }
 
-    // ── Scripts checks ───────────────────────────────────────────────────────
+    // ── Scripts checks (VTD-0114..0117 → reclassified signals) ───────────────
+    // Aggregated per-skill: the script-derived signals describe the scripts/
+    // interface as a whole, so "present" means ANY analyzed CLI script has the
+    // attribute. When no CLI script exists there is no interface to describe —
+    // the four compatibility signals are skipped entirely (`scripts_analyzed`),
+    // matching the finding-block structure they replace.
 
     if has_scripts {
         let mut script_files: Vec<(&str, &str)> = text_files
@@ -515,82 +351,14 @@ pub fn scan_skill_with_repo_context(
             Regex::new(r"(?i)dependencies\s*=\s*\[|require\(|import\s").expect("bad dep re")
         });
 
-        for (path, content) in script_files {
-            findings.push(Finding {
-                rule_id: RULE_SCRIPT_CLI_HELP.to_string(),
-                category: FindingCategory::Scripts,
-                severity: Severity::Info,
-                label: if has_cli_hint(content) {
-                    "CLI help supported".to_string()
-                } else {
-                    "No --help support".to_string()
-                },
-                detail: if has_cli_hint(content) {
-                    format!("{path}: Script documents its interface via --help or argument parsing")
-                } else {
-                    format!("{path}: Add argument parsing with --help output so agents know the script's interface")
-                },
-                filepath: Some(path.to_string()),
-                owasp_llm_category: None,
-                chain_id: None,
-                intent: None,
-                source: DEFAULT_SOURCE.to_string(),
-            });
-
-            if interactive_re.is_match(content) {
-                findings.push(Finding {
-                    rule_id: RULE_SCRIPT_INTERACTIVE_PROMPTS.to_string(),
-                    category: FindingCategory::Scripts,
-                    severity: Severity::High,
-                    label: "Interactive prompts detected".to_string(),
-                    detail: format!(
-                        "{path}: Agents run in non-interactive shells — replace prompts with CLI flags or stdin"
-                    ),
-                    filepath: Some(path.to_string()),
-                    owasp_llm_category: None,
-                    chain_id: None,
-                    intent: None,
-                    source: DEFAULT_SOURCE.to_string(),
-                });
-            }
-
-            if structured_re.is_match(content) {
-                findings.push(Finding {
-                    rule_id: RULE_SCRIPT_STRUCTURED_OUTPUT.to_string(),
-                    category: FindingCategory::Scripts,
-                    severity: Severity::Info,
-                    label: "Structured output format".to_string(),
-                    detail: format!(
-                        "{path}: Uses JSON/CSV output which is easily parseable by agents"
-                    ),
-                    filepath: Some(path.to_string()),
-                    owasp_llm_category: None,
-                    chain_id: None,
-                    intent: None,
-                    source: DEFAULT_SOURCE.to_string(),
-                });
-            }
-
-            {
-                let has_pinned_deps = dep_re.is_match(content);
-                if has_pinned_deps && content.contains(">=") && !content.contains('<') {
-                    findings.push(Finding {
-                        rule_id: RULE_SCRIPT_DEPENDENCY_PINNING.to_string(),
-                        category: FindingCategory::Scripts,
-                        severity: Severity::Low,
-                        label: "Unpinned dependency versions".to_string(),
-                        detail: format!(
-                            "{path}: Pin dependency versions for reproducibility \
-                            (e.g., >=4.12,<5 instead of >=4.12)"
-                        ),
-                        filepath: Some(path.to_string()),
-                        owasp_llm_category: None,
-                        chain_id: None,
-                        intent: None,
-                        source: DEFAULT_SOURCE.to_string(),
-                    });
-                }
-            }
+        reclassified.scripts_analyzed = !script_files.is_empty();
+        for (_, content) in &script_files {
+            reclassified.script_cli_help |= has_cli_hint(content);
+            reclassified.script_interactive_prompts |= interactive_re.is_match(content);
+            reclassified.script_structured_output |= structured_re.is_match(content);
+            let has_pinned_deps = dep_re.is_match(content);
+            reclassified.script_unpinned_dependencies |=
+                has_pinned_deps && content.contains(">=") && !content.contains('<');
         }
     }
 
@@ -666,9 +434,10 @@ pub fn scan_skill_with_repo_context(
         }
     };
 
-    // ── Evals quality check ──────────────────────────────────────────────────
+    // ── Evals quality check (VTD-0119..0123 → reclassified signals) ─────────
 
     if has_evals {
+        reclassified.evals_present = true;
         let eval_json_content = EVAL_JSON_CANDIDATES
             .iter()
             .find_map(|&candidate| text_files.get(candidate));
@@ -688,16 +457,9 @@ pub fn scan_skill_with_repo_context(
                     .or_else(|| val.as_array());
 
                 if let Some(cases) = evals.filter(|a| !a.is_empty()) {
-                    let count = cases.len();
-                    findings.push(f!(
-                        RULE_EVALS_TEST_CASE_COUNT,
-                        FindingCategory::Evals,
-                        Severity::Info,
-                        "Test cases defined",
-                        format!("{count} test case(s) found in evals JSON")
-                    ));
+                    reclassified.eval_case_count = Some(cases.len());
 
-                    let has_assertions = cases.iter().any(|e| {
+                    reclassified.eval_has_assertions = cases.iter().any(|e| {
                         (e.get("assertions")
                             .and_then(|v| v.as_array())
                             .map(|a| !a.is_empty())
@@ -717,38 +479,6 @@ pub fn scan_skill_with_repo_context(
                             || e.get("golden_answer").and_then(|v| v.as_str()).is_some()
                             || e.get("rubric").and_then(|v| v.as_str()).is_some()
                     });
-                    findings.push(if has_assertions {
-                        f!(
-                            RULE_EVALS_ASSERTIONS,
-                            FindingCategory::Evals,
-                            Severity::Info,
-                            "Assertions defined for test cases",
-                            "Verifiable assertions or expected outputs enable automated grading of skill outputs"
-                                .to_string()
-                        )
-                    } else {
-                        f!(
-                            RULE_EVALS_ASSERTIONS,
-                            FindingCategory::Evals,
-                            Severity::Info,
-                            "No assertions in test cases",
-                            "Add verifiable assertions, expected outputs, or criteria to each test case"
-                                .to_string()
-                        )
-                    });
-
-                    if count < EVALS_MIN_TEST_CASES {
-                        findings.push(f!(
-                            RULE_EVALS_MIN_COUNT,
-                            FindingCategory::Evals,
-                            Severity::Info,
-                            "Few test cases",
-                            format!(
-                                "Consider adding at least {EVALS_MIN_TEST_CASES} test cases \
-                                 covering varied prompts and edge cases"
-                            )
-                        ));
-                    }
                 }
             }
         }
@@ -769,18 +499,10 @@ pub fn scan_skill_with_repo_context(
                 })
                 .count();
 
-            if non_trivial_count > 0 {
-                findings.push(f!(
-                    RULE_EVAL_FILES_FOUND,
-                    FindingCategory::Evals,
-                    Severity::Info,
-                    "Eval files found",
-                    format!(
-                        "{non_trivial_count} evaluation file(s) detected in non-JSON format \
-                             (markdown, YAML, JSONL, etc.)"
-                    )
-                ));
-            }
+            // `characteristics/eval-file-format` fact: "present" when the
+            // skill ships evals in a non-JSON format, "absent" when they are
+            // JSON (or no non-JSON files exist).
+            reclassified.eval_non_json_files = non_trivial_count > 0;
         }
     }
 
@@ -803,6 +525,7 @@ pub fn scan_skill_with_repo_context(
         repo_context,
         observed_at,
         text_files.contains_key(skill_key),
+        &reclassified,
     );
     let coverage = coverage_entries(
         has_skill_md,

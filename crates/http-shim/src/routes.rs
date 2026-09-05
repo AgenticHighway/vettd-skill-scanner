@@ -195,12 +195,16 @@ mod tests {
     // Wire parity: first-party findings omit `source` (serde skips the
     // default "vettd") — the suite's adapter relies on this and fills the
     // field itself. If this test breaks, that adapter contract changed.
+    // A package with no SKILL.md at all is used so the finding channel is
+    // guaranteed non-empty: the reclassification moved the quality findings
+    // (VTD-0083..0123) onto the signal channel, so a minimal well-formed
+    // skill no longer produces findings by itself.
     #[tokio::test]
     async fn first_party_findings_omit_source_on_the_wire() {
         let response = router()
             .oneshot(scan_request(serde_json::json!({
-                "textFiles": {"SKILL.md": "# Skill"},
-                "allPaths": ["SKILL.md"],
+                "textFiles": {},
+                "allPaths": [],
             })))
             .await
             .expect("response");

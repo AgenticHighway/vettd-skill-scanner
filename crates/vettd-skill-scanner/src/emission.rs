@@ -7,7 +7,7 @@ use regex::Regex;
 use tiktoken_rs::cl100k_base_singleton;
 use yaml_rust2::Yaml;
 
-use crate::consts::DEFAULT_SOURCE;
+use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
 use crate::language::language_for_path;
 use crate::signal::Signal;
@@ -15,6 +15,79 @@ use crate::signal_rules::*;
 use crate::skill_md::ParsedSkillMd;
 
 const SCAN_SOURCE_CLASS: &str = "scan";
+
+/// Per-skill analysis values computed in `scanner.rs` that feed the
+/// reclassified quality/characteristics/compatibility signals. The analysis
+/// (body helpers, script regexes, description counts) lives next to the
+/// finding blocks it replaced; emission consumes the results, never re-runs
+/// the checks.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReclassifiedAnalysis {
+    // ── characteristics/repository-link ──────────────────────────────────
+    /// Frontmatter `repository:` field carries a value.
+    pub repository_present: bool,
+    // ── description-derived ──────────────────────────────────────────────
+    /// Description field is non-empty.
+    pub description_present: bool,
+    /// Description char count (drives `cost/description-length`).
+    pub description_char_count: usize,
+    /// Description word count (drives `reliability/description-briefness`).
+    pub description_word_count: usize,
+    /// Description carries "use when..."-style usage context.
+    pub description_usage_context: bool,
+    /// Description overclaims scope with broad trigger words.
+    pub description_overclaimed: bool,
+    // ── body-derived ─────────────────────────────────────────────────────
+    /// SKILL.md body is non-empty — the body facts gate on this.
+    pub body_present: bool,
+    pub gotchas_section: bool,
+    pub examples: bool,
+    pub checklist_pattern: bool,
+    pub validation_loop: bool,
+    pub step_by_step_workflow: bool,
+    pub progressive_disclosure: bool,
+    /// Number of generic-instruction phrases matched (collapsed to one row).
+    pub generic_instruction_count: usize,
+    // ── script-derived (aggregated across analyzed CLI scripts) ──────────
+    /// At least one CLI script was analyzed — the 4 script signals gate on
+    /// this (no scripts means no interface to describe).
+    pub scripts_analyzed: bool,
+    pub script_cli_help: bool,
+    pub script_interactive_prompts: bool,
+    pub script_structured_output: bool,
+    pub script_unpinned_dependencies: bool,
+    // ── evals-derived ────────────────────────────────────────────────────
+    /// Eval files exist — `characteristics/eval-file-format` gates on this.
+    pub evals_present: bool,
+    /// Parsed eval test-case count (drives the measurement + sufficiency finding).
+    pub eval_case_count: Option<usize>,
+    /// Any eval case carries assertions/expected output.
+    pub eval_has_assertions: bool,
+    /// Non-JSON-format eval files are present.
+    pub eval_non_json_files: bool,
+}
+
+pub(crate) fn emit_signals(
+    parsed: &ParsedSkillMd,
+    all_paths: &[String],
+    repo_context: &RepoContext<'_>,
+    observed_at: &str,
+    skill_md_content_present: bool,
+    reclassified: &ReclassifiedAnalysis,
+) -> Vec<Signal> {
+    let mut signals = emit_scalar_signals(parsed, all_paths, observed_at, skill_md_content_present);
+    if skill_md_content_present {
+        signals.extend(emit_declared_claims(parsed, observed_at));
+        signals.extend(emit_reclassified_signals(reclassified, observed_at));
+    }
+    signals.extend(internal_reference_signal(
+        &parsed.body,
+        all_paths,
+        repo_context,
+        observed_at,
+    ));
+    signals
+}
 
 /// Extra context for resolving internal references that point outside the skill's own bundle —
 /// shared content that lives elsewhere in the same repository (e.g. a repo-root `references/`
@@ -32,26 +105,6 @@ pub struct RepoContext<'a> {
     /// influences structural presence flags (hasScripts/hasReferences/hasEvals), which stay
     /// scoped to `all_paths` alone.
     pub repo_paths: &'a [String],
-}
-
-pub(crate) fn emit_signals(
-    parsed: &ParsedSkillMd,
-    all_paths: &[String],
-    repo_context: &RepoContext<'_>,
-    observed_at: &str,
-    skill_md_content_present: bool,
-) -> Vec<Signal> {
-    let mut signals = emit_scalar_signals(parsed, all_paths, observed_at, skill_md_content_present);
-    if skill_md_content_present {
-        signals.extend(emit_declared_claims(parsed, observed_at));
-    }
-    signals.extend(internal_reference_signal(
-        &parsed.body,
-        all_paths,
-        repo_context,
-        observed_at,
-    ));
-    signals
 }
 
 fn emit_scalar_signals(
@@ -83,6 +136,276 @@ fn emit_scalar_signals(
             observed_at,
         ),
     ]
+}
+
+/// The 21 reclassified non-safety signals (see the reclassify plan §3-§4).
+///
+/// Emission rules differ by kind:
+/// - **Facts** collapse the old pass/fail twin findings into one row whose
+///   `value_text` is the state (`"present"`/`"absent"`), with `derivation:
+///   read`. Body facts emit for every skill with a non-empty body (presence
+///   is itself information); the description usage-context fact emits only
+///   when a description exists; the repository-link and eval-file-format
+///   facts emit whenever the thing they describe exists.
+/// - **Findings** emit only their failure branch (severity-bearing), e.g.
+///   `cost/description-length` only when the description exceeds the limit.
+///   `reliability/generic-instruction` collapses 0..n phrase matches into one
+///   row whose `detail` carries the count.
+/// - **Measurements** emit a `value_num` + `method`; no derivation.
+///
+/// All rows are gated upstream on `skill_md_content_present` (this fn is only
+/// called from that branch) — a path-only SKILL.md has no content to analyze.
+fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str) -> Vec<Signal> {
+    let mut signals = Vec::new();
+
+    // characteristics/repository-link — fact, always for content-present skills.
+    // The repository field is frontmatter, not body, so it exists independently
+    // of `body_present`; an empty field is the "absent" state, not a skip.
+    signals.push(fact(
+        REPOSITORY_LINK,
+        "Repository link",
+        state(analysis.repository_present),
+        observed_at,
+    ));
+
+    // ── description-derived ──────────────────────────────────────────────
+    if !analysis.description_present {
+        // reliability/description-presence — finding, missing branch only.
+        signals.push(Signal {
+            severity: Some("info".to_string()),
+            detail: Some(
+                "The description field is required and should describe what the skill \
+                 does and when to use it"
+                    .to_string(),
+            ),
+            ..base_signal(
+                DESCRIPTION_PRESENCE,
+                observed_at,
+                "Missing description field",
+            )
+        });
+    } else {
+        // reliability/description-usage-context — fact. Requires a description
+        // to speak about; a missing description is covered by description-presence.
+        signals.push(fact(
+            DESCRIPTION_USAGE_CONTEXT,
+            "Description usage context",
+            state(analysis.description_usage_context),
+            observed_at,
+        ));
+
+        // cost/description-length — finding, only when over the limit (the
+        // "within limit" twin is dropped; the token measurement already covers
+        // the healthy state).
+        if analysis.description_char_count > DESCRIPTION_MAX_LENGTH {
+            signals.push(Signal {
+                severity: Some("info".to_string()),
+                detail: Some(format!(
+                    "Description is {} characters (max: {DESCRIPTION_MAX_LENGTH})",
+                    analysis.description_char_count
+                )),
+                ..base_signal(
+                    DESCRIPTION_LENGTH,
+                    observed_at,
+                    "Description exceeds 1024-character limit",
+                )
+            });
+        }
+
+        // reliability/description-briefness — finding, only when under 5 words.
+        if analysis.description_word_count < 5 {
+            signals.push(Signal {
+                severity: Some("info".to_string()),
+                detail: Some(
+                    "A few sentences covering scope and trigger conditions improves \
+                     activation accuracy"
+                        .to_string(),
+                ),
+                ..base_signal(DESCRIPTION_BRIEFNESS, observed_at, "Description too brief")
+            });
+        }
+
+        // reliability/description-overclaim — finding, low severity (preserved
+        // from VTD-0113; a graded finding no longer lands in Safety).
+        if analysis.description_overclaimed {
+            signals.push(Signal {
+                severity: Some("low".to_string()),
+                detail: Some(
+                    "Broad trigger words (anything, everything, all files, etc.) widen \
+                     attack surface — narrow to specific use cases"
+                        .to_string(),
+                ),
+                ..base_signal(
+                    DESCRIPTION_OVERCLAIM,
+                    observed_at,
+                    "Description overclaims scope",
+                )
+            });
+        }
+    }
+
+    // ── body-derived facts ───────────────────────────────────────────────
+    if analysis.body_present {
+        signals.push(fact(
+            GOTCHAS_SECTION,
+            "Gotchas section",
+            state(analysis.gotchas_section),
+            observed_at,
+        ));
+        signals.push(fact(
+            EXAMPLES,
+            "Examples",
+            state(analysis.examples),
+            observed_at,
+        ));
+        signals.push(fact(
+            CHECKLIST_PATTERN,
+            "Checklist pattern",
+            state(analysis.checklist_pattern),
+            observed_at,
+        ));
+        signals.push(fact(
+            VALIDATION_LOOP,
+            "Validation loop",
+            state(analysis.validation_loop),
+            observed_at,
+        ));
+        signals.push(fact(
+            STEP_BY_STEP_WORKFLOW,
+            "Step-by-step workflow",
+            state(analysis.step_by_step_workflow),
+            observed_at,
+        ));
+        signals.push(fact(
+            PROGRESSIVE_DISCLOSURE,
+            "Progressive disclosure",
+            state(analysis.progressive_disclosure),
+            observed_at,
+        ));
+
+        // reliability/generic-instruction — finding, collapsed to a single row
+        // whose detail states how many phrases matched (0..n per-skill today).
+        if analysis.generic_instruction_count > 0 {
+            signals.push(Signal {
+                severity: Some("info".to_string()),
+                detail: Some(format!(
+                    "{} generic instruction phrase(s) detected",
+                    analysis.generic_instruction_count
+                )),
+                ..base_signal(
+                    GENERIC_INSTRUCTION,
+                    observed_at,
+                    "Generic instruction detected",
+                )
+            });
+        }
+    }
+
+    // ── script-derived (aggregated per-skill, gated on scripts existing) ──
+    if analysis.scripts_analyzed {
+        signals.push(fact(
+            CLI_HELP,
+            "CLI help",
+            state(analysis.script_cli_help),
+            observed_at,
+        ));
+        signals.push(fact(
+            STRUCTURED_OUTPUT,
+            "Structured output",
+            state(analysis.script_structured_output),
+            observed_at,
+        ));
+        if analysis.script_interactive_prompts {
+            signals.push(Signal {
+                severity: Some("high".to_string()),
+                detail: Some(
+                    "Agents run in non-interactive shells — replace prompts with CLI \
+                     flags or stdin"
+                        .to_string(),
+                ),
+                ..base_signal(
+                    INTERACTIVE_PROMPTS,
+                    observed_at,
+                    "Interactive prompts detected",
+                )
+            });
+        }
+        if analysis.script_unpinned_dependencies {
+            signals.push(Signal {
+                severity: Some("low".to_string()),
+                detail: Some(
+                    "Pin dependency versions for reproducibility (e.g., >=4.12,<5 instead \
+                     of >=4.12)"
+                        .to_string(),
+                ),
+                ..base_signal(
+                    UNPINNED_DEPENDENCIES,
+                    observed_at,
+                    "Unpinned dependency versions",
+                )
+            });
+        }
+    }
+
+    // ── evals-derived ────────────────────────────────────────────────────
+    if let Some(count) = analysis.eval_case_count {
+        // reliability/eval-test-case-count — measurement with a method string.
+        signals.push(Signal {
+            value_num: Some(count as f64),
+            method: Some(EVAL_CASE_COUNT_METHOD.to_string()),
+            ..base_signal(EVAL_TEST_CASE_COUNT, observed_at, "Eval test-case count")
+        });
+        // reliability/eval-assertions — fact; requires test cases to speak about.
+        signals.push(fact(
+            EVAL_ASSERTIONS,
+            "Eval assertions",
+            state(analysis.eval_has_assertions),
+            observed_at,
+        ));
+        // reliability/eval-test-cases-sufficient — finding, only when the count
+        // is below the minimum (the healthy state is dropped entirely).
+        if count < EVALS_MIN_TEST_CASES {
+            signals.push(Signal {
+                severity: Some("info".to_string()),
+                detail: Some(format!(
+                    "Consider adding at least {EVALS_MIN_TEST_CASES} test cases covering \
+                     varied prompts and edge cases"
+                )),
+                ..base_signal(
+                    EVAL_TEST_CASES_SUFFICIENT,
+                    observed_at,
+                    "Few eval test cases",
+                )
+            });
+        }
+    }
+
+    // characteristics/eval-file-format — fact, gated on eval files existing.
+    if analysis.evals_present {
+        signals.push(fact(
+            EVAL_FILE_FORMAT,
+            "Eval file format",
+            if analysis.eval_non_json_files {
+                "present".to_string()
+            } else {
+                "absent".to_string()
+            },
+            observed_at,
+        ));
+    }
+
+    signals
+}
+
+/// The fact state string: `"present"` when the attribute exists, `"absent"`
+/// when it does not. Facts carry this as their only value column — no severity,
+/// no measurement.
+fn state(present: bool) -> String {
+    if present {
+        "present".to_string()
+    } else {
+        "absent".to_string()
+    }
 }
 
 fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal> {

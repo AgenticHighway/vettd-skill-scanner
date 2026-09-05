@@ -574,6 +574,20 @@ fn path_only_skill_md_emits_no_frontmatter_derived_signals() {
         "compatibility/declared-mcp-servers",
         "compatibility/declared-harness-targets",
         "compatibility/declared-name",
+        // Reclassified quality/characteristics/compatibility signals — a
+        // path-only SKILL.md has no content to analyze, so none may fire.
+        "characteristics/repository-link",
+        "characteristics/eval-file-format",
+        "reliability/description-presence",
+        "reliability/description-usage-context",
+        "reliability/gotchas-section",
+        "reliability/generic-instruction",
+        "performance/progressive-disclosure",
+        "compatibility/cli-help",
+        "compatibility/interactive-prompts",
+        "compatibility/structured-output",
+        "compatibility/unpinned-dependencies",
+        "reliability/eval-test-case-count",
     ] {
         assert!(
             !result
@@ -792,4 +806,337 @@ fn default_repo_context_behaves_exactly_like_scan_skill() {
         .signals
         .iter()
         .any(|signal| signal.rule_id == "reliability/unresolvable-internal-references"));
+}
+
+// ---------------------------------------------------------------------------
+// Reclassified non-safety signals (VTD-0083, VTD-0102..0123 → signals)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn body_quality_facts_are_present_absent_states_with_no_grade_effect() {
+    // Body rules are facts now, not pass/fail twin findings: one row whose
+    // valueText is the state. A body with gotchas/examples/checklist/workflow/
+    // validation shows "present" for those and "absent" for what it lacks; an
+    // empty body emits none of them (there is no body to describe).
+    let result = scan(
+        "---\nname: quality\n---\n## Gotchas\nWatch out.\n\n## Examples\n```py\npass\n```\n\n## Checklist\n- [ ] do it\n\n1. First step\n\nRun the validator.\n",
+        &["SKILL.md"],
+    );
+    for (rule_id, expected) in [
+        ("reliability/gotchas-section", "present"),
+        ("reliability/examples", "present"),
+        ("reliability/checklist-pattern", "present"),
+        ("reliability/validation-loop", "present"),
+        ("reliability/step-by-step-workflow", "present"),
+        ("performance/progressive-disclosure", "absent"),
+    ] {
+        let fact = signal(&result, rule_id);
+        assert_eq!(fact.value_text.as_deref(), Some(expected), "{rule_id}");
+        assert_eq!(fact.derivation.as_deref(), Some("read"), "{rule_id}");
+        assert_eq!(fact.severity, None, "a fact carries no severity: {rule_id}");
+        assert_eq!(
+            fact.value_num, None,
+            "a fact is not a measurement: {rule_id}"
+        );
+        assert_eq!(fact.method, None, "a fact has no method: {rule_id}");
+    }
+
+    let empty = scan("---\nname: empty\n---\n", &["SKILL.md"]);
+    for rule_id in [
+        "reliability/gotchas-section",
+        "reliability/examples",
+        "reliability/checklist-pattern",
+        "reliability/validation-loop",
+        "reliability/step-by-step-workflow",
+        "reliability/progressive-disclosure",
+    ] {
+        assert!(
+            !empty.signals.iter().any(|s| s.rule_id == rule_id),
+            "an empty body has no body-derived facts: {rule_id}"
+        );
+    }
+}
+
+#[test]
+fn description_findings_emit_only_failure_branches_with_preserved_severity() {
+    // Missing description → reliability/description-presence (info).
+    let missing = scan("---\nname: no-desc\n---\nBody.", &["SKILL.md"]);
+    let presence = signal(&missing, "reliability/description-presence");
+    assert_eq!(presence.severity.as_deref(), Some("info"));
+
+    // >1024 chars → cost/description-length (info); the within-limit twin is
+    // dropped entirely.
+    let long = scan(
+        &format!(
+            "---\nname: long-desc\ndescription: {}\n---\nBody.",
+            "a".repeat(1025)
+        ),
+        &["SKILL.md"],
+    );
+    let length = signal(&long, "cost/description-length");
+    assert_eq!(length.severity.as_deref(), Some("info"));
+    assert_eq!(
+        length.detail.as_deref(),
+        Some("Description is 1025 characters (max: 1024)")
+    );
+
+    // <5 words → reliability/description-briefness (info).
+    let brief = scan(
+        "---\nname: brief-desc\ndescription: Too short\n---\nBody.",
+        &["SKILL.md"],
+    );
+    let brevity = signal(&brief, "reliability/description-briefness");
+    assert_eq!(brevity.severity.as_deref(), Some("info"));
+
+    // Broad trigger words → reliability/description-overclaim (low).
+    let overclaim = scan(
+        "---\nname: overclaim-desc\ndescription: Handles anything and everything.\n---\nBody.",
+        &["SKILL.md"],
+    );
+    let scope = signal(&overclaim, "reliability/description-overclaim");
+    assert_eq!(scope.severity.as_deref(), Some("low"));
+
+    // A good description emits none of the failure branches, only the
+    // usage-context fact.
+    let good = scan(
+        "---\nname: good-desc\ndescription: Use this skill when you need to format and validate JSON documents quickly.\n---\nBody.",
+        &["SKILL.md"],
+    );
+    for rule_id in [
+        "reliability/description-presence",
+        "cost/description-length",
+        "reliability/description-briefness",
+        "reliability/description-overclaim",
+    ] {
+        assert!(
+            !good.signals.iter().any(|s| s.rule_id == rule_id),
+            "clean description must not emit the failure branch: {rule_id}"
+        );
+    }
+    let context = signal(&good, "reliability/description-usage-context");
+    assert_eq!(context.value_text.as_deref(), Some("present"));
+    assert_eq!(context.derivation.as_deref(), Some("read"));
+}
+
+#[test]
+fn generic_instruction_collapses_to_one_finding_with_count_in_detail() {
+    // VTD-0108 fired once per matched phrase (0-4x); the signal must be a
+    // single row whose detail states how many phrases matched.
+    let result = scan(
+        "---\nname: generic\n---\nFollow best practices and handle errors appropriately. Use proper tooling.",
+        &["SKILL.md"],
+    );
+    let rows: Vec<_> = result
+        .signals
+        .iter()
+        .filter(|s| s.rule_id == "reliability/generic-instruction")
+        .collect();
+    assert_eq!(rows.len(), 1, "generic-instruction must be a single row");
+    assert_eq!(rows[0].severity.as_deref(), Some("info"));
+    assert_eq!(
+        rows[0].detail.as_deref(),
+        Some("3 generic instruction phrase(s) detected")
+    );
+
+    let clean = scan(
+        "---\nname: specific\n---\nRun `scripts/check.py --strict` then review the diff.\n",
+        &["SKILL.md"],
+    );
+    assert!(
+        !clean
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "reliability/generic-instruction"),
+        "no generic phrases means no generic-instruction row"
+    );
+}
+
+#[test]
+fn progressive_disclosure_fact_is_present_when_body_references_bundled_dirs() {
+    let result = scan(
+        "---\nname: progressive\n---\nLoad `references/guide.md` and run `scripts/setup.sh` on demand.",
+        &["SKILL.md", "references/guide.md", "scripts/setup.sh"],
+    );
+    let fact = signal(&result, "performance/progressive-disclosure");
+    assert_eq!(fact.value_text.as_deref(), Some("present"));
+    assert_eq!(fact.derivation.as_deref(), Some("read"));
+
+    let refs_without_dirs = scan(
+        "---\nname: nothing\n---\nLoad `references/guide.md` on demand.",
+        &["SKILL.md"],
+    );
+    let absent = signal(&refs_without_dirs, "performance/progressive-disclosure");
+    assert_eq!(
+        absent.value_text.as_deref(),
+        Some("absent"),
+        "referencing a dir that does not exist is not progressive disclosure"
+    );
+}
+
+#[test]
+fn script_signals_aggregate_per_skill_and_skip_when_no_scripts_exist() {
+    // One script has argparse + json.dumps; the other prompts and pins an
+    // unbounded dependency. Aggregated per-skill: cli-help and structured
+    // output are "present" (ANY script), interactive-prompts is a high
+    // finding, unpinned-dependencies a low finding.
+    let md = "---\nname: cli\n---\nRun the tool.\n";
+    let text_files = HashMap::from([
+        ("SKILL.md".to_string(), md.to_string()),
+        (
+            "scripts/a.py".to_string(),
+            "import argparse\nparser = argparse.ArgumentParser()\nprint(json.dumps({}))\n"
+                .to_string(),
+        ),
+        (
+            "scripts/b.py".to_string(),
+            "name = input('name: ')\nimport tool\nFoo >= 1.0\n".to_string(),
+        ),
+    ]);
+    let all_paths = ["SKILL.md", "scripts/a.py", "scripts/b.py"]
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect::<Vec<_>>();
+    let result = scan_skill(&text_files, &all_paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+
+    let cli_help = signal(&result, "compatibility/cli-help");
+    assert_eq!(cli_help.value_text.as_deref(), Some("present"));
+    assert_eq!(cli_help.derivation.as_deref(), Some("read"));
+
+    let structured = signal(&result, "compatibility/structured-output");
+    assert_eq!(structured.value_text.as_deref(), Some("present"));
+
+    let interactive = signal(&result, "compatibility/interactive-prompts");
+    assert_eq!(interactive.severity.as_deref(), Some("high"));
+
+    let unpinned = signal(&result, "compatibility/unpinned-dependencies");
+    assert_eq!(unpinned.severity.as_deref(), Some("low"));
+
+    // A scripts/ dir whose files are helpers (no CLI markers) describes
+    // nothing: no CLI script was analyzed, so the four compatibility signals
+    // are skipped, matching the old finding-block gate on `script_files`.
+    let helper_files = HashMap::from([
+        (
+            "SKILL.md".to_string(),
+            "---\nname: helper-only\n---\nUse lib.\n".to_string(),
+        ),
+        (
+            "scripts/helpers/util.py".to_string(),
+            "def helper(): pass\n".to_string(),
+        ),
+    ]);
+    let helper_paths = ["SKILL.md", "scripts/helpers/util.py"]
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect::<Vec<_>>();
+    let helpers =
+        scan_skill(&helper_files, &helper_paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+    for rule_id in [
+        "compatibility/cli-help",
+        "compatibility/interactive-prompts",
+        "compatibility/structured-output",
+        "compatibility/unpinned-dependencies",
+    ] {
+        assert!(
+            !helpers.signals.iter().any(|s| s.rule_id == rule_id),
+            "helper-only scripts/ must not emit script signals: {rule_id}"
+        );
+    }
+
+    // No scripts/ at all → same skip.
+    let no_scripts = scan(
+        "---\nname: no-scripts\n---\nNothing to run.\n",
+        &["SKILL.md"],
+    );
+    assert!(
+        !no_scripts
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "compatibility/cli-help"),
+        "no scripts means no cli-help fact"
+    );
+}
+
+#[test]
+fn eval_signals_carry_measurement_fact_and_sufficiency_finding() {
+    // Two cases (below the minimum of 3): the measurement reports 2, the
+    // assertions fact reports "present" (case 1 has `expected`), the
+    // sufficiency finding fires (info), and the format fact reads "absent"
+    // (the evals are JSON, nothing non-JSON).
+    let evals_json = r#"{"evals":[{"input":"x","expected":"y"},{"input":"a"}]}"#;
+    let text_files = HashMap::from([
+        (
+            "SKILL.md".to_string(),
+            "---\nname: evals\n---\nRun eval.\n".to_string(),
+        ),
+        ("evals/evals.json".to_string(), evals_json.to_string()),
+        ("evals/cases.yaml".to_string(), "case: 1\n".to_string()),
+    ]);
+    let all_paths = ["SKILL.md", "evals/evals.json", "evals/cases.yaml"]
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect::<Vec<_>>();
+    let result = scan_skill(&text_files, &all_paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+
+    let count = signal(&result, "reliability/eval-test-case-count");
+    assert_eq!(count.value_num, Some(2.0));
+    assert_eq!(count.method.as_deref(), Some("bundle-evals-case-count"));
+    assert_eq!(count.derivation, None, "a measurement has no derivation");
+    assert_eq!(count.severity, None, "a measurement is not a finding");
+
+    let assertions = signal(&result, "reliability/eval-assertions");
+    assert_eq!(assertions.value_text.as_deref(), Some("present"));
+    assert_eq!(assertions.derivation.as_deref(), Some("read"));
+
+    let sufficient = signal(&result, "reliability/eval-test-cases-sufficient");
+    assert_eq!(sufficient.severity.as_deref(), Some("info"));
+
+    // eval-file-format is "absent": a JSON eval file exists, and the extra
+    // YAML record under evals/ was never reached (JSON wins).
+    let format = signal(&result, "characteristics/eval-file-format");
+    assert_eq!(format.value_text.as_deref(), Some("absent"));
+
+    // Enough cases → no sufficiency finding, but the measurement still lands.
+    let enough_json = r#"{"evals":[{"input":"a"},{"input":"b"},{"input":"c"},{"input":"d"}]}"#;
+    let enough_files = HashMap::from([
+        (
+            "SKILL.md".to_string(),
+            "---\nname: evals-ok\n---\nRun eval.\n".to_string(),
+        ),
+        ("evals/evals.json".to_string(), enough_json.to_string()),
+    ]);
+    let enough_paths = ["SKILL.md", "evals/evals.json"]
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect::<Vec<_>>();
+    let enough =
+        scan_skill(&enough_files, &enough_paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
+    assert_eq!(
+        signal(&enough, "reliability/eval-test-case-count").value_num,
+        Some(4.0)
+    );
+    assert!(
+        !enough
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "reliability/eval-test-cases-sufficient"),
+        "a sufficient eval suite must not emit the sufficiency finding"
+    );
+    // Cases with no assertion fields at all → fact reads "absent".
+    let no_assertions = scan_skill(
+        &HashMap::from([
+            (
+                "SKILL.md".to_string(),
+                "---\nname: evals-bare\n---\nRun.\n".to_string(),
+            ),
+            (
+                "evals/evals.json".to_string(),
+                r#"{"evals":[{"input":"a"},{"input":"b"},{"input":"c"}]}"#.to_string(),
+            ),
+        ]),
+        &["SKILL.md".to_string(), "evals/evals.json".to_string()],
+        OBSERVED_AT,
+    )
+    .expect("valid RFC3339 timestamp");
+    let bare = signal(&no_assertions, "reliability/eval-assertions");
+    assert_eq!(bare.value_text.as_deref(), Some("absent"));
 }
