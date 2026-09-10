@@ -25,6 +25,12 @@ pub(crate) struct SensitivePattern {
     pub(crate) code_only: bool,
     /// if set, overrides `severity` when the matched file is a `.md` file.
     pub(crate) doc_severity: Option<Severity>,
+    /// if true, the regex match itself may contain literal secret bytes (an API
+    /// token, a private key, a base64 blob) — the finding detail redacts everything
+    /// from the match start onward instead of showing the raw line. Every pattern
+    /// must set this explicitly so adding a new secret-literal pattern without
+    /// thinking about redaction is a compile error, not a silent leak.
+    pub(crate) redact_match: bool,
 }
 
 // Array order mirrors vettd's SENSITIVE_PATTERNS definition order.
@@ -35,6 +41,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: true,
         doc_severity: None,
     },
     SensitivePattern {
@@ -43,6 +50,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: true,
         doc_severity: None,
     },
     SensitivePattern {
@@ -51,6 +59,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -59,6 +68,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -67,6 +77,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -75,6 +86,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -83,6 +95,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -91,6 +104,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -99,6 +113,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Low,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -107,6 +122,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -115,6 +131,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -123,6 +140,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -131,6 +149,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -139,6 +158,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -147,6 +167,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -155,6 +176,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -163,6 +185,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -171,6 +194,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -179,6 +203,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -187,6 +212,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -195,6 +221,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: false,
+        redact_match: false,
         doc_severity: Some(Severity::Medium),
     },
     SensitivePattern {
@@ -203,6 +230,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -211,6 +239,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -219,6 +248,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -227,6 +257,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -235,6 +266,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -243,6 +275,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -251,6 +284,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -259,6 +293,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -267,6 +302,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -275,6 +311,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -283,6 +320,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -291,6 +329,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -299,6 +338,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -307,6 +347,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -315,6 +356,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -323,6 +365,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -331,6 +374,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -339,6 +383,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -347,6 +392,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -355,6 +401,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::High,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -363,6 +410,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -371,6 +419,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -379,6 +428,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -387,6 +437,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -395,6 +446,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -403,6 +455,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -411,6 +464,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -419,6 +473,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Medium,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -427,6 +482,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Medium,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -435,6 +491,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Medium,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -443,6 +500,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Medium,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -451,6 +509,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -459,6 +518,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Medium,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -467,6 +527,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -475,6 +536,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -483,6 +545,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -491,6 +554,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -499,6 +563,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::High,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -507,6 +572,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::High,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -515,6 +581,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -523,6 +590,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -531,6 +599,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
+        redact_match: false,
         doc_severity: None,
     },
     SensitivePattern {
@@ -539,6 +608,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         severity: Severity::Critical,
         intent: Intent::Malicious,
         code_only: false,
+        redact_match: true,
         doc_severity: None,
     },
 ];
@@ -693,10 +763,50 @@ static SUSPICIOUS_SECRET_KEY_STR: &str = r"(?i)(?:^|[-_.])(?:api[-_.]?key|access
 static ASSIGNMENT_QUOTED_VALUE_RE: OnceLock<Regex> = OnceLock::new();
 static SUSPICIOUS_SECRET_KEY_RE: OnceLock<Regex> = OnceLock::new();
 
+/// caps `s` to at most `max_chars` UTF-8 characters, cutting on a character boundary.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| &s[..i])
+        .unwrap_or(s)
+}
+
+/// builds the `detail` string for a line-match finding.
+///
+/// when `redact_from` is `Some(byte_offset)`, everything in `line` from that offset
+/// onward — the regex match itself, plus any trailing content on the line — is
+/// replaced with the literal marker `[REDACTED]`. this is used for patterns whose
+/// match can contain literal secret bytes (an API token, a private key, a base64
+/// blob): only the text *before* the match is kept, so no secret material or
+/// unredacted continuation of it ever reaches the finding. otherwise the trimmed
+/// line is shown as-is. either way the result is capped to 120 characters.
+fn build_line_detail(
+    path: &str,
+    line_num: usize,
+    line: &str,
+    redact_from: Option<usize>,
+) -> String {
+    let snippet = match redact_from {
+        Some(offset) => {
+            let prefix = line.get(..offset).unwrap_or(line).trim();
+            if prefix.is_empty() {
+                "[REDACTED]".to_string()
+            } else {
+                format!("{prefix} [REDACTED]")
+            }
+        }
+        None => line.trim().to_string(),
+    };
+    let snippet = truncate_chars(&snippet, 120);
+    format!("Detected in {path}:{line_num} — `{snippet}`")
+}
+
 /// scans all text files against every pattern in `SENSITIVE_PATTERNS`.
 ///
 /// for `.md` files, patterns with `code_only` set are skipped, and `doc_severity`
 /// overrides `severity` when set. only the first matching line per pattern per file is reported.
+/// patterns with `redact_match` set never surface the matched secret bytes in `detail`
+/// (see [`build_line_detail`]).
 ///
 /// # Parameters
 /// - `text_files` — map of normalized relative paths to decoded UTF-8 file content.
@@ -729,14 +839,9 @@ pub(crate) fn scan_sensitive_patterns(
             };
             let re = &regexes[i_pat];
             for (i_line, line) in lines.iter().enumerate() {
-                if re.is_match(line) {
-                    let snippet = line.trim();
-                    let snippet = snippet
-                        .char_indices()
-                        .nth(120)
-                        .map(|(i, _)| &snippet[..i])
-                        .unwrap_or(snippet);
-                    let detail = format!("Detected in {path}:{} — `{snippet}`", i_line + 1);
+                if let Some(m) = re.find(line) {
+                    let redact_from = pat.redact_match.then_some(m.start());
+                    let detail = build_line_detail(path, i_line + 1, line, redact_from);
                     findings.push(Finding {
                         rule_id: pat.rule_id.to_string(),
                         category: FindingCategory::Security,
@@ -811,18 +916,18 @@ pub(crate) fn scan_entropy(text_files: &HashMap<String, String>, findings: &mut 
                     continue;
                 }
                 if shannon_entropy(value) >= 3.5 {
-                    let snippet = line.trim();
-                    let snippet = snippet
-                        .char_indices()
-                        .nth(120)
-                        .map(|(i, _)| &snippet[..i])
-                        .unwrap_or(snippet);
+                    // Redact the secret value itself; the key name is safe to show
+                    // and is what makes the finding actionable.
+                    let snippet = truncate_chars(key, 100);
                     findings.push(Finding {
                         rule_id: RULE_HIGH_ENTROPY_SECRET.to_string(),
                         category: FindingCategory::Security,
                         severity: Severity::Critical,
                         label: "High-entropy value — potential hardcoded secret".to_string(),
-                        detail: format!("Detected in {path}:{} — `{snippet}`", i_line + 1),
+                        detail: format!(
+                            "Detected in {path}:{} — `{snippet} = [REDACTED]`",
+                            i_line + 1
+                        ),
                         filepath: Some(path.clone()),
                         owasp_llm_category: None,
                         chain_id: None,
@@ -1081,6 +1186,108 @@ mod tests {
         assert_eq!(count, 1, "only first match per pattern per file");
     }
 
+    // Regression test for #1027: VTD-0002 (API token literal) previously echoed
+    // the raw token back in `detail`. Surrounding context (the assignment target)
+    // is kept since it isn't secret and is useful for triage.
+    #[test]
+    fn api_token_value_redacted_prefix_context_kept() {
+        let token = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012";
+        let content = format!("AUTH = \"{token}\"");
+        let tf = files(&[("scripts/x.sh", content.as_str())]);
+        let (findings, _) = scan_sensitive_patterns(&tf);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RULE_POTENTIAL_API_TOKEN)
+            .expect("VTD-0002 should fire");
+        assert!(
+            !f.detail.contains(token),
+            "token leaked into detail: {}",
+            f.detail
+        );
+        assert!(
+            f.detail.contains("AUTH"),
+            "assignment-target context should be preserved: {}",
+            f.detail
+        );
+        assert!(f.detail.contains("[REDACTED]"), "detail: {}", f.detail);
+    }
+
+    // Regression test for #1027: a PEM embedded as an escaped single-line string
+    // literal puts the key body on the *same* line as the "BEGIN ... PRIVATE
+    // KEY" header match. Confirm everything from the match onward is dropped —
+    // not just the header substring — so the key body can't leak through the
+    // 120-char detail window either.
+    #[test]
+    fn private_key_body_after_header_is_dropped_not_just_masked() {
+        let content = r#"PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretkeybytesabcdefgh\n-----END RSA PRIVATE KEY-----""#;
+        let tf = files(&[("scripts/x.sh", content)]);
+        let (findings, _) = scan_sensitive_patterns(&tf);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RULE_EMBEDDED_PRIVATE_KEY)
+            .expect("VTD-0001 should fire");
+        assert!(
+            !f.detail.contains("MIIEow"),
+            "key body leaked into detail: {}",
+            f.detail
+        );
+        assert!(
+            f.detail.contains("PRIVATE_KEY"),
+            "assignment-target context should be preserved: {}",
+            f.detail
+        );
+    }
+
+    // Regression test for #1027: VTD-0027 (base64 literal assignment) previously
+    // echoed the raw blob back in `detail`.
+    #[test]
+    fn base64_literal_value_redacted() {
+        let blob = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==";
+        let content = format!(r#"PAYLOAD="{blob}""#);
+        let tf = files(&[("scripts/x.sh", content.as_str())]);
+        let (findings, _) = scan_sensitive_patterns(&tf);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RULE_SHELL_BASE64_LITERAL)
+            .expect("VTD-0027 should fire");
+        assert!(
+            !f.detail.contains(blob),
+            "base64 blob leaked into detail: {}",
+            f.detail
+        );
+    }
+
+    // Prevention for the #1027 bug class recurring elsewhere: for every pattern
+    // marked `redact_match`, the finding detail must never contain the raw
+    // triggering snippet. This walks PATTERN_CASES generically, so a future
+    // secret-literal pattern that sets `redact_match: true` but wires the
+    // redaction up wrong is caught here even without a dedicated test for it.
+    #[test]
+    fn redact_match_patterns_never_leak_the_triggering_snippet() {
+        for &(snippet, expected_rule) in PATTERN_CASES {
+            let pat = SENSITIVE_PATTERNS
+                .iter()
+                .find(|p| p.rule_id == expected_rule)
+                .expect("PATTERN_CASES rule should exist in SENSITIVE_PATTERNS");
+            if !pat.redact_match {
+                continue;
+            }
+            let tf = files(&[("scripts/x.sh", snippet)]);
+            let (findings, _) = scan_sensitive_patterns(&tf);
+            let f = findings
+                .iter()
+                .find(|f| f.rule_id == expected_rule)
+                .unwrap_or_else(|| {
+                    panic!("rule {expected_rule} did not fire for snippet: {snippet:?}")
+                });
+            assert!(
+                !f.detail.contains(snippet),
+                "rule {expected_rule} (redact_match) leaked the raw snippet into detail: {}",
+                f.detail
+            );
+        }
+    }
+
     #[test]
     fn scan_entropy_fires_on_high_entropy_secret() {
         let content = "api_key = \"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX\"";
@@ -1093,6 +1300,33 @@ mod tests {
                 .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
             "high-entropy secret assignment should fire VTD-0003"
         );
+    }
+
+    // Regression test for #1027: VTD-0003 previously echoed the raw secret value
+    // back in `detail`. The key name stays (it's what makes the finding
+    // actionable) but the value must never appear.
+    #[test]
+    fn scan_entropy_redacts_value_but_keeps_key() {
+        let secret_value = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX"; // gitleaks:allow — fake fixture value, not a real credential
+        let content = format!("api_key = \"{secret_value}\"");
+        let tf = files(&[("scripts/config.sh", content.as_str())]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET)
+            .expect("VTD-0003 should fire");
+        assert!(
+            !f.detail.contains(secret_value),
+            "secret value leaked into detail: {}",
+            f.detail
+        );
+        assert!(
+            f.detail.contains("api_key"),
+            "key name should be preserved for context: {}",
+            f.detail
+        );
+        assert!(f.detail.contains("[REDACTED]"), "detail: {}", f.detail);
     }
 
     #[test]
