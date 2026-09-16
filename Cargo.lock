@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "http-shim"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "axum",
  "http-body-util",
@@ -641,7 +641,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vettd-skill-scanner"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "base64",
  "regex",

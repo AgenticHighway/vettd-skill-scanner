@@ -24,7 +24,7 @@
 
 pub mod consts;
 
-/// The scanner crate's own semantic version (from Cargo.toml), e.g. "0.1.4".
+/// The scanner crate's own semantic version (from Cargo.toml), e.g. "0.2.0".
 ///
 /// Distinct from [`consts::CURRENT_SCANNER_VERSION`], which is the findings
 /// *schema* version (currently `9`) used to detect stale scan results. This
