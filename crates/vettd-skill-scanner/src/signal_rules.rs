@@ -20,6 +20,12 @@ pub(crate) const DECLARED_NAME: &str = "compatibility/declared-name";
 // value_text + derivation "read"; measurements carry value_num + method;
 // findings carry severity and emit only their failure branch.
 
+// Retired: seven judgments about meaning (description overclaim and usage context, generic
+// instruction, examples, validation loop, step-by-step workflow, gotchas section) are no longer
+// emitted here. A model-based scanner (System 1, in the scanner suite) owns them under its own
+// ids; keeping both would double-report. Vettd's rule registry still lists the old ids for
+// historic rows.
+
 // Characteristics — neutral attributes.
 pub(crate) const REPOSITORY_LINK: &str = "characteristics/repository-link";
 pub(crate) const EVAL_FILE_FORMAT: &str = "characteristics/eval-file-format";
@@ -28,19 +34,12 @@ pub(crate) const EVAL_FILE_FORMAT: &str = "characteristics/eval-file-format";
 pub(crate) const PROGRESSIVE_DISCLOSURE: &str = "performance/progressive-disclosure";
 
 // Reliability — facts.
-pub(crate) const GOTCHAS_SECTION: &str = "reliability/gotchas-section";
-pub(crate) const EXAMPLES: &str = "reliability/examples";
 pub(crate) const CHECKLIST_PATTERN: &str = "reliability/checklist-pattern";
-pub(crate) const VALIDATION_LOOP: &str = "reliability/validation-loop";
-pub(crate) const STEP_BY_STEP_WORKFLOW: &str = "reliability/step-by-step-workflow";
-pub(crate) const DESCRIPTION_USAGE_CONTEXT: &str = "reliability/description-usage-context";
 pub(crate) const EVAL_ASSERTIONS: &str = "reliability/eval-assertions";
 
 // Reliability — findings (severity-bearing, failure branch only).
-pub(crate) const GENERIC_INSTRUCTION: &str = "reliability/generic-instruction";
 pub(crate) const DESCRIPTION_PRESENCE: &str = "reliability/description-presence";
 pub(crate) const DESCRIPTION_BRIEFNESS: &str = "reliability/description-briefness";
-pub(crate) const DESCRIPTION_OVERCLAIM: &str = "reliability/description-overclaim";
 pub(crate) const EVAL_TEST_CASES_SUFFICIENT: &str = "reliability/eval-test-cases-sufficient";
 
 // Reliability — measurements.

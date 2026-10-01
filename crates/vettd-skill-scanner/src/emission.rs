@@ -185,15 +185,6 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             )
         });
     } else {
-        // reliability/description-usage-context — fact. Requires a description
-        // to speak about; a missing description is covered by description-presence.
-        signals.push(fact(
-            DESCRIPTION_USAGE_CONTEXT,
-            "Description usage context",
-            state(analysis.description_usage_context),
-            observed_at,
-        ));
-
         // cost/description-length — finding, only when over the limit (the
         // "within limit" twin is dropped; the token measurement already covers
         // the healthy state).
@@ -224,56 +215,14 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
                 ..base_signal(DESCRIPTION_BRIEFNESS, observed_at, "Description too brief")
             });
         }
-
-        // reliability/description-overclaim — finding, low severity (preserved
-        // from VTD-0113; a graded finding no longer lands in Safety).
-        if analysis.description_overclaimed {
-            signals.push(Signal {
-                severity: Some("low".to_string()),
-                detail: Some(
-                    "Broad trigger words (anything, everything, all files, etc.) widen \
-                     attack surface — narrow to specific use cases"
-                        .to_string(),
-                ),
-                ..base_signal(
-                    DESCRIPTION_OVERCLAIM,
-                    observed_at,
-                    "Description overclaims scope",
-                )
-            });
-        }
     }
 
     // ── body-derived facts ───────────────────────────────────────────────
     if analysis.body_present {
         signals.push(fact(
-            GOTCHAS_SECTION,
-            "Gotchas section",
-            state(analysis.gotchas_section),
-            observed_at,
-        ));
-        signals.push(fact(
-            EXAMPLES,
-            "Examples",
-            state(analysis.examples),
-            observed_at,
-        ));
-        signals.push(fact(
             CHECKLIST_PATTERN,
             "Checklist pattern",
             state(analysis.checklist_pattern),
-            observed_at,
-        ));
-        signals.push(fact(
-            VALIDATION_LOOP,
-            "Validation loop",
-            state(analysis.validation_loop),
-            observed_at,
-        ));
-        signals.push(fact(
-            STEP_BY_STEP_WORKFLOW,
-            "Step-by-step workflow",
-            state(analysis.step_by_step_workflow),
             observed_at,
         ));
         signals.push(fact(
@@ -282,23 +231,6 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             state(analysis.progressive_disclosure),
             observed_at,
         ));
-
-        // reliability/generic-instruction — finding, collapsed to a single row
-        // whose detail states how many phrases matched (0..n per-skill today).
-        if analysis.generic_instruction_count > 0 {
-            signals.push(Signal {
-                severity: Some("info".to_string()),
-                detail: Some(format!(
-                    "{} generic instruction phrase(s) detected",
-                    analysis.generic_instruction_count
-                )),
-                ..base_signal(
-                    GENERIC_INSTRUCTION,
-                    observed_at,
-                    "Generic instruction detected",
-                )
-            });
-        }
     }
 
     // ── script-derived (aggregated per-skill, gated on scripts existing) ──
