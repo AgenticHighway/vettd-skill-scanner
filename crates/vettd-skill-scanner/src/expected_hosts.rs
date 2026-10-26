@@ -7,7 +7,8 @@
 //!
 //! Matching fails closed: a host that cannot be read as a plain DNS name
 //! (explicit port, userinfo, IP literal, non-ASCII, percent-encoding, empty)
-//! is unexpected.
+//! is unexpected. A leading template placeholder label (`<name>`, `{name}`,
+//! `${name}`) matches only a `TemplatedSuffix` entry.
 
 use std::sync::OnceLock;
 
@@ -41,9 +42,14 @@ pub(crate) enum HostEntry {
     /// Matches `github.com/<org>/...` for this lowercase org. GitHub is
     /// multi-tenant, so only the org path identifies the producer.
     GitHubOrg(&'static str),
+    /// Matches `<placeholder>.<suffix>` where one or more leftmost labels are
+    /// template placeholders, e.g. `https://<account>.blob.core.windows.net`.
+    /// Only for zones the provider runs; a concrete tenant host still needs
+    /// its own entry.
+    TemplatedSuffix(&'static str),
 }
 
-use HostEntry::{Exact, GitHubOrg};
+use HostEntry::{Exact, GitHubOrg, TemplatedSuffix};
 
 /// The curated set, derived from the provider-associated URLs in the
 /// 2026-10-26 cohort security reports (#24). The PR records the per-entry
@@ -94,6 +100,34 @@ const EXPECTED_HOSTS: &[HostEntry] = &[
     GitHubOrg("microsoft"),
     GitHubOrg("azure"),
     GitHubOrg("azure-samples"),
+    // Microsoft service zones behind placeholder hosts in microsoft-skills
+    // code samples; the reports did not grade these (#24).
+    TemplatedSuffix("api.cognitive.microsoft.com"),
+    TemplatedSuffix("azconfig.io"),
+    TemplatedSuffix("azurecr.io"),
+    TemplatedSuffix("azurewebsites.net"),
+    TemplatedSuffix("batch.azure.com"),
+    TemplatedSuffix("blob.core.windows.net"),
+    TemplatedSuffix("cognitiveservices.azure.com"),
+    TemplatedSuffix("communication.azure.com"),
+    TemplatedSuffix("dfs.core.windows.net"),
+    TemplatedSuffix("documents.azure.com"),
+    TemplatedSuffix("eventgrid.azure.net"),
+    TemplatedSuffix("file.core.windows.net"),
+    TemplatedSuffix("in.applicationinsights.azure.com"),
+    TemplatedSuffix("ingest.monitor.azure.com"),
+    TemplatedSuffix("kusto.windows.net"),
+    TemplatedSuffix("openai.azure.com"),
+    TemplatedSuffix("queue.core.windows.net"),
+    TemplatedSuffix("scm.azurewebsites.net"),
+    TemplatedSuffix("search.windows.net"),
+    TemplatedSuffix("services.ai.azure.com"),
+    TemplatedSuffix("stt.speech.microsoft.com"),
+    TemplatedSuffix("table.core.windows.net"),
+    TemplatedSuffix("table.cosmos.azure.com"),
+    TemplatedSuffix("table.cosmosdb.azure.com"),
+    TemplatedSuffix("vault.azure.net"),
+    TemplatedSuffix("webpubsub.azure.com"),
     // neondatabase
     Exact("neon.com"),
     Exact("console.neon.tech"),
@@ -136,6 +170,7 @@ const TEST_HOSTS: &[HostEntry] = &[
         example: "api.docs.expected.test",
     },
     GitHubOrg("expected-org"),
+    TemplatedSuffix("tenant.expected.test"),
 ];
 
 fn entries() -> impl Iterator<Item = &'static HostEntry> {
@@ -169,20 +204,40 @@ struct UrlRef {
     first_segment: Option<String>,
 }
 
+fn placeholder_re() -> &'static Regex {
+    static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+    PLACEHOLDER_RE.get_or_init(|| {
+        Regex::new(r"^(?:<[A-Za-z0-9_-]+>|\$?\{[A-Za-z0-9_-]+\})").expect("bad placeholder re")
+    })
+}
+
 /// Normalizes a URL authority to a plain lowercase host, or `None` when it
-/// is not one.
+/// is not one. Leftmost placeholder labels become `*`.
 fn plain_host(authority: &str) -> Option<String> {
-    let host = authority.to_ascii_lowercase();
-    let host = host.strip_suffix('.').unwrap_or(&host);
-    let labels: Vec<&str> = host.split('.').collect();
-    let valid_labels = labels
-        .iter()
-        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    let host = authority.strip_suffix('.').unwrap_or(authority);
+    let mut labels: Vec<String> = Vec::new();
+    for label in host.split('.') {
+        let is_placeholder = placeholder_re()
+            .find(label)
+            .is_some_and(|m| m.end() == label.len());
+        if is_placeholder {
+            // Placeholders may only lead; `a.<b>.c` could be anything.
+            if labels.iter().any(|l| l != "*") {
+                return None;
+            }
+            labels.push("*".to_string());
+        } else {
+            labels.push(label.to_ascii_lowercase());
+        }
+    }
+    let valid_labels = labels.iter().all(|l| {
+        l == "*" || (!l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    });
     // An all-numeric final label is an IPv4 literal (or a shorthand of one).
     let is_ip = labels
         .last()
         .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
-    (valid_labels && !is_ip).then(|| host.to_string())
+    (valid_labels && !is_ip).then(|| labels.join("."))
 }
 
 /// The lowercase first segment of `path` (text after the authority's `/`),
@@ -220,12 +275,34 @@ fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
         // Characters that can belong to an authority are consumed (including
         // ones `plain_host` rejects, like `@`, `:` and non-ASCII), so they
         // fail closed rather than truncating to a trusted-looking prefix.
-        let end = rest
-            .find(|c: char| {
-                !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%'))
-            })
-            .unwrap_or(rest.len());
-        let host = plain_host(&rest[..end])?;
+        let mut end = 0;
+        while let Some(c) = rest[end..].chars().next() {
+            if let Some(m) = placeholder_re().find(&rest[end..]) {
+                end += m.end();
+            } else if c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%' | '$' | '{' | '}'
+                )
+            {
+                end += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let authority = &rest[..end];
+        // A placeholder host names no concrete server, so its scheme's
+        // default port (`https://<account>.documents.azure.com:443`) adds no
+        // destination; concrete hosts keep the strict no-port rule.
+        let default_port = if m.as_str().len() == "https://".len() {
+            ":443"
+        } else {
+            ":80"
+        };
+        let host = match authority.strip_suffix(default_port).and_then(plain_host) {
+            Some(h) if h.starts_with("*.") => h,
+            _ => plain_host(authority)?,
+        };
         let first_segment = rest[end..].strip_prefix('/').and_then(first_segment);
         Some(UrlRef {
             host,
@@ -238,6 +315,13 @@ fn is_expected(r: &UrlRef) -> bool {
     entries().any(|e| match e {
         Exact(h) => *h == r.host,
         GitHubOrg(org) => r.host == "github.com" && r.first_segment.as_deref() == Some(*org),
+        TemplatedSuffix(suffix) => {
+            let mut rest = r.host.as_str();
+            while let Some(r) = rest.strip_prefix("*.") {
+                rest = r;
+            }
+            rest.len() < r.host.len() && rest == *suffix
+        }
         HostEntry::Pattern { .. } => false,
     }) || compiled_patterns().iter().any(|re| re.is_match(&r.host))
 }
@@ -324,7 +408,8 @@ mod tests {
         // dropping a host.
         for e in entries() {
             match e {
-                Exact(h) | HostEntry::Pattern { example: h, .. } => {
+                Exact(h) | TemplatedSuffix(h) | HostEntry::Pattern { example: h, .. } => {
+                    assert!(!h.contains('*'), "bad entry {h}");
                     assert_eq!(plain_host(h).as_deref(), Some(*h), "bad entry {h}")
                 }
                 GitHubOrg(org) => {
@@ -368,6 +453,33 @@ mod tests {
     }
 
     #[test]
+    fn templated_hosts_match_only_listed_zones() {
+        // Placeholder hosts name no concrete destination, so they pass only
+        // inside a zone the provider runs; anywhere else they stay flagged.
+        assert!(!unexpected("https://<account>.tenant.expected.test/x"));
+        assert!(!unexpected("https://${account}.tenant.expected.test"));
+        assert!(!unexpected(
+            "https://{account}.<region>.tenant.expected.test"
+        ));
+        assert!(!unexpected("https://<account>.tenant.expected.test:443/"));
+        for url in [
+            "https://<account>.evil.test/",
+            "https://<endpoint>/",
+            "https://$FQDN/",
+            "https://tenant.expected.test/",
+            "https://<a>-b.tenant.expected.test/",
+            "https://x.<a>.tenant.expected.test/",
+            "https://<a>.tenant.expected.test:8443/",
+            "http://<a>.tenant.expected.test:443/",
+            "https://expected.test:443/x",
+            "https://<a>.tenant.expected.test${sas}",
+            "https://<a>.expected.test/",
+        ] {
+            assert!(unexpected(url), "{url} must count as unexpected");
+        }
+    }
+
+    #[test]
     fn production_set_covers_report_examples() {
         // One provider-associated URL per entry kind from the cohort reports.
         assert!(!unexpected("https://learn.microsoft.com/azure/aks/"));
@@ -375,6 +487,7 @@ mod tests {
         assert!(!unexpected(
             "https://github.com/Azure/azure-sdk-for-net/tree/main"
         ));
+        assert!(!unexpected("https://<vault-name>.vault.azure.net/"));
         assert!(unexpected("https://github.com/microsoft-evil/skills"));
     }
 
