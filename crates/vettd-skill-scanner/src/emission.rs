@@ -9,6 +9,7 @@ use yaml_rust2::Yaml;
 
 use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
+use crate::expected_hosts::ExternalUrlOutcome;
 use crate::language::language_for_path;
 use crate::signal::Signal;
 use crate::signal_rules::*;
@@ -472,7 +473,7 @@ pub(crate) fn coverage_entries(
     skill_md_content_present: bool,
     secrets_check_passed: bool,
     behavioral_check_passed: bool,
-    external_urls_clean: bool,
+    external_urls: ExternalUrlOutcome,
     name_valid: bool,
     clean_internal_references: bool,
 ) -> Vec<CoverageEntry> {
@@ -482,7 +483,7 @@ pub(crate) fn coverage_entries(
         return Vec::new();
     }
     let mut entries = Vec::new();
-    let attestation_flags: [(&str, &str, &str, bool); 4] = [
+    let attestation_flags: [(&str, &str, &str, bool); 5] = [
         (
             "VTD-0091",
             "Secrets scan passed",
@@ -499,7 +500,13 @@ pub(crate) fn coverage_entries(
             "VTD-0093",
             "External URL scan passed",
             "No external URLs were found in scanned skill text.",
-            external_urls_clean,
+            external_urls == ExternalUrlOutcome::NoUrls,
+        ),
+        (
+            "VTD-0094",
+            "External URLs limited to expected hosts",
+            "All external URLs in scanned skill text point to curated expected hosts.",
+            external_urls == ExternalUrlOutcome::ExpectedHostsOnly,
         ),
         (
             "VTD-0099",

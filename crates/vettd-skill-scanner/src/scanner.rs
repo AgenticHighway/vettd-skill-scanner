@@ -14,6 +14,7 @@ use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
     ReclassifiedAnalysis, RepoContext,
 };
+use crate::expected_hosts::{has_unexpected_external_url, ExternalUrlOutcome};
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
@@ -388,9 +389,10 @@ pub fn scan_skill_with_repo_context(
 
     scan_hidden_unicode(text_files, &mut findings);
 
-    // External URL check. A found external URL stays a Medium finding; a clean
-    // scan is a pass attestation on the coverage channel (VTD-0093), not a
-    // finding — see coverage_entries().
+    // External URL check. A URL to a host outside the curated expected set
+    // (expected_hosts.rs) stays a Medium finding. A scan with no URLs (VTD-0093)
+    // or only expected-host URLs (VTD-0094) is a pass attestation on the
+    // coverage channel, not a finding — see coverage_entries().
     let url_target_files: Vec<(&str, &str)> = {
         let mut targets: Vec<(&str, &str)> = Vec::new();
         for name in &["SKILL.md", "skill.md"] {
@@ -408,10 +410,12 @@ pub fn scan_skill_with_repo_context(
         targets
     };
 
-    let external_urls_clean = if url_target_files.is_empty() {
-        false
+    let external_urls = if url_target_files.is_empty() {
+        ExternalUrlOutcome::NotChecked
     } else {
-        let url_file = url_target_files.iter().find(|(_, c)| has_external_url(c));
+        let url_file = url_target_files
+            .iter()
+            .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c));
         if let Some((path, _)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),
@@ -428,9 +432,11 @@ pub fn scan_skill_with_repo_context(
                 intent: None,
                 source: DEFAULT_SOURCE.to_string(),
             });
-            false
+            ExternalUrlOutcome::Flagged
+        } else if url_target_files.iter().any(|(_, c)| has_external_url(c)) {
+            ExternalUrlOutcome::ExpectedHostsOnly
         } else {
-            true
+            ExternalUrlOutcome::NoUrls
         }
     };
 
@@ -532,7 +538,7 @@ pub fn scan_skill_with_repo_context(
         text_files.contains_key(skill_key),
         secrets_check_passed,
         behavioral_check_passed,
-        external_urls_clean,
+        external_urls,
         validate_name(&parsed.name).is_none(),
         clean_internal_references,
     );
