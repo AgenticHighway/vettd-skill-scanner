@@ -27,7 +27,7 @@ pub(crate) enum ExternalUrlOutcome {
 }
 
 /// One allowlist entry.
-// Production builds construct no entries until the seed set lands (#24).
+// The production set has no `Pattern` entries yet.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum HostEntry {
     /// Matches exactly this lowercase host.
@@ -38,22 +38,104 @@ pub(crate) enum HostEntry {
         regex: &'static str,
         example: &'static str,
     },
+    /// Matches `github.com/<org>/...` for this lowercase org. GitHub is
+    /// multi-tenant, so only the org path identifies the producer.
+    GitHubOrg(&'static str),
 }
 
-/// The curated set. Each entry is a host owned or operated by a cohort
-/// producer; the justification for every entry is recorded in the PR that
-/// adds it.
-const EXPECTED_HOSTS: &[HostEntry] = &[];
+use HostEntry::{Exact, GitHubOrg};
+
+/// The curated set, derived from the provider-associated URLs in the
+/// 2026-10-26 cohort security reports (#24). The PR records the per-entry
+/// evidence.
+const EXPECTED_HOSTS: &[HostEntry] = &[
+    // awesome-claude-skills (ComposioHQ)
+    Exact("composio.dev"),
+    Exact("platform.composio.dev"),
+    Exact("rube.app"),
+    // better-auth
+    Exact("better-auth.com"),
+    GitHubOrg("better-auth"),
+    // browserbase
+    Exact("browserbase.com"),
+    Exact("api.browserbase.com"),
+    Exact("docs.browserbase.com"),
+    GitHubOrg("browserbase"),
+    // cloudflare-skills
+    Exact("developers.cloudflare.com"),
+    Exact("challenges.cloudflare.com"),
+    Exact("dash.cloudflare.com"),
+    GitHubOrg("cloudflare"),
+    // firecrawl
+    Exact("www.firecrawl.dev"),
+    Exact("api.firecrawl.dev"),
+    Exact("docs.firecrawl.dev"),
+    GitHubOrg("firecrawl"),
+    // microsoft-skills
+    Exact("microsoft.com"),
+    Exact("learn.microsoft.com"),
+    Exact("azure.microsoft.com"),
+    Exact("azuremarketplace.microsoft.com"),
+    Exact("graph.microsoft.com"),
+    Exact("mcr.microsoft.com"),
+    Exact("portal.azure.com"),
+    Exact("management.azure.com"),
+    Exact("cognitiveservices.azure.com"),
+    Exact("your-resource.cognitiveservices.azure.com"),
+    Exact("your-resource.openai.azure.com"),
+    Exact("my-resource.openai.azure.com"),
+    Exact("xxx.in.applicationinsights.azure.com"),
+    Exact("js.monitor.azure.com"),
+    Exact("mcp.ai.azure.com"),
+    Exact("documentintelligence.ai.azure.com"),
+    Exact("auth.msft.communication.azure.com"),
+    Exact("api.loganalytics.azure.cn"),
+    Exact("management.chinacloudapi.cn"),
+    GitHubOrg("microsoft"),
+    GitHubOrg("azure"),
+    GitHubOrg("azure-samples"),
+    // neondatabase
+    Exact("neon.com"),
+    Exact("console.neon.tech"),
+    GitHubOrg("neondatabase"),
+    // obra-superpowers
+    Exact("api.github.com"),
+    GitHubOrg("obra"),
+    // openai-skills
+    Exact("developers.openai.com"),
+    Exact("platform.openai.com"),
+    GitHubOrg("openai"),
+    // remotion-dev
+    Exact("www.remotion.dev"),
+    GitHubOrg("remotion-dev"),
+    // resend
+    Exact("resend.com"),
+    GitHubOrg("resend"),
+    // sentry-skills
+    Exact("develop.sentry.dev"),
+    Exact("sentry.sentry.io"),
+    Exact("us.sentry.io"),
+    // supabase
+    Exact("supabase.com"),
+    Exact("mcp.supabase.com"),
+    GitHubOrg("supabase"),
+    // trailofbits-skills
+    Exact("blog.trailofbits.com"),
+    GitHubOrg("trailofbits"),
+    // vercel-agent-skills
+    Exact("vercel.com"),
+];
 
 /// Fixture entries on the reserved `.test` TLD (RFC 2606), so tests never
 /// depend on the production set.
 #[cfg(test)]
 const TEST_HOSTS: &[HostEntry] = &[
-    HostEntry::Exact("expected.test"),
+    Exact("expected.test"),
     HostEntry::Pattern {
         regex: r"[a-z0-9-]+\.docs\.expected\.test",
         example: "api.docs.expected.test",
     },
+    GitHubOrg("expected-org"),
 ];
 
 fn entries() -> impl Iterator<Item = &'static HostEntry> {
@@ -70,7 +152,7 @@ fn compiled_patterns() -> &'static [Regex] {
         entries()
             .filter_map(|e| match e {
                 HostEntry::Pattern { regex, .. } => Some(anchored(regex)),
-                HostEntry::Exact(_) => None,
+                _ => None,
             })
             .collect()
     })
@@ -78,6 +160,13 @@ fn compiled_patterns() -> &'static [Regex] {
 
 fn anchored(regex: &str) -> Regex {
     Regex::new(&format!("^(?:{regex})$")).expect("bad expected-host pattern")
+}
+
+/// A parsed reference: its plain host and, when the path is safe to read,
+/// its lowercase first path segment.
+struct UrlRef {
+    host: String,
+    first_segment: Option<String>,
 }
 
 /// Normalizes a URL authority to a plain lowercase host, or `None` when it
@@ -96,9 +185,34 @@ fn plain_host(authority: &str) -> Option<String> {
     (valid_labels && !is_ip).then(|| host.to_string())
 }
 
-/// Yields the host of every `http(s)://` reference in `content`, or `None`
-/// for a reference whose authority is not a plain host.
-fn extract_hosts(content: &str) -> impl Iterator<Item = Option<String>> + '_ {
+/// The lowercase first segment of `path` (text after the authority's `/`),
+/// or `None` when the path could resolve elsewhere: dot segments,
+/// backslashes and percent-encoding are rejected rather than normalized.
+fn first_segment(path: &str) -> Option<String> {
+    let end = path
+        .find(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '?' | '#' | ')' | ']' | '>' | '<' | '"' | '\'' | '`' | '*' | '|'
+                )
+        })
+        .unwrap_or(path.len());
+    let path = path[..end].trim_end_matches(['.', ',']);
+    if path.contains("..") || path.contains('\\') || path.contains('%') {
+        return None;
+    }
+    let segment = path.split('/').next()?;
+    (!segment.is_empty()
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    .then(|| segment.to_ascii_lowercase())
+}
+
+/// Yields every `http(s)://` reference in `content`, or `None` for a
+/// reference whose authority is not a plain host.
+fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
     static SCHEME_RE: OnceLock<Regex> = OnceLock::new();
     let re = SCHEME_RE.get_or_init(|| Regex::new(r"(?i)https?://").expect("bad scheme re"));
     re.find_iter(content).map(|m| {
@@ -111,18 +225,26 @@ fn extract_hosts(content: &str) -> impl Iterator<Item = Option<String>> + '_ {
                 !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%'))
             })
             .unwrap_or(rest.len());
-        plain_host(&rest[..end])
+        let host = plain_host(&rest[..end])?;
+        let first_segment = rest[end..].strip_prefix('/').and_then(first_segment);
+        Some(UrlRef {
+            host,
+            first_segment,
+        })
     })
 }
 
-fn is_expected_host(host: &str) -> bool {
-    entries().any(|e| matches!(e, HostEntry::Exact(h) if *h == host))
-        || compiled_patterns().iter().any(|re| re.is_match(host))
+fn is_expected(r: &UrlRef) -> bool {
+    entries().any(|e| match e {
+        Exact(h) => *h == r.host,
+        GitHubOrg(org) => r.host == "github.com" && r.first_segment.as_deref() == Some(*org),
+        HostEntry::Pattern { .. } => false,
+    }) || compiled_patterns().iter().any(|re| re.is_match(&r.host))
 }
 
-/// True when `content` references any host outside the expected set.
+/// True when `content` references any URL outside the expected set.
 pub(crate) fn has_unexpected_external_url(content: &str) -> bool {
-    extract_hosts(content).any(|host| !host.is_some_and(|h| is_expected_host(&h)))
+    extract_refs(content).any(|r| !r.is_some_and(|r| is_expected(&r)))
 }
 
 #[cfg(test)]
@@ -201,12 +323,59 @@ mod tests {
         // A non-normalized entry or example could never match, silently
         // dropping a host.
         for e in entries() {
-            let h = match e {
-                HostEntry::Exact(h) => h,
-                HostEntry::Pattern { example, .. } => example,
-            };
-            assert_eq!(plain_host(h).as_deref(), Some(*h), "bad entry {h}");
+            match e {
+                Exact(h) | HostEntry::Pattern { example: h, .. } => {
+                    assert_eq!(plain_host(h).as_deref(), Some(*h), "bad entry {h}")
+                }
+                GitHubOrg(org) => {
+                    assert_eq!(first_segment(org).as_deref(), Some(*org), "bad org {org}")
+                }
+            }
         }
+    }
+
+    #[test]
+    fn github_org_entry_matches_only_that_org() {
+        // github.com hosts every account, so only the org segment may vouch
+        // for a link; lookalike orgs and other hosts stay flagged.
+        assert!(!unexpected(
+            "https://github.com/expected-org/repo/blob/main/x.md"
+        ));
+        assert!(!unexpected("https://github.com/Expected-Org"));
+        assert!(!unexpected("https://github.com/expected-org."));
+        for url in [
+            "https://github.com/",
+            "https://github.com",
+            "https://github.com/expected-org-evil/repo",
+            "https://github.com/evil/expected-org",
+            "https://gitlab.com/expected-org/repo",
+            "https://api.github.com.evil.test/expected-org",
+        ] {
+            assert!(unexpected(url), "{url} must count as unexpected");
+        }
+    }
+
+    #[test]
+    fn github_org_paths_that_could_resolve_elsewhere_fail_closed() {
+        // Browsers normalize these to a different org's path.
+        for url in [
+            "https://github.com/expected-org/../evil/repo",
+            "https://github.com/expected-org/%2e%2e/evil",
+            "https://github.com/expected-org\\..\\evil",
+        ] {
+            assert!(unexpected(url), "{url} must count as unexpected");
+        }
+    }
+
+    #[test]
+    fn production_set_covers_report_examples() {
+        // One provider-associated URL per entry kind from the cohort reports.
+        assert!(!unexpected("https://learn.microsoft.com/azure/aks/"));
+        assert!(!unexpected("https://composio.dev/toolkits/_21risk"));
+        assert!(!unexpected(
+            "https://github.com/Azure/azure-sdk-for-net/tree/main"
+        ));
+        assert!(unexpected("https://github.com/microsoft-evil/skills"));
     }
 
     #[test]

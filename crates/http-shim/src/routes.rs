@@ -255,6 +255,27 @@ mod tests {
         );
     }
 
+    // #24: the suite must see the same expected-host outcome as vettd-cli — no
+    // VTD-0088 to score, and a VTD-0094 attestation that the check ran.
+    #[tokio::test]
+    async fn scan_attests_expected_host_urls_instead_of_flagging() {
+        let response = router()
+            .oneshot(scan_request(serde_json::json!({
+                "textFiles": {"SKILL.md": "---\nname: links\ndescription: Links.\n---\nSee https://learn.microsoft.com/azure/."},
+                "allPaths": ["SKILL.md"],
+            })))
+            .await
+            .expect("response");
+        let json = body_json(response).await;
+        let has_rule = |key: &str, rule: &str| {
+            json[key]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|e| e["ruleId"] == rule))
+        };
+        assert!(!has_rule("findings", "VTD-0088"));
+        assert!(has_rule("coverage", "VTD-0094"));
+    }
+
     // vettd#1011 follow-up: a `../`-relative reference absent from the skill's own subtree
     // resolves once `bundlePath`/`repoPaths` supply the wider repository.
     #[tokio::test]
