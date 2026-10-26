@@ -503,7 +503,7 @@ pub(crate) fn coverage_entries(
             external_urls == ExternalUrlOutcome::NoUrls,
         ),
         (
-            "VTD-0094",
+            "VTD-0124",
             "External URLs limited to expected hosts",
             "All external URLs in scanned skill text point to curated expected hosts.",
             external_urls == ExternalUrlOutcome::ExpectedHostsOnly,

@@ -256,7 +256,7 @@ mod tests {
     }
 
     // #24: the suite must see the same expected-host outcome as vettd-cli — no
-    // VTD-0088 to score, and a VTD-0094 attestation that the check ran.
+    // VTD-0088 to score, and a VTD-0124 attestation that the check ran.
     #[tokio::test]
     async fn scan_attests_expected_host_urls_instead_of_flagging() {
         let response = router()
@@ -273,7 +273,7 @@ mod tests {
                 .is_some_and(|a| a.iter().any(|e| e["ruleId"] == rule))
         };
         assert!(!has_rule("findings", "VTD-0088"));
-        assert!(has_rule("coverage", "VTD-0094"));
+        assert!(has_rule("coverage", "VTD-0124"));
     }
 
     // vettd#1011 follow-up: a `../`-relative reference absent from the skill's own subtree

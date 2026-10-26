@@ -391,7 +391,7 @@ pub fn scan_skill_with_repo_context(
 
     // External URL check. A URL to a host outside the curated expected set
     // (expected_hosts.rs) stays a Medium finding. A scan with no URLs (VTD-0093)
-    // or only expected-host URLs (VTD-0094) is a pass attestation on the
+    // or only expected-host URLs (VTD-0124) is a pass attestation on the
     // coverage channel, not a finding — see coverage_entries().
     let url_target_files: Vec<(&str, &str)> = {
         let mut targets: Vec<(&str, &str)> = Vec::new();

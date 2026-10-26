@@ -21,7 +21,7 @@ pub(crate) enum ExternalUrlOutcome {
     NotChecked,
     /// No external URLs (VTD-0093).
     NoUrls,
-    /// URLs found, all on expected hosts (VTD-0094).
+    /// URLs found, all on expected hosts (VTD-0124).
     ExpectedHostsOnly,
     /// A URL to an unexpected host; VTD-0088 was emitted.
     Flagged,
@@ -534,13 +534,13 @@ mod tests {
     #[test]
     fn expected_only_scan_attests_instead_of_flagging() {
         // Expected hosts must not dock the grade, yet the report still has to
-        // say the check ran and found URLs: VTD-0094, distinct from VTD-0093.
+        // say the check ran and found URLs: VTD-0124, distinct from VTD-0093.
         let result = scan_files(&[(
             "SKILL.md",
             &format!("{SKILL_HEAD}See https://expected.test."),
         )]);
         assert_eq!(has_rule(&result, "VTD-0088"), (false, false));
-        assert_eq!(has_rule(&result, "VTD-0094"), (false, true));
+        assert_eq!(has_rule(&result, "VTD-0124"), (false, true));
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
     }
 
@@ -548,7 +548,7 @@ mod tests {
     fn no_url_scan_keeps_vtd_0093_only() {
         let result = scan_files(&[("SKILL.md", &format!("{SKILL_HEAD}No links."))]);
         assert_eq!(has_rule(&result, "VTD-0093"), (false, true));
-        assert_eq!(has_rule(&result, "VTD-0094"), (false, false));
+        assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
     }
 
     #[test]
@@ -571,6 +571,6 @@ mod tests {
             "External URL(s) detected in references/a.md — referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
-        assert_eq!(has_rule(&result, "VTD-0094"), (false, false));
+        assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
     }
 }
