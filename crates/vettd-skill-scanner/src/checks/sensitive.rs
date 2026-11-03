@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::checks::folding::{expand_line, literal_bindings};
 use crate::consts::DEFAULT_SOURCE;
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
 use crate::rules::*;
@@ -824,6 +825,7 @@ pub(crate) fn scan_sensitive_patterns(
     sorted_files.sort_by_key(|(p, _)| p.as_str());
     for (path, content) in sorted_files {
         let is_doc = path.to_lowercase().ends_with(".md");
+        let bindings = literal_bindings(content);
         let lines: Vec<&str> = content.split('\n').collect();
 
         for (i_pat, pat) in SENSITIVE_PATTERNS.iter().enumerate() {
@@ -839,9 +841,35 @@ pub(crate) fn scan_sensitive_patterns(
             };
             let re = &regexes[i_pat];
             for (i_line, line) in lines.iter().enumerate() {
-                if let Some(m) = re.find(line) {
-                    let redact_from = pat.redact_match.then_some(m.start());
-                    let detail = build_line_detail(path, i_line + 1, line, redact_from);
+                // A direct match is reported as-is. Otherwise, a bounded folded
+                // view of the same line catches a literal split by trivial
+                // concatenation, a local literal binding, or a short base64
+                // literal; the reported location stays the original line.
+                let expanded = if re.find(line).is_some() {
+                    None
+                } else {
+                    expand_line(line, &bindings)
+                };
+                let folded = expanded
+                    .as_deref()
+                    .is_some_and(|view| re.find(view).is_some());
+                let matched = if folded {
+                    expanded.as_deref().and_then(|view| re.find(view))
+                } else {
+                    re.find(line)
+                };
+
+                if let Some(m) = matched {
+                    // A folded match has no reliable offset into the original
+                    // line, so a secret-literal pattern redacts the whole view
+                    // rather than guessing a prefix.
+                    let redact_from =
+                        pat.redact_match
+                            .then_some(if folded { 0 } else { m.start() });
+                    let mut detail = build_line_detail(path, i_line + 1, line, redact_from);
+                    if folded {
+                        detail.push_str(" [after bounded constant folding]");
+                    }
                     findings.push(Finding {
                         rule_id: pat.rule_id.to_string(),
                         category: FindingCategory::Security,

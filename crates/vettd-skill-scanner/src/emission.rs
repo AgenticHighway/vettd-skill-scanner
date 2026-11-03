@@ -487,7 +487,7 @@ pub(crate) fn coverage_entries(
         (
             "VTD-0091",
             "Secrets scan passed",
-            "No secrets or unsafe code patterns were detected.",
+            "Deterministic static matching found no secrets or unsafe code patterns. Limits: literal patterns plus bounded constant folding only; dynamic construction, unsupported languages, and non-literal multilingual intent are not decided, and runtime isolation is still required.",
             secrets_check_passed,
         ),
         (
