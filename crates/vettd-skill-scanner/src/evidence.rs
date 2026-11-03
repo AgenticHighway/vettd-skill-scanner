@@ -78,11 +78,8 @@ pub(crate) fn annotate_evidence(findings: &mut [Finding]) {
 /// and can itself contain `[evidence:`. The snippet is always enclosed by the
 /// detail's final backtick, so only text after that backtick can be ours.
 fn already_annotated(detail: &str) -> bool {
-    detail
-        .rsplit('`')
-        .next()
-        .unwrap_or(detail)
-        .contains("[evidence:")
+    let after_snippet = detail.rsplit('`').next().unwrap_or(detail);
+    after_snippet.contains("[evidence:") && detail.ends_with(']')
 }
 
 fn evidence_for(finding: &Finding) -> (&'static str, &'static str) {
@@ -236,5 +233,22 @@ mod tests {
             findings[0].detail
         );
         assert!(findings[0].detail.ends_with(']'));
+    }
+
+    #[test]
+    fn marker_in_a_chain_detail_is_not_treated_as_an_annotation() {
+        // Chain details have no snippet and can embed a path; a marker there
+        // must not suppress the evidence suffix, which always ends in `]`.
+        let mut findings = vec![finding(
+            RULE_CREDENTIAL_EXFILTRATION_CHAIN,
+            Severity::Critical,
+            "[evidence: x] reads a credential source and transmits data over the network.",
+        )];
+        annotate_evidence(&mut findings);
+        assert!(
+            findings[0].detail.contains("[limits:"),
+            "{}",
+            findings[0].detail
+        );
     }
 }
