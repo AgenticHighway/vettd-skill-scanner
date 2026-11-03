@@ -31,6 +31,9 @@ pub(crate) enum ExternalUrlOutcome {
 ///
 /// Recorded with every expected-host assessment so a later policy change (a
 /// revoked or widened exception) is distinguishable from an unchanged one.
+/// The unit tests pin a digest of [`EXPECTED_HOSTS`]: editing the list without
+/// bumping this version fails them, so the recorded version can never silently
+/// describe a different policy than the one that ran.
 pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-02";
 
 /// One external destination observed in analyzed text.
@@ -88,12 +91,11 @@ pub(crate) fn audit_destinations(content: &str) -> Vec<Destination> {
 }
 
 /// Renders destinations for a result string, marking each as expected or not.
-/// Capped so a skill full of links cannot grow the result without bound.
+/// Every distinct destination is listed: the record is the evidence for the
+/// assessment, so silently truncating it would break that contract.
 pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
-    const MAX_LISTED: usize = 8;
-    let mut parts: Vec<String> = destinations
+    destinations
         .iter()
-        .take(MAX_LISTED)
         .map(|d| {
             format!(
                 "{}://{} ({})",
@@ -106,11 +108,8 @@ pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
                 }
             )
         })
-        .collect();
-    if destinations.len() > MAX_LISTED {
-        parts.push(format!("and {} more", destinations.len() - MAX_LISTED));
-    }
-    parts.join(", ")
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 /// Result of the external-URL check: the outcome plus every destination seen.
 ///
@@ -682,6 +681,67 @@ mod tests {
         // A version bump is a deliberate policy change, never an accident: the
         // recorded version is what lets a reviewer tell the two apart.
         assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-02");
+    }
+
+    /// Stable FNV-1a digest of the production list (test-only: no new dep).
+    fn expected_hosts_digest() -> u64 {
+        fn feed(hash: &mut u64, bytes: &[u8]) {
+            for &byte in bytes {
+                *hash ^= u64::from(byte);
+                *hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for entry in EXPECTED_HOSTS {
+            match entry {
+                Exact(host) => {
+                    feed(&mut hash, b"E");
+                    feed(&mut hash, host.as_bytes());
+                }
+                GitHubOrg(org) => {
+                    feed(&mut hash, b"G");
+                    feed(&mut hash, org.as_bytes());
+                }
+                TemplatedSuffix(suffix) => {
+                    feed(&mut hash, b"T");
+                    feed(&mut hash, suffix.as_bytes());
+                }
+                HostEntry::Pattern { regex, .. } => {
+                    feed(&mut hash, b"P");
+                    feed(&mut hash, regex.as_bytes());
+                }
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn policy_version_is_tied_to_the_host_list() {
+        // The version is recorded in every assessment; the digest makes an
+        // unnoticed list edit fail here instead of mislabeling a result.
+        assert_eq!(
+            expected_hosts_digest(),
+            14461354016487588110,
+            "expected-host list changed: bump EXPECTED_HOSTS_POLICY_VERSION and update this digest"
+        );
+    }
+
+    #[test]
+    fn every_destination_is_recorded_without_truncation() {
+        let mut content = String::new();
+        for i in 0..12 {
+            content.push_str(&format!("https://host{i}.invalid/x "));
+        }
+        let destinations = audit_destinations(&content);
+        assert_eq!(destinations.len(), 12);
+        let summary = destinations_summary(&destinations);
+        for i in 0..12 {
+            assert!(
+                summary.contains(&format!("https://host{i}.invalid")),
+                "destination {i} missing from summary: {summary}"
+            );
+        }
+        assert!(!summary.contains("more"));
     }
 
     #[test]

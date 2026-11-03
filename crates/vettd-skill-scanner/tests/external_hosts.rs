@@ -150,3 +150,21 @@ fn userinfo_and_explicit_port_fail_closed() {
         assert!(coverage(&result, "VTD-0124").is_none(), "{url}");
     }
 }
+
+#[test]
+fn every_distinct_destination_is_named_in_the_finding() {
+    let mut body = String::from("See:\n");
+    for i in 0..12 {
+        body.push_str(&format!("- https://host{i}.invalid/page\n"));
+    }
+    let result = scan(&body);
+    let hit = finding(&result, "VTD-0088").expect("unexpected hosts are flagged");
+    for i in 0..12 {
+        assert!(
+            hit.detail.contains(&format!("https://host{i}.invalid")),
+            "destination {i} missing from the record: {}",
+            hit.detail
+        );
+    }
+    assert!(!hit.detail.contains("more"));
+}
