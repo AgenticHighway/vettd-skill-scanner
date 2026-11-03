@@ -68,6 +68,10 @@ fn malicious() -> Vec<Malicious> {
         acc.push_str(&format!("const alias{i} = require('child_process');\n"));
         acc
     }) + "alias19.exec(process.argv[2]);\n";
+    let too_many_aliases = (0..40).fold(String::new(), |mut acc, i| {
+        acc.push_str(&format!("const large{i} = require('child_process');\n"));
+        acc
+    }) + "large39.exec(process.argv[2]);\n";
 
     vec![
         Malicious {
@@ -119,6 +123,13 @@ fn malicious() -> Vec<Malicious> {
             name: "more than sixteen aliases",
             path: "scripts/f.js",
             body: many_aliases,
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "alias count over the resolution bound",
+            path: "scripts/f2.js",
+            body: too_many_aliases,
             rule: EXEC_RULE,
             floor: Severity::Critical,
         },
