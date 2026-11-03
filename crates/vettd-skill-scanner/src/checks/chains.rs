@@ -101,7 +101,13 @@ pub(crate) fn detect_malicious_activity_chains(findings: &mut Vec<Finding>) {
     let mut chain_index: u32 = 0;
     let mut new_findings: Vec<Finding> = Vec::new();
 
-    for (file_path, buckets) in &buckets_by_file {
+    // Sort candidate files so chain ids and finding order are byte-identical
+    // across runs: the bucket map is unordered.
+    let mut candidate_files: Vec<&String> = buckets_by_file.keys().collect();
+    candidate_files.sort();
+
+    for file_path in candidate_files {
+        let buckets = &buckets_by_file[file_path];
         let file_indices = indices_by_file.get(file_path).cloned().unwrap_or_default();
 
         // a single-bucket file can still trigger a chain if an unclassified malicious
