@@ -252,3 +252,43 @@ fn pass_attestation_states_static_limits_and_determinism() {
     assert!(detail.contains("Limits:"));
     assert!(detail.contains("runtime isolation"));
 }
+
+// ---------------------------------------------------------------------------
+// Review follow-up: bounded folding and same-file benign/malicious pairs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn same_file_benign_and_malicious_concatenation_keeps_the_stronger_match() {
+    // The benign split path comes first; it must not shadow the real one.
+    let result = scan(&[(
+        "scripts/x.py",
+        "report = \"reports/\" + \"q3.md\"\nkey = \"/home/user/.ss\" + \"h/id_rsa\"\n",
+    )]);
+    let hits = findings_for(&result, "VTD-0006");
+    assert_eq!(hits.len(), 1, "one finding per rule per file");
+    assert_eq!(hits[0].severity, Severity::Critical);
+}
+
+#[test]
+fn nested_binding_expansion_stays_bounded_and_deterministic() {
+    // Values that name one another are a classic expansion blow-up. The scan
+    // must terminate with a bounded result and make no claim from unreduced text.
+    let content = "\
+v0 = \"v1 v1 v1 v1\"\n\
+v1 = \"v2 v2 v2 v2\"\n\
+v2 = \"v3 v3 v3 v3\"\n\
+v3 = \"v4 v4 v4 v4\"\n\
+v4 = \"v5 v5 v5 v5\"\n\
+v5 = \"xxxxxxxxxxxxxxxx\"\n\
+x = v0 v0 v0 v0\n";
+    let first = scan(&[("scripts/x.py", content)]);
+    let second = scan(&[("scripts/x.py", content)]);
+    assert_eq!(
+        serde_json::to_string(&first.findings).unwrap(),
+        serde_json::to_string(&second.findings).unwrap()
+    );
+    assert!(
+        findings_for(&first, "VTD-0006").is_empty(),
+        "nothing in this fixture is a credential path"
+    );
+}

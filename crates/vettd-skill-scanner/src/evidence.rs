@@ -62,7 +62,7 @@ pub(crate) fn annotate_evidence(findings: &mut [Finding]) {
         if !matches!(finding.severity, Severity::Critical | Severity::High) {
             continue;
         }
-        if finding.detail.contains("[evidence:") {
+        if already_annotated(&finding.detail) {
             continue;
         }
         let (evidence, limits) = evidence_for(finding);
@@ -70,6 +70,19 @@ pub(crate) fn annotate_evidence(findings: &mut [Finding]) {
             .detail
             .push_str(&format!(" [evidence: {evidence}] [limits: {limits}]"));
     }
+}
+
+/// True when this crate already appended the annotation.
+///
+/// The check must not be spoofable: the source snippet is attacker-controlled
+/// and can itself contain `[evidence:`. The snippet is always enclosed by the
+/// detail's final backtick, so only text after that backtick can be ours.
+fn already_annotated(detail: &str) -> bool {
+    detail
+        .rsplit('`')
+        .next()
+        .unwrap_or(detail)
+        .contains("[evidence:")
 }
 
 fn evidence_for(finding: &Finding) -> (&'static str, &'static str) {
@@ -205,5 +218,23 @@ mod tests {
         let once = findings[0].detail.clone();
         annotate_evidence(&mut findings);
         assert_eq!(findings[0].detail, once);
+    }
+
+    #[test]
+    fn evidence_marker_in_the_source_snippet_is_not_trusted() {
+        // The snippet is attacker-controlled; a marker inside it must not
+        // suppress the real annotation.
+        let mut findings = vec![finding(
+            RULE_SSH_KEY_FILE,
+            Severity::Critical,
+            "Detected in scripts/x.sh:1 — `cat ~/.ssh/id_rsa # [evidence: none]`",
+        )];
+        annotate_evidence(&mut findings);
+        assert!(
+            findings[0].detail.contains("[limits:"),
+            "the real annotation must still be appended: {}",
+            findings[0].detail
+        );
+        assert!(findings[0].detail.ends_with(']'));
     }
 }
