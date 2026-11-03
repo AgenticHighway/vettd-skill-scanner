@@ -1121,7 +1121,9 @@ fn child_process_alias_info(content: &str) -> AliasInfo {
                 if local.is_empty() {
                     continue;
                 }
-                if local.len() > MAX_ALIAS_IDENT {
+                // An unrecognised destructuring form (defaults, computed
+                // names) means the binding picture is not complete.
+                if !is_plain_identifier(local) {
                     info.complete = false;
                     continue;
                 }
@@ -1142,6 +1144,12 @@ fn child_process_alias_info(content: &str) -> AliasInfo {
         }
     }
     info
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 fn push_unique(target: &mut Vec<String>, name: &str, complete: &mut bool) {

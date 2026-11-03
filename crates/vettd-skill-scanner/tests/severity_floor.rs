@@ -100,6 +100,15 @@ fn malicious() -> Vec<Malicious> {
             floor: Severity::Critical,
         },
         Malicious {
+            name: "destructuring with an unrecognised default",
+            path: "scripts/d2.js",
+            body:
+                "const {exec: run = exec} = require('child_process');\nrun(process.argv[2]);\n"
+                    .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
             name: "dollar-prefixed alias",
             path: "scripts/e.js",
             body: "const $cp = require('child_process');\n$cp.exec(process.argv[2]);\n".to_string(),
@@ -224,6 +233,13 @@ fn malicious() -> Vec<Malicious> {
             name: "code before a line comment",
             path: "scripts/w.js",
             body: "const k = fs.readFileSync(\"/home/me/.ssh/id_rsa\"); // never read it\n".to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "comment marker inside a string",
+            path: "scripts/y.js",
+            body: "const s = \"/* Never read ~/.ssh/id_rsa */\";\n".to_string(),
             rule: CREDENTIAL_RULE,
             floor: Severity::Critical,
         },

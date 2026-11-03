@@ -203,6 +203,11 @@ fn comment_body(path: &str, line: &str, pos: usize) -> Option<(usize, usize)> {
     let mut search = 0usize;
     while let Some(relative) = line[search..].find(open) {
         let open_start = search + relative;
+        // A marker inside a quoted literal is text, not a comment opener.
+        if inside_string_literal(line, open_start) {
+            search = open_start + open.len();
+            continue;
+        }
         let Some(close_relative) = line[open_start + open.len()..].find(close) else {
             // Unclosed on this line: the body may continue, so do not guess.
             return None;
@@ -571,6 +576,20 @@ mod tests {
         assert_eq!(
             at("x.js", "/* Never read ~/.ssh/id_rsa */", RULE, ".ssh"),
             MatchKind::DefensiveComment
+        );
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_string_is_not_a_comment() {
+        assert_eq!(
+            at(
+                "x.js",
+                "const s = \"/* Never read ~/.ssh/id_rsa */\";",
+                RULE,
+                ".ssh"
+            ),
+            MatchKind::Runtime,
+            "quoted text that looks like a block comment is still executable text"
         );
     }
 
