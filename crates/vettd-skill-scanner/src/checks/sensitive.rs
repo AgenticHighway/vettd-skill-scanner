@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::checks::context::{classify, context_note, policy_severity, MatchKind};
+use crate::checks::context::{classify, context_note, is_inert_text, policy_severity, MatchKind};
 use crate::checks::folding::{expand_line, literal_bindings};
 use crate::consts::DEFAULT_SOURCE;
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
@@ -618,7 +618,10 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
     SensitivePattern {
         rule_id: RULE_SHELL_EXEC_UNSANDBOXED,
         label: "Process execution capability imported",
-        severity: Severity::Info,
+        // Base severity stays Critical so an unresolved binding picture (or any
+        // other failed classification) fails closed. The import-only policy
+        // downgrade is what turns a positively established import into Info.
+        severity: Severity::Critical,
         intent: Intent::Negligent,
         code_only: true,
         redact_match: false,
@@ -835,6 +838,16 @@ pub(crate) struct SensitiveScan {
     pub(crate) non_actionable: Vec<usize>,
 }
 
+/// Keeps the strongest severity; the earliest match breaks a tie.
+fn keep_best(
+    best: &mut Option<(Severity, MatchKind, usize, usize, bool)>,
+    candidate: (Severity, MatchKind, usize, usize, bool),
+) {
+    if best.as_ref().is_none_or(|current| candidate.0 > current.0) {
+        *best = Some(candidate);
+    }
+}
+
 /// scans all text files against every pattern in `SENSITIVE_PATTERNS`.
 ///
 /// for `.md` files, patterns with `code_only` set are skipped, and `doc_severity`
@@ -871,7 +884,11 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             .iter()
             .map(|line| expand_line(line, &bindings))
             .collect();
-        let alias_re = alias_call_regex(&child_process_aliases(content));
+        let alias_info = child_process_alias_info(content);
+        // An import-only downgrade requires a complete binding picture; when a
+        // module mention or alias could not be resolved, keep base severity.
+        let capability_downgrade_allowed = alias_info.complete;
+        let alias_re = alias_call_regex(&alias_info);
         let mut best_by_rule: HashMap<&'static str, usize> = HashMap::new();
         let mut non_actionable: HashSet<usize> = HashSet::new();
 
@@ -890,39 +907,78 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             let mut best: Option<(Severity, MatchKind, usize, usize, bool)> = None;
 
             for (i_line, line) in lines.iter().enumerate() {
-                // A direct match is reported as-is. Otherwise, a bounded folded
-                // view of the same line catches a literal split by trivial
-                // concatenation, a local literal binding, or a short base64
-                // literal; the reported location stays the original line.
-                let direct = re.find(line);
-                let view = folded_lines[i_line].as_deref();
-                let folded = direct.is_none() && view.is_some_and(|view| re.find(view).is_some());
-                // An alias bound to child_process (`const cp = require(...)`)
-                // is a call even though the module name is not on the line.
-                let alias = pat.rule_id == RULE_SHELL_EXEC_UNSANDBOXED
-                    && alias_re.as_ref().is_some_and(|alias_re| {
-                        alias_re.is_match(line)
-                            || (direct.is_none() && view.is_some_and(|v| alias_re.is_match(v)))
-                    });
-
-                if direct.is_none() && !folded && !alias {
-                    continue;
+                // Classify every match on the line and keep the strongest. A
+                // fixed decoy must never hide a later dynamic call on the same
+                // line.
+                let mut direct_found = false;
+                // A child_process import in a file whose bindings are
+                // unresolved is not positively import-only; other import forms
+                // are unaffected.
+                let allow_capability = capability_downgrade_allowed
+                    || !line.to_ascii_lowercase().contains("child_process");
+                for found in re.find_iter(line) {
+                    direct_found = true;
+                    let kind = classify(
+                        path,
+                        line,
+                        pat.rule_id,
+                        found.start(),
+                        found.end(),
+                        allow_capability,
+                    );
+                    keep_best(
+                        &mut best,
+                        (
+                            policy_severity(effective_severity.clone(), kind),
+                            kind,
+                            i_line,
+                            found.start(),
+                            false,
+                        ),
+                    );
                 }
-
-                // A folded view has no reliable offset into the original line,
-                // so it can never qualify as a defensive reference.
-                let match_start = match direct {
-                    Some(m) if !folded => m.start(),
-                    _ if folded => usize::MAX,
-                    _ => 0,
-                };
-                let kind = classify(path, line, pat.rule_id, match_start);
-                let severity = policy_severity(effective_severity.clone(), kind);
-                let better = best
-                    .as_ref()
-                    .is_none_or(|(current, ..)| severity > *current);
-                if better {
-                    best = Some((severity, kind, i_line, match_start, folded));
+                // A bounded folded view of the same line catches a literal
+                // split by trivial concatenation, a local literal binding, or a
+                // short base64 literal. It has no reliable offset, so it never
+                // qualifies for a downgrade.
+                if !direct_found
+                    && folded_lines[i_line]
+                        .as_deref()
+                        .is_some_and(|view| re.is_match(view))
+                {
+                    keep_best(
+                        &mut best,
+                        (
+                            effective_severity.clone(),
+                            MatchKind::Runtime,
+                            i_line,
+                            0,
+                            true,
+                        ),
+                    );
+                }
+                // An alias bound to child_process (`const cp = require(...)`,
+                // `const {exec: run} = ...`) is a call even though the module
+                // name is not on the line. Alias calls are never downgraded:
+                // the binding form is the only positive evidence we have.
+                if pat.rule_id == RULE_SHELL_EXEC_UNSANDBOXED {
+                    if let Some(alias_re) = alias_re.as_ref() {
+                        for found in alias_re.find_iter(line) {
+                            if is_inert_text(path, line, found.start()) {
+                                continue;
+                            }
+                            keep_best(
+                                &mut best,
+                                (
+                                    effective_severity.clone(),
+                                    MatchKind::Runtime,
+                                    i_line,
+                                    found.start(),
+                                    false,
+                                ),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -998,43 +1054,139 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
     scan
 }
 
-/// Names bound to the child_process module by a local alias.
+/// Longest alias identifier the scanner will build a regex for.
+const MAX_ALIAS_IDENT: usize = 64;
+/// Most aliases of each kind included in one generated regex.
+const MAX_ALIASES: usize = 32;
+
+/// Bindings of `child_process` in one file.
 ///
-/// Only these names are treated as process APIs: a bare `.exec(` call on an
-/// unrelated object is not evidence of process execution.
-fn child_process_aliases(content: &str) -> Vec<String> {
-    static ALIAS_RE: OnceLock<Regex> = OnceLock::new();
-    let re = ALIAS_RE.get_or_init(|| {
-        Regex::new(
-            r#"(?m)^\s*(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*require\s*\(\s*['"](?:node:)?child_process['"]\s*\)|^\s*import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"](?:node:)?child_process['"]"#,
-        )
-        .expect("bad child_process alias regex")
-    });
-    let mut aliases: Vec<String> = Vec::new();
-    for cap in re.captures_iter(content) {
-        let Some(name) = cap.get(1).or_else(|| cap.get(2)) else {
-            continue;
-        };
-        let name = name.as_str();
-        if !aliases.iter().any(|a| a == name) {
-            aliases.push(name.to_string());
-        }
-        if aliases.len() >= 16 {
-            break;
-        }
-    }
-    aliases
+/// `complete` is false when a mention of the module could not be resolved to a
+/// known binding or call, or when an identifier or alias count exceeded the
+/// bound. In that case the caller must not apply the import-only downgrade:
+/// absence of a matched call is not evidence of absence.
+struct AliasInfo {
+    /// Module bindings called as `alias.exec(...)`.
+    aliases: Vec<String>,
+    /// Destructured or imported function names called directly (`run(...)`).
+    bare_calls: Vec<String>,
+    complete: bool,
 }
 
-fn alias_call_regex(aliases: &[String]) -> Option<Regex> {
-    let names: Vec<String> = aliases.iter().map(|a| regex::escape(a)).collect();
-    (!names.is_empty()).then(|| {
-        Regex::new(&format!(
-            r"(?i)\b(?:{})\s*\.\s*(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(",
-            names.join("|")
-        ))
-        .expect("bad alias call regex")
+fn alias_binding_re() -> &'static Regex {
+    static BINDING_RE: OnceLock<Regex> = OnceLock::new();
+    BINDING_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^A-Za-z0-9_$])(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]{0,63})\s*=\s*require\s*\(\s*['"](?:node:)?child_process['"]\s*\)|(?:^|[^A-Za-z0-9_$])(?:const|let|var)\s*\{([^}]{0,512})\}\s*=\s*require\s*\(\s*['"](?:node:)?child_process['"]\s*\)|(?:^|[^A-Za-z0-9_$])import\s+(?:[A-Za-z_$][A-Za-z0-9_$]{0,63}\s*,\s*)?(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]{0,63})\s+from\s+['"](?:node:)?child_process['"]|(?:^|[^A-Za-z0-9_$])import\s*\{([^}]{0,512})\}\s*from\s+['"](?:node:)?child_process['"]"#,
+        )
+        .expect("static alias binding regex")
     })
+}
+
+fn direct_module_call_re() -> &'static Regex {
+    static DIRECT_RE: OnceLock<Regex> = OnceLock::new();
+    DIRECT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:child_process|childProcess)\s*\.\s*(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(",
+        )
+        .expect("static direct call regex")
+    })
+}
+
+fn child_process_alias_info(content: &str) -> AliasInfo {
+    let mut info = AliasInfo {
+        aliases: Vec::new(),
+        bare_calls: Vec::new(),
+        complete: true,
+    };
+    for captures in alias_binding_re().captures_iter(content) {
+        if let Some(name) = captures.get(1).or_else(|| captures.get(3)) {
+            push_unique(&mut info.aliases, name.as_str(), &mut info.complete);
+        }
+        if let Some(names) = captures.get(2).or_else(|| captures.get(4)) {
+            for item in names.as_str().split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let local = item
+                    .split_once(':')
+                    .map(|(_, local)| local.trim())
+                    .unwrap_or(item);
+                let local = local
+                    .split_once(" as ")
+                    .map(|(_, alias)| alias.trim())
+                    .unwrap_or(local);
+                let local = local.trim_start_matches("type ").trim();
+                if local.is_empty() {
+                    continue;
+                }
+                if local.len() > MAX_ALIAS_IDENT {
+                    info.complete = false;
+                    continue;
+                }
+                push_unique(&mut info.bare_calls, local, &mut info.complete);
+            }
+        }
+    }
+    // Any mention of the module that is not a resolved binding or a qualified
+    // call means the binding picture is incomplete.
+    for line in content.split('\n') {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("child_process") {
+            continue;
+        }
+        let resolved = alias_binding_re().is_match(line) || direct_module_call_re().is_match(line);
+        if !resolved {
+            info.complete = false;
+        }
+    }
+    info
+}
+
+fn push_unique(target: &mut Vec<String>, name: &str, complete: &mut bool) {
+    if name.len() > MAX_ALIAS_IDENT {
+        *complete = false;
+        return;
+    }
+    if target.iter().any(|existing| existing == name) {
+        return;
+    }
+    if target.len() >= MAX_ALIASES {
+        *complete = false;
+        return;
+    }
+    target.push(name.to_string());
+}
+
+fn alias_call_regex(info: &AliasInfo) -> Option<Regex> {
+    let mut parts: Vec<String> = Vec::new();
+    for alias in &info.aliases {
+        parts.push(format!(
+            r"(?:^|[^A-Za-z0-9_$]){}\s*\.\s*(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(",
+            regex::escape(alias)
+        ));
+    }
+    for name in &info.bare_calls {
+        if !is_builtin_call_name(name) {
+            parts.push(format!(r"(?:^|[^A-Za-z0-9_$]){}\s*\(", regex::escape(name)));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("|");
+    if joined.len() > 8192 {
+        return None;
+    }
+    Regex::new(&format!("(?i){joined}")).ok()
+}
+
+fn is_builtin_call_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "exec" | "spawn" | "execsync" | "spawnsync" | "execfile" | "execfilesync"
+    )
 }
 
 fn shannon_entropy(s: &str) -> f64 {

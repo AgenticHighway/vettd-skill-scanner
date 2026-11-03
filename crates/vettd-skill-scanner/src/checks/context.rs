@@ -75,20 +75,46 @@ pub(crate) fn policy_severity(base: Severity, kind: MatchKind) -> Severity {
     }
 }
 
-/// Classifies a matched line for `rule_id`.
+/// Classifies one match span for `rule_id`.
 ///
-/// `match_start` is the match's byte offset in the original `line`; callers
-/// that only have a folded view pass `usize::MAX`, which never qualifies as a
-/// defensive reference (the offset cannot be trusted).
-pub(crate) fn classify(path: &str, line: &str, rule_id: &str, match_start: usize) -> MatchKind {
-    if is_defensive_comment(path, line, rule_id, match_start) {
-        return MatchKind::DefensiveComment;
+/// `match_start..match_end` is the match's byte range in the original `line`;
+/// callers that only have a folded view pass `0..0`, which never qualifies for
+/// a downgrade (the offset cannot be trusted). `capability_downgrade_allowed`
+/// is false when the file's process-execution bindings could not be resolved
+/// completely, so an import-only downgrade is not positively established.
+///
+/// Fails closed: every branch requires positive evidence for that exact span,
+/// and anything uncertain keeps [`MatchKind::Runtime`] (base severity).
+pub(crate) fn classify(
+    path: &str,
+    line: &str,
+    rule_id: &str,
+    match_start: usize,
+    match_end: usize,
+    capability_downgrade_allowed: bool,
+) -> MatchKind {
+    if match_start >= line.len() || match_end <= match_start {
+        return MatchKind::Runtime;
+    }
+    if let Some((body_start, body_end)) = comment_body(path, line, match_start) {
+        return if is_defensive_comment(line, rule_id, body_start, body_end, match_start) {
+            MatchKind::DefensiveComment
+        } else {
+            // Text inside a comment is never a runtime operation, but prose
+            // that does not forbid it is not a defense either: keep base.
+            MatchKind::Runtime
+        };
+    }
+    // A match inside a quoted literal is text, not a call; a decoy string
+    // must never justify a downgrade.
+    if inside_string_literal(line, match_start) {
+        return MatchKind::Runtime;
     }
     if rule_id == RULE_SHELL_EXEC_UNSANDBOXED {
-        if is_capability_import(line) && !has_invocation(line) {
+        if capability_downgrade_allowed && is_capability_import(line) && !has_invocation(line) {
             return MatchKind::CapabilityOnly;
         }
-        if is_fixed_argument_call(line) {
+        if call_is_fixed(line, match_start, match_end) {
             return MatchKind::FixedArgument;
         }
     }
@@ -111,49 +137,144 @@ pub(crate) fn context_note(kind: MatchKind) -> Option<&'static str> {
     }
 }
 
-/// Comment markers for the file's language, or a conservative default.
-fn comment_markers(path: &str) -> &'static [&'static str] {
+/// Comment syntax for the file's language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentStyle {
+    Hash,
+    Slash,
+    Html,
+    Sql,
+    /// Unknown language: only the two unambiguous line markers.
+    Conservative,
+}
+
+fn comment_style(path: &str) -> CommentStyle {
     let extension = path
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .unwrap_or_default();
     match extension.as_str() {
         "sh" | "bash" | "zsh" | "ksh" | "dash" | "py" | "rb" | "pl" | "pm" | "yaml" | "yml"
-        | "toml" | "r" | "ini" | "cfg" | "conf" | "properties" | "tf" | "hcl" => &["#"],
+        | "toml" | "r" | "ini" | "cfg" | "conf" | "properties" | "tf" | "hcl" => CommentStyle::Hash,
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs"
         | "go" | "rs" | "java" | "kt" | "kts" | "swift" | "php" | "scala" | "m" => {
-            &["//", "/*", "*"]
+            CommentStyle::Slash
         }
-        "html" | "htm" | "xml" | "svg" | "md" | "markdown" => &["<!--"],
-        "sql" => &["--"],
-        _ => &["#", "//", "/*", "<!--"],
+        "html" | "htm" | "xml" | "svg" | "md" | "markdown" => CommentStyle::Html,
+        "sql" => CommentStyle::Sql,
+        _ => CommentStyle::Conservative,
     }
 }
 
-/// True when the line is a comment whose prohibition governs the matched
-/// operation.
-fn is_defensive_comment(path: &str, line: &str, rule_id: &str, match_start: usize) -> bool {
-    if !DEFENSIVE_ELIGIBLE.contains(&rule_id) || match_start > line.len() {
-        return false;
-    }
+/// Returns the byte range of the comment body containing `pos`, if any.
+///
+/// Only comments that are positively established on this line qualify: a line
+/// marker must be the first non-whitespace text, and a block comment must open
+/// and close on the same line with no code after the close. A multi-line block
+/// continuation is not tracked, so it never justifies a downgrade.
+fn comment_body(path: &str, line: &str, pos: usize) -> Option<(usize, usize)> {
     let trimmed = line.trim_start();
-    if !comment_markers(path)
-        .iter()
-        .any(|marker| trimmed.starts_with(marker))
-    {
+    let indent = line.len() - trimmed.len();
+    let style = comment_style(path);
+    let line_marker = match style {
+        CommentStyle::Hash => trimmed.starts_with('#').then_some("#"),
+        CommentStyle::Slash => trimmed.starts_with("//").then_some("//"),
+        CommentStyle::Sql => trimmed.starts_with("--").then_some("--"),
+        CommentStyle::Html => None,
+        CommentStyle::Conservative => {
+            if trimmed.starts_with('#') {
+                Some("#")
+            } else if trimmed.starts_with("//") {
+                Some("//")
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(marker) = line_marker {
+        let body_start = indent + marker.len();
+        return (pos > body_start && pos <= line.len()).then_some((body_start, line.len()));
+    }
+    let (open, close) = match style {
+        CommentStyle::Html => ("<!--", "-->"),
+        CommentStyle::Slash => ("/*", "*/"),
+        CommentStyle::Hash | CommentStyle::Sql | CommentStyle::Conservative => return None,
+    };
+    let mut search = 0usize;
+    while let Some(relative) = line[search..].find(open) {
+        let open_start = search + relative;
+        let Some(close_relative) = line[open_start + open.len()..].find(close) else {
+            // Unclosed on this line: the body may continue, so do not guess.
+            return None;
+        };
+        let close_start = open_start + open.len() + close_relative;
+        if pos > open_start + open.len() && pos < close_start {
+            // Code after the closing marker means the line is mixed; a match
+            // inside the comment cannot vouch for the rest of it.
+            return line[close_start + close.len()..]
+                .trim()
+                .is_empty()
+                .then_some((open_start + open.len(), close_start));
+        }
+        search = close_start + close.len();
+    }
+    None
+}
+
+/// True when `pos` is comment text or a quoted literal rather than code.
+pub(crate) fn is_inert_text(path: &str, line: &str, pos: usize) -> bool {
+    comment_body(path, line, pos).is_some() || inside_string_literal(line, pos)
+}
+
+/// True when `pos` lies inside a quoted literal on the line.
+fn inside_string_literal(line: &str, pos: usize) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if i >= pos {
+            return quote.is_some();
+        }
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if matches!(c, '"' | '\'' | '`') => quote = Some(c),
+            None => {}
+        }
+    }
+    quote.is_some()
+}
+
+/// True when a comment's prohibition governs the matched operation.
+fn is_defensive_comment(
+    line: &str,
+    rule_id: &str,
+    body_start: usize,
+    body_end: usize,
+    match_start: usize,
+) -> bool {
+    if !DEFENSIVE_ELIGIBLE.contains(&rule_id) {
         return false;
     }
-    let Some(prohibition) = prohibition_re().find(line) else {
+    let body = &line[body_start..body_end];
+    let Some(prohibition) = prohibition_re().find(body) else {
         return false;
     };
+    let prohibition_end = body_start + prohibition.end();
     // The prohibition has to come first: "the agent should run: cat ~/.ssh/…"
     // is an instruction, not a defense, even when it contains "avoid".
-    if prohibition.end() > match_start {
+    if prohibition_end > match_start {
         return false;
     }
     // Only the clause that follows the prohibition can be governed by it. A
     // clause break or a modal instruction starts a new, imperative sentence.
-    let governed = &line[prohibition.end()..match_start];
+    let governed = &line[prohibition_end..match_start];
     !governed.contains([':', ';']) && !modal_re().is_match(governed)
 }
 
@@ -201,39 +322,68 @@ fn has_invocation(line: &str) -> bool {
 /// Upper bound on the argument text inspected for one call.
 const MAX_ARG_CHARS: usize = 4096;
 
-/// True when every argument, and every array element, is a literal.
-///
-/// A first literal is not enough: `execFile("sh", ["-c", argv])` and
-/// `spawn('bash', ['-c', x])` still hand runtime input to a process. Options
-/// objects are accepted when their values are literals (`{cwd: "/tmp"}`),
-/// since keys are not arguments.
-fn is_fixed_argument_call(line: &str) -> bool {
-    // Find the invocation's own paren, not an earlier call on the same line
-    // (`require('child_process').exec(cmd)` must inspect `exec`'s argument).
+fn call_open_re() -> &'static Regex {
     static CALL_OPEN_RE: OnceLock<Regex> = OnceLock::new();
-    let re = CALL_OPEN_RE.get_or_init(|| {
+    CALL_OPEN_RE.get_or_init(|| {
         Regex::new(r"(?i)\b(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(")
             .expect("bad call-open regex")
-    });
-    let Some(call) = re.find(line) else {
-        return false;
-    };
-    let rest = &line[call.end()..];
-
-    // Any of these means the argument is built at runtime or handed to a
-    // shell/format engine, so a literal reading is not justified.
-    if rest.contains("shell=True") || rest.contains("shell: true") {
-        return false;
-    }
-
-    let Some(args) = balanced_arguments(rest) else {
-        return false;
-    };
-    arguments_are_literals(args)
+    })
 }
 
-/// Returns the text between the call's parentheses.
-fn balanced_arguments(rest: &str) -> Option<&str> {
+/// True when every invocation overlapping the match span is a fixed-literal
+/// call.
+///
+/// Every overlapping call must qualify: `execSync("ls"); exec(argv)` matches
+/// twice and the dynamic call keeps its base severity. A match that overlaps no
+/// call (prose, a bare name) is not fixed.
+fn call_is_fixed(line: &str, match_start: usize, match_end: usize) -> bool {
+    let mut found = false;
+    for call in call_open_re().find_iter(line) {
+        let rest = &line[call.end()..];
+        let Some((args, close)) = balanced_arguments(rest) else {
+            return false;
+        };
+        let call_end = call.end() + close + 1;
+        if call.start() < match_end && call_end > match_start {
+            found = true;
+            if !arguments_are_literals(args) || shell_opt_in_unsafe(args) {
+                return false;
+            }
+        }
+    }
+    found
+}
+
+/// True when the argument text opts into a shell or leaves the option unknown.
+///
+/// Structural, not spelling-based: quoted keys `{'shell':true}`, arbitrary
+/// whitespace, and `shell=True` all count. Only an explicit literal false
+/// (`false`/`0`) clears the option; any other value, including a variable, is
+/// treated as a runtime shell.
+fn shell_opt_in_unsafe(args: &str) -> bool {
+    static SHELL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SHELL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)['"]?\bshell\b['"]?\s*[:=]\s*([^,}\)\s]+)"#)
+            .expect("static shell option regex")
+    });
+    if !args.to_ascii_lowercase().contains("shell") {
+        return false;
+    }
+    let Some(captures) = re.captures(args) else {
+        return true;
+    };
+    !matches!(
+        captures
+            .get(1)
+            .map(|m| m.as_str().to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str(),
+        "false" | "0"
+    )
+}
+
+/// Returns the text between the call's parentheses and the offset of `)`.
+fn balanced_arguments(rest: &str) -> Option<(&str, usize)> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -253,7 +403,7 @@ fn balanced_arguments(rest: &str) -> Option<&str> {
             '(' | '[' | '{' => depth += 1,
             ')' => {
                 if depth == 0 {
-                    return Some(&rest[..i]);
+                    return Some((&rest[..i], i));
                 }
                 depth -= 1;
             }
@@ -357,16 +507,23 @@ mod tests {
 
     const RULE: &str = RULE_SHELL_EXEC_UNSANDBOXED;
 
+    fn at(path: &str, line: &str, rule: &str, needle: &str) -> MatchKind {
+        let start = line.find(needle).expect("needle in line");
+        classify(path, line, rule, start, start + needle.len(), true)
+    }
+
+    fn whole(path: &str, line: &str, rule: &str) -> MatchKind {
+        classify(path, line, rule, 0, line.len(), true)
+    }
+
     #[test]
     fn prohibition_is_only_defensive_inside_a_comment() {
-        let line = "# Never read ~/.ssh/id_rsa";
-        let start = line.find(".ssh").expect("path in line");
         assert_eq!(
-            classify("x.py", line, RULE, start),
+            at("x.py", "# Never read ~/.ssh/id_rsa", RULE, ".ssh"),
             MatchKind::DefensiveComment
         );
         assert_eq!(
-            classify("x.py", "print('never read ~/.ssh/id_rsa')", RULE, 30),
+            at("x.py", "print('never read ~/.ssh/id_rsa')", RULE, ".ssh"),
             MatchKind::Runtime,
             "prose in executable code is not a defense"
         );
@@ -374,50 +531,124 @@ mod tests {
 
     #[test]
     fn prohibition_must_govern_the_matched_operation() {
-        let line = "# to avoid prompts the agent should run: cat ~/.ssh/id_rsa";
-        let start = line.find(".ssh").expect("path in line");
         assert_eq!(
-            classify("x.sh", line, RULE, start),
+            at(
+                "x.sh",
+                "# to avoid prompts the agent should run: cat ~/.ssh/id_rsa",
+                RULE,
+                ".ssh"
+            ),
             MatchKind::Runtime,
             "an imperative after the prohibition is an instruction, not a defense"
+        );
+        assert_eq!(
+            at(
+                "x.sh",
+                "# Never read ~/.ssh/id_rsa; cat ~/.ssh/id_rsa",
+                RULE,
+                "cat"
+            ),
+            MatchKind::Runtime,
+            "a later clause break ends the prohibition's reach"
+        );
+    }
+
+    #[test]
+    fn a_match_outside_a_closed_block_comment_is_not_defensive() {
+        let line =
+            "/* Never read files */ console.log(require(\"fs\").readFileSync(\"/home/me/.ssh/id_rsa\"))";
+        assert_eq!(
+            at("x.js", line, crate::rules::RULE_SSH_KEY_FILE, ".ssh"),
+            MatchKind::Runtime,
+            "the comment closed before the credential read"
+        );
+        // Code after the closing marker makes the line mixed even when the
+        // match sits inside the comment text.
+        assert_eq!(
+            at("x.js", "/* Never read ~/.ssh/id_rsa */ run()", RULE, ".ssh"),
+            MatchKind::Runtime
+        );
+        assert_eq!(
+            at("x.js", "/* Never read ~/.ssh/id_rsa */", RULE, ".ssh"),
+            MatchKind::DefensiveComment
+        );
+    }
+
+    #[test]
+    fn code_before_a_line_comment_is_not_defensive() {
+        assert_eq!(
+            at(
+                "x.sh",
+                "echo setup; # never read ~/.ssh/id_rsa",
+                RULE,
+                ".ssh"
+            ),
+            MatchKind::Runtime
         );
     }
 
     #[test]
     fn secret_literals_are_never_defensive() {
-        let line = "# do not commit: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012";
-        let start = line.find("ghp_").expect("token in line");
         assert_eq!(
-            classify("x.sh", line, crate::rules::RULE_POTENTIAL_API_TOKEN, start),
+            at(
+                "x.sh",
+                "# do not commit: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012",
+                crate::rules::RULE_POTENTIAL_API_TOKEN,
+                "ghp_"
+            ),
             MatchKind::Runtime,
             "a literal secret is a leak regardless of surrounding prose"
         );
     }
 
     #[test]
+    fn quoted_text_never_justifies_a_downgrade() {
+        assert_eq!(
+            at(
+                "x.js",
+                "const decoy=\"execSync('ls')\"; exec(process.argv[2]);",
+                RULE,
+                "execSync"
+            ),
+            MatchKind::Runtime,
+            "the decoy call is inside a string literal"
+        );
+    }
+
+    #[test]
     fn import_without_a_call_is_capability_only() {
         assert_eq!(
-            classify("x.py", "import subprocess", RULE, 0),
+            whole("x.py", "import subprocess", RULE),
             MatchKind::CapabilityOnly
         );
         assert_eq!(
-            classify("x.js", "const cp = require('child_process');", RULE, 0),
+            whole("x.js", "const cp = require('child_process');", RULE),
             MatchKind::CapabilityOnly
         );
         assert_eq!(
-            classify("x.js", "import * as cp from 'node:child_process';", RULE, 0),
+            whole("x.js", "import * as cp from 'node:child_process';", RULE),
             MatchKind::CapabilityOnly
+        );
+    }
+
+    #[test]
+    fn import_downgrade_requires_complete_binding_resolution() {
+        let line = "const cp = require('child_process');";
+        assert_eq!(
+            classify("x.js", line, RULE, 0, line.len(), false),
+            MatchKind::Runtime,
+            "an unresolved alias means import-only is not positively established"
         );
     }
 
     #[test]
     fn fixed_literal_call_is_a_capability() {
         assert_eq!(
-            classify("x.js", "execSync(\"ls -la\")", RULE, 0),
+            whole("x.js", "execSync(\"ls -la\")", RULE),
             MatchKind::FixedArgument
         );
         assert_eq!(
-            classify("x.py", "subprocess.run([\"ls\", \"-la\"])", RULE, 0),
+            whole("x.py", "subprocess.run([\"ls\", \"-la\"])", RULE),
             MatchKind::Runtime,
             "the process-exec pattern does not claim Python run(); do not invent a classification"
         );
@@ -434,28 +665,44 @@ mod tests {
             "exec(`ls ${dir}`)",
             "subprocess.run(\"ls\", shell=True)",
         ] {
-            assert_eq!(
-                classify("x.js", line, RULE, 0),
-                MatchKind::Runtime,
-                "{line}"
-            );
+            assert_eq!(whole("x.js", line, RULE), MatchKind::Runtime, "{line}");
         }
         assert_eq!(
-            classify(
-                "x.js",
-                "execFile(\"ls\", [\"-la\"], {cwd: \"/tmp\"})",
-                RULE,
-                0
-            ),
+            whole("x.js", "execFile(\"ls\", [\"-la\"], {cwd: \"/tmp\"})", RULE),
             MatchKind::FixedArgument,
             "literal arguments and a literal-valued options object are fixed"
         );
     }
 
     #[test]
+    fn shell_opt_in_is_detected_structurally() {
+        for line in [
+            "spawn('echo', ['$UNTRUSTED'], {shell:true})",
+            "spawn('echo', ['$UNTRUSTED'], {shell : true})",
+            "spawn('echo', ['$UNTRUSTED'], {'shell':true})",
+            "spawn('echo', ['$UNTRUSTED'], { shell : True })",
+            "spawn('echo', ['$UNTRUSTED'], {shell: shellFlag})",
+            "spawn('echo', ['$UNTRUSTED'], {shell})",
+        ] {
+            assert_eq!(whole("x.js", line, RULE), MatchKind::Runtime, "{line}");
+        }
+        for line in [
+            "spawn('echo', ['x'], {shell: false})",
+            "spawn('echo', ['x'], {'shell':false})",
+            "spawn('echo', ['x'], { shell : 0 })",
+        ] {
+            assert_eq!(
+                whole("x.js", line, RULE),
+                MatchKind::FixedArgument,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn require_then_exec_inspects_the_exec_argument() {
         assert_eq!(
-            classify("x.js", "require('child_process').exec(cmd)", RULE, 0),
+            whole("x.js", "require('child_process').exec(cmd)", RULE),
             MatchKind::Runtime,
             "the require() argument must not be mistaken for exec's argument"
         );
