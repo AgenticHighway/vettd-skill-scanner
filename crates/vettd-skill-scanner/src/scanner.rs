@@ -14,6 +14,7 @@ use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
     ReclassifiedAnalysis, RepoContext,
 };
+use crate::evidence::annotate_evidence;
 use crate::expected_hosts::{has_unexpected_external_url, ExternalUrlOutcome};
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
@@ -522,6 +523,11 @@ pub fn scan_skill_with_repo_context(
         String::new()
     };
     check_description_behavior_mismatch(&description_for_mismatch, &mut findings);
+
+    // Every critical/high finding must carry its evidence and its limits. This
+    // runs after chain detection so escalated findings are annotated too, and
+    // after all finding producers so nothing leaves the crate unqualified.
+    annotate_evidence(&mut findings);
 
     let clean_internal_references = has_internal_references(&parsed.body)
         && !has_unresolvable_internal_references(&parsed.body, all_paths, repo_context);

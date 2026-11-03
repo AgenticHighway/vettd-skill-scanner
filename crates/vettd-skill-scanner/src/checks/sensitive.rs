@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::checks::context::{classify, context_note, policy_severity};
 use crate::checks::folding::{expand_line, literal_bindings};
 use crate::consts::DEFAULT_SOURCE;
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
@@ -612,6 +613,17 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         redact_match: true,
         doc_severity: None,
     },
+    // Capability observation, deliberately Info: importing a process-execution
+    // module is not evidence that it is invoked or that input is untrusted.
+    SensitivePattern {
+        rule_id: RULE_SHELL_EXEC_UNSANDBOXED,
+        label: "Process execution capability imported",
+        severity: Severity::Info,
+        intent: Intent::Negligent,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
 ];
 
 // Regex strings indexed parallel to SENSITIVE_PATTERNS (same order, same count).
@@ -622,8 +634,16 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r"(?:ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{22,}|sk-[a-zA-Z0-9]{20,})",
     // VTD-0017 — eval() code injection
     r"(?i)\beval\s*\(",
-    // VTD-0018 — shell exec without sandboxing
-    r"(?i)(?:\bchild_process\b|(?:^|[^.\w])(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\()",
+    // VTD-0018 — shell exec without sandboxing. Qualified process-module calls
+    // are matched explicitly; a bare `child_process` import is not a call and
+    // is reported as an Info capability by the pattern at the end of this list.
+    concat!(
+        r"(?i)(?:",
+        r"(?:^|[^.\w])(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(",
+        r"|(?:child_process|childProcess)\s*\.\s*(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\(",
+        r#"|require\s*\(\s*['"]child_process['"]\s*\)\s*\.\s*(?:exec|spawn|execSync|spawnSync|execFile|execFileSync)\s*\("#,
+        r")",
+    ),
     // VTD-0019 — destructive filesystem op
     r"(?im)(?:^|[\s;&|])(?:rm\s+-rf|rmdir/s|del\s+/f)\s+(?:/|~|\.{1,2}(?:/|\s|$)|\*|\$[{(]?[A-Za-z_])",
     // VTD-0020 — pipe to shell (curl/wget | bash)
@@ -744,6 +764,8 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r#"(?i)(?:Content-Type|content[_-]?type)["']?\s*[:=]\s*["']?application/octet-stream"#,
     // VTD-0027 — shell variable assigned long base64 literal
     r#"\b[A-Za-z_]\w*=["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
+    // VTD-0018 — process-execution module imported, no call observed (capability)
+    r#"(?i)(?:^\s*import\s+subprocess\b|^\s*from\s+subprocess\s+import\b|require\s*\(\s*['"]child_process['"]\s*\)|from\s+['"]child_process['"])"#,
 ];
 
 static SENSITIVE_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -827,6 +849,7 @@ pub(crate) fn scan_sensitive_patterns(
         let is_doc = path.to_lowercase().ends_with(".md");
         let bindings = literal_bindings(content);
         let lines: Vec<&str> = content.split('\n').collect();
+        let mut matched_rules: HashSet<&'static str> = HashSet::new();
 
         for (i_pat, pat) in SENSITIVE_PATTERNS.iter().enumerate() {
             if pat.code_only && is_doc {
@@ -860,6 +883,13 @@ pub(crate) fn scan_sensitive_patterns(
                 };
 
                 if let Some(m) = matched {
+                    let kind = classify(path, line, pat.rule_id);
+                    let severity = policy_severity(effective_severity, kind);
+                    // A capability observation never shadows a stronger
+                    // observation of the same rule in the same file.
+                    if severity == Severity::Info && matched_rules.contains(pat.rule_id) {
+                        break;
+                    }
                     // A folded match has no reliable offset into the original
                     // line, so a secret-literal pattern redacts the whole view
                     // rather than guessing a prefix.
@@ -870,10 +900,13 @@ pub(crate) fn scan_sensitive_patterns(
                     if folded {
                         detail.push_str(" [after bounded constant folding]");
                     }
+                    if let Some(note) = context_note(kind) {
+                        detail.push_str(note);
+                    }
                     findings.push(Finding {
                         rule_id: pat.rule_id.to_string(),
                         category: FindingCategory::Security,
-                        severity: effective_severity,
+                        severity,
                         label: pat.label.to_string(),
                         detail,
                         filepath: Some(path.clone()),
@@ -882,6 +915,7 @@ pub(crate) fn scan_sensitive_patterns(
                         intent: Some(pat.intent.clone()),
                         source: DEFAULT_SOURCE.to_string(),
                     });
+                    matched_rules.insert(pat.rule_id);
                     break; // first match per pattern per file only
                 }
             }
