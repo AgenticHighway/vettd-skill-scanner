@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -370,15 +370,7 @@ pub fn scan_skill_with_repo_context(
     // ── Security scan ────────────────────────────────────────────────────────
 
     let sensitive_scan = scan_sensitive_patterns(text_files);
-    let sensitive_offset = findings.len();
     findings.extend(sensitive_scan.findings);
-    // Classified non-actionable observations are excluded from chain sources by
-    // index, so only the downgraded classes lose chain behaviour.
-    let non_actionable: HashSet<usize> = sensitive_scan
-        .non_actionable
-        .iter()
-        .map(|index| index + sensitive_offset)
-        .collect();
 
     scan_entropy(text_files, &mut findings);
     scan_env_files(text_files, &mut findings);
@@ -541,7 +533,7 @@ pub fn scan_skill_with_repo_context(
 
     // ── Chain detection and mismatch checks ─────────────────────────────────
 
-    detect_exfiltration_chains(&mut findings, text_files, &non_actionable);
+    detect_exfiltration_chains(&mut findings, text_files);
     detect_malicious_activity_chains(&mut findings);
     let description_for_mismatch = if has_skill_md {
         parsed.description.clone()
@@ -552,11 +544,7 @@ pub fn scan_skill_with_repo_context(
 
     // The secrets attestation is decided after chain escalation: a critical
     // chain must never coexist with a "Secrets scan passed" entry.
-    let secrets_check_passed = !secrets_check_failed
-        && !base64_secrets_failed
-        && !findings.iter().any(|f| {
-            f.chain_id.is_some() && matches!(f.severity, Severity::Critical | Severity::High)
-        });
+    let secrets_check_passed = !secrets_check_failed && !base64_secrets_failed;
 
     // Every critical/high finding must carry its evidence and its limits. This
     // runs after chain detection so escalated findings are annotated too, and

