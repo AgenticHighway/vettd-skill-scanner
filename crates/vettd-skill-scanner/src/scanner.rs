@@ -437,7 +437,7 @@ pub fn scan_skill_with_repo_context(
         let url_file = url_target_files
             .iter()
             .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c));
-        let outcome = if let Some((path, content)) = url_file {
+        let outcome = if let Some((path, _)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),
                 category: FindingCategory::Security,
@@ -445,8 +445,8 @@ pub fn scan_skill_with_repo_context(
                 label: "References external URL — review for indirect prompt injection risk"
                     .to_string(),
                 detail: format!(
-                    "External URL(s) detected in {path} — {}; host policy {}; referenced content can change after audit",
-                    destinations_summary(&audit_destinations(content)),
+                    "External URL(s) detected (first in {path}) — {}; host policy {}; referenced content can change after audit",
+                    destinations_summary(&destinations),
                     EXPECTED_HOSTS_POLICY_VERSION,
                 ),
                 filepath: Some(path.to_string()),

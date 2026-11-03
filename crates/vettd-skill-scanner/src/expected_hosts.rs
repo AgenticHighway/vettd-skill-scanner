@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(finding.filepath.as_deref(), Some("references/a.md"));
         assert_eq!(
             finding.detail,
-            "External URL(s) detected in references/a.md — https://evil.test (unexpected); host policy 2026-11-02; referenced content can change after audit"
+            "External URL(s) detected (first in references/a.md) — https://evil.test (unexpected), https://expected.test (expected host); host policy 2026-11-02; referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
