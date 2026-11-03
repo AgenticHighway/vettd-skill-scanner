@@ -27,6 +27,10 @@ const MAX_BINDINGS: usize = 64;
 const MAX_LITERAL: usize = 256;
 /// Upper bound on fold iterations per line; each iteration is one merge.
 const MAX_FOLD_PASSES: usize = 8;
+/// Upper bound on a folded view. A larger view is dropped: the scan then sees
+/// only the original line, which is safe, rather than analysing unbounded
+/// attacker-controlled text.
+const MAX_EXPANDED: usize = 4096;
 
 /// Names that are syntax, not user bindings, and must never be substituted.
 const RESERVED: &[&str] = &[
@@ -100,21 +104,29 @@ fn unquote(literal: &str) -> &str {
 ///
 /// The original line keeps its identity: callers report the unchanged line
 /// number and the original text, so a folded match never invents a location.
+///
+/// Substitution is a single pass over the *original* line, never over its own
+/// output, and never inside a quoted literal. A bound value therefore cannot
+/// trigger another substitution, and the result is capped by [`MAX_EXPANDED`].
 pub(crate) fn expand_line(line: &str, bindings: &[(String, String)]) -> Option<String> {
-    let mut expanded = line.to_string();
-
-    // Bare identifiers first, so a substituted value is never re-substituted
-    // by a later pass (the scanner advances past each replacement).
-    for (name, value) in bindings {
-        expanded = substitute_identifier(&expanded, name, value);
+    if line.len() > MAX_EXPANDED {
+        return None;
     }
-    for (name, value) in bindings {
-        expanded = expanded.replace(&format!("${{{name}}}"), unquote(value));
-        expanded = expanded.replace(&format!("${name}"), unquote(value));
+
+    let mut expanded = substitute_bindings(line, bindings)?;
+    if expanded.len() > MAX_EXPANDED {
+        return None;
     }
 
     expanded = fold_literals(&expanded);
+    if expanded.len() > MAX_EXPANDED {
+        return None;
+    }
+
     if let Some(decoded) = decode_short_base64(&expanded) {
+        if expanded.len() + 1 + decoded.len() > MAX_EXPANDED {
+            return None;
+        }
         expanded.push(' ');
         expanded.push_str(&decoded);
     }
@@ -122,39 +134,137 @@ pub(crate) fn expand_line(line: &str, bindings: &[(String, String)]) -> Option<S
     (expanded != line).then_some(expanded)
 }
 
-/// Substitutes a bare `name` only where it is a value, never where it is a
-/// property (`.name`), a shell expansion (`$name`, `${name}`), a call
-/// (`name(`), a keyword argument (`name:`), or an assignment target (`name =`).
-fn substitute_identifier(src: &str, name: &str, value: &str) -> String {
+/// One left-to-right pass over `src`, replacing bound names in value position.
+///
+/// A name is only replaced where it is a value: never inside a quoted literal,
+/// a property (`.name`), a call (`name(`), a keyword argument (`name:`), or an
+/// assignment target (`name =`). The replacement text is emitted verbatim and
+/// is not rescanned, so bindings cannot expand into one another.
+fn substitute_bindings(src: &str, bindings: &[(String, String)]) -> Option<String> {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
     let mut consumed = 0usize;
+    let mut quote: Option<char> = None;
 
-    while let Some(pos) = rest.find(name) {
-        let abs = consumed + pos;
-        let after = pos + name.len();
-        out.push_str(&rest[..pos]);
-
-        let prev_ok = abs == 0 || {
-            let b = src.as_bytes()[abs - 1];
-            !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'{'))
-        };
-        let next_ok = abs + name.len() == src.len() || {
-            let b = src.as_bytes()[abs + name.len()];
-            !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'(' | b'=' | b':'))
-        };
-
-        if prev_ok && next_ok {
-            out.push_str(value);
-        } else {
-            out.push_str(name);
+    while let Some(c) = rest.chars().next() {
+        if out.len() > MAX_EXPANDED {
+            return None;
+        }
+        // Inside a literal nothing is substituted; only the closing quote and
+        // an escape keep the scanner's place.
+        if let Some(q) = quote {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            consumed += c.len_utf8();
+            if c == '\\' {
+                if let Some(next) = rest.chars().next() {
+                    out.push(next);
+                    rest = &rest[next.len_utf8()..];
+                    consumed += next.len_utf8();
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
         }
 
-        consumed = abs + name.len();
-        rest = &rest[after..];
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+                consumed += c.len_utf8();
+            }
+            '$' => {
+                let after_dollar = &rest[1..];
+                let braced = after_dollar
+                    .strip_prefix('{')
+                    .and_then(|s| s.split_once('}'))
+                    .filter(|(n, _)| !n.is_empty() && n.chars().all(is_ident_char));
+                let (name, consumed_inner): (String, usize) = match braced {
+                    // `$`, `{`, name, `}`.
+                    Some((n, _)) => (n.to_string(), n.len() + 3),
+                    None => {
+                        let name: String = after_dollar
+                            .chars()
+                            .take_while(|c| is_ident_char(*c))
+                            .collect();
+                        if name.is_empty() || !is_ident_start(name.chars().next().unwrap_or('_')) {
+                            out.push(c);
+                            rest = after_dollar;
+                            consumed += 1;
+                            continue;
+                        }
+                        let len = name.len();
+                        // `$` and the name.
+                        (name, len + 1)
+                    }
+                };
+                match lookup(bindings, &name) {
+                    Some(value) => out.push_str(unquote(value)),
+                    None => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+                rest = &rest[consumed_inner..];
+                consumed += consumed_inner;
+            }
+            c if is_ident_start(c) => {
+                let name: String = rest.chars().take_while(|c| is_ident_char(*c)).collect();
+                let abs = consumed;
+                let next = rest[name.len()..].chars().next();
+                let value_position = prev_allows(src, abs) && next_allows(next);
+                match lookup(bindings, &name) {
+                    Some(value) if value_position => out.push_str(value),
+                    _ => out.push_str(&name),
+                }
+                rest = &rest[name.len()..];
+                consumed += name.len();
+            }
+            _ => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+                consumed += c.len_utf8();
+            }
+        }
     }
-    out.push_str(rest);
-    out
+
+    Some(out)
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn lookup<'a>(bindings: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    bindings
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// True when the character before `name` lets it be a value, not a property,
+/// shell expansion, or the tail of a longer identifier.
+fn prev_allows(src: &str, abs: usize) -> bool {
+    if abs == 0 {
+        return true;
+    }
+    let b = src.as_bytes()[abs - 1];
+    !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'{'))
+}
+
+/// True when the character after `name` lets it be a value, not a call,
+/// keyword argument, or assignment target.
+fn next_allows(next: Option<char>) -> bool {
+    match next {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | '=' | ':')),
+    }
 }
 
 /// Merges trivia-joined, `+`-joined, and pathlib-`/`-joined string literals.
@@ -267,5 +377,48 @@ mod tests {
         // A shell-expanded value is dynamic; folding it would invent a literal.
         let bindings = literal_bindings("key=\"$HOME/.ssh/id_rsa\"\n");
         assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn substitution_does_not_recurse_into_bound_values() {
+        // Each value names the next binding. A recursive expansion would grow
+        // multiplicatively; a single pass over the original line may only
+        // replace the names the line itself contains.
+        let content = "\
+v0 = \"v1 v1 v1 v1\"\n\
+v1 = \"v2 v2 v2 v2\"\n\
+v2 = \"v3 v3 v3 v3\"\n\
+v3 = \"v4 v4 v4 v4\"\n\
+v4 = \"v5 v5 v5 v5\"\n\
+v5 = \"xxxxxxxxxxxxxxxx\"\n";
+        let bindings = literal_bindings(content);
+        let line = "x = v0 v0 v0 v0";
+        let expanded = expand_line(line, &bindings).expect("v0 is bound");
+        assert!(
+            expanded.len() <= MAX_EXPANDED,
+            "expansion must stay bounded, got {} bytes",
+            expanded.len()
+        );
+        assert!(
+            !expanded.contains("xxxxxxxxxxxxxxxx"),
+            "a bound value must not be expanded again: {expanded}"
+        );
+    }
+
+    #[test]
+    fn oversized_expansion_is_dropped() {
+        let big = "a".repeat(MAX_LITERAL);
+        let bindings = literal_bindings(&format!("big = \"{big}\"\n"));
+        let line = format!("x = {}", "big ".repeat(30));
+        assert!(
+            expand_line(&line, &bindings).is_none(),
+            "an expansion past the cap must be dropped, not analysed"
+        );
+    }
+
+    #[test]
+    fn names_inside_quoted_literals_are_not_substituted() {
+        let bindings = literal_bindings("name = \"/home/user/.ssh/id_rsa\"\n");
+        assert_eq!(expand_line("print(\"name\")", &bindings), None);
     }
 }
