@@ -15,7 +15,10 @@ use crate::emission::{
     ReclassifiedAnalysis, RepoContext,
 };
 use crate::evidence::annotate_evidence;
-use crate::expected_hosts::{has_unexpected_external_url, ExternalUrlOutcome};
+use crate::expected_hosts::{
+    audit_destinations, destinations_summary, has_unexpected_external_url, ExternalUrlAudit,
+    ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
+};
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
@@ -412,12 +415,24 @@ pub fn scan_skill_with_repo_context(
     };
 
     let external_urls = if url_target_files.is_empty() {
-        ExternalUrlOutcome::NotChecked
+        ExternalUrlAudit {
+            outcome: ExternalUrlOutcome::NotChecked,
+            destinations: Vec::new(),
+        }
     } else {
+        // Record every distinct destination even when the outcome is a
+        // finding, so the result names what was assessed rather than only that
+        // something was. Records are kept together with the outcome.
+        let joined = url_target_files
+            .iter()
+            .map(|(_, content)| *content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let destinations = audit_destinations(&joined);
         let url_file = url_target_files
             .iter()
             .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c));
-        if let Some((path, _)) = url_file {
+        let outcome = if let Some((path, content)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),
                 category: FindingCategory::Security,
@@ -425,7 +440,9 @@ pub fn scan_skill_with_repo_context(
                 label: "References external URL — review for indirect prompt injection risk"
                     .to_string(),
                 detail: format!(
-                    "External URL(s) detected in {path} — referenced content can change after audit"
+                    "External URL(s) detected in {path} — {}; host policy {}; referenced content can change after audit",
+                    destinations_summary(&audit_destinations(content)),
+                    EXPECTED_HOSTS_POLICY_VERSION,
                 ),
                 filepath: Some(path.to_string()),
                 owasp_llm_category: None,
@@ -438,6 +455,10 @@ pub fn scan_skill_with_repo_context(
             ExternalUrlOutcome::ExpectedHostsOnly
         } else {
             ExternalUrlOutcome::NoUrls
+        };
+        ExternalUrlAudit {
+            outcome,
+            destinations,
         }
     };
 
@@ -544,7 +565,7 @@ pub fn scan_skill_with_repo_context(
         text_files.contains_key(skill_key),
         secrets_check_passed,
         behavioral_check_passed,
-        external_urls,
+        &external_urls,
         validate_name(&parsed.name).is_none(),
         clean_internal_references,
     );
