@@ -163,6 +163,26 @@ fn benign_base64_is_not_flagged() {
 }
 
 #[test]
+fn benign_wrapper_call_is_not_a_credential_read() {
+    // A process wrapper around a non-sensitive path must not become a
+    // credential-path claim. The fixed-argument call itself stays a pinned
+    // known false positive of the exec rule (#31), so this asserts the
+    // credential-path family only.
+    let result = scan(&[("scripts/x.py", "subprocess.run([\"cat\", \"README.md\"])\n")]);
+    assert!(findings_for(&result, "VTD-0006").is_empty());
+}
+
+#[test]
+fn benign_alternate_path_api_is_not_flagged() {
+    let result = scan(&[(
+        "scripts/x.py",
+        "notes = Path.home() / \"Documents\" / \"notes.md\"\n",
+    )]);
+    assert!(findings_for(&result, "VTD-0006").is_empty());
+    assert!(!has_at_least(&result, Severity::High));
+}
+
+#[test]
 fn benign_multilingual_prose_is_not_flagged() {
     let result = scan(&[(
         "SKILL.md",
