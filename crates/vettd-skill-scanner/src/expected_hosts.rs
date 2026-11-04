@@ -27,6 +27,207 @@ pub(crate) enum ExternalUrlOutcome {
     Flagged,
 }
 
+/// Version of the compiled-in expected-host policy.
+///
+/// Recorded with every expected-host assessment so a later policy change (a
+/// revoked or widened exception) is distinguishable from an unchanged one.
+/// The unit tests pin a digest of [`EXPECTED_HOSTS`]: editing the list without
+/// bumping this version fails them, so the recorded version can never silently
+/// describe a different policy than the one that ran.
+pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-02";
+
+/// One external destination observed in analyzed text.
+///
+/// `scheme://host` is recorded exactly; query strings and fragments are
+/// deliberately omitted so a signed URL or embedded token is never copied into
+/// a result. `expected` records the assessment decision, never an egress
+/// permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Destination {
+    /// `"https"`, `"http"`, or `"?"` for an authority no parser can read.
+    pub(crate) scheme: &'static str,
+    /// Lowercase host, or `unparsed-authority`.
+    pub(crate) host: String,
+    /// True only when the host (and, for GitHub, the org path) is expected.
+    pub(crate) expected: bool,
+    /// What the analyzed text does with this destination (riskiest use wins).
+    pub(crate) kind: DestinationKind,
+}
+
+/// How analyzed text uses a destination, ordered from least to most risky.
+///
+/// Classified from the line that holds the reference. It records what the
+/// text appears to do, never what is allowed: no kind is an egress
+/// permission. Static text cannot see redirects or a later change of host
+/// ownership, so those stay stated limits of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DestinationKind {
+    /// Mentioned or linked, e.g. documentation.
+    Association,
+    /// Fetched and read as content (fetch, curl, wget, GET).
+    RetrievedContent,
+    /// Installed or cloned as a dependency.
+    DeclaredDependency,
+    /// Data is sent there (POST/PUT, upload, webhook).
+    OutboundDestination,
+    /// Downloaded and executed (piped to a shell, or an executable file).
+    ExecutableDownload,
+}
+
+impl DestinationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Association => "association",
+            Self::RetrievedContent => "retrieved content",
+            Self::DeclaredDependency => "declared dependency",
+            Self::OutboundDestination => "outbound destination",
+            Self::ExecutableDownload => "executable download",
+        }
+    }
+}
+
+/// Classifies one line of text by the riskiest use it shows. Ambiguous lines
+/// take the riskier reading (fail closed).
+pub(crate) fn classify_use(line: &str) -> DestinationKind {
+    static EXEC_RE: OnceLock<Regex> = OnceLock::new();
+    static OUT_RE: OnceLock<Regex> = OnceLock::new();
+    static DEP_RE: OnceLock<Regex> = OnceLock::new();
+    static GET_RE: OnceLock<Regex> = OnceLock::new();
+    let exec = EXEC_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\|\s*(sudo\s+)?(sh|bash|zsh|python3?|node|perl|ruby|iex)\b|invoke-expression|\biex\s*\(|https?://\S+\.(sh|ps1|bat|cmd|exe|msi|pkg|dmg|appimage|deb|rpm|bin|jar)\b|(bash|sh)\s+<\(\s*(curl|wget)",
+        )
+        .expect("bad exec re")
+    });
+    let out = OUT_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)-x\s*(post|put|patch)\b|--data|--upload-file|\s-(d|f|t)\s|\.(post|put|patch)\s*\(|method\s*[:=]\s*["']?(post|put|patch)|\bupload|\bwebhook|\bsend\b|\bexfil"#,
+        )
+        .expect("bad outbound re")
+    });
+    let dep = DEP_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(pip3?|uv|npm|pnpm|yarn|bun|cargo|go|gem|brew|apt(-get)?|poetry)\s+(install|add|get|i)\b|\bgit\s+(clone|submodule)\b|\bnpx\b|\buvx\b",
+        )
+        .expect("bad dependency re")
+    });
+    let get = GET_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(curl|wget|fetch|invoke-webrequest|iwr|irm|invoke-restmethod|webfetch|download)\b|\.get\s*\(|urlopen",
+        )
+        .expect("bad retrieval re")
+    });
+    if exec.is_match(line) {
+        DestinationKind::ExecutableDownload
+    } else if out.is_match(line) {
+        DestinationKind::OutboundDestination
+    } else if dep.is_match(line) {
+        DestinationKind::DeclaredDependency
+    } else if get.is_match(line) {
+        DestinationKind::RetrievedContent
+    } else {
+        DestinationKind::Association
+    }
+}
+
+/// The full line of `content` that holds byte offset `at`.
+fn line_at(content: &str, at: usize) -> &str {
+    let start = content[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = content[at..].find('\n').map_or(content.len(), |i| at + i);
+    &content[start..end]
+}
+
+/// Merges `dest` into `out`, keyed by `scheme://host`, failing closed: a host
+/// that is unexpected in any reference stays unexpected.
+fn merge_destination(out: &mut Vec<Destination>, dest: Destination) {
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|e| e.scheme == dest.scheme && e.host == dest.host)
+    {
+        existing.expected &= dest.expected;
+        existing.kind = existing.kind.max(dest.kind);
+    } else {
+        out.push(dest);
+    }
+}
+
+/// Records every distinct external destination in `content`, sorted
+/// deterministically, with its assessment status.
+pub(crate) fn audit_destinations(content: &str) -> Vec<Destination> {
+    let mut destinations = Vec::new();
+    for (at, reference) in extract_refs_at(content) {
+        let kind = classify_use(line_at(content, at));
+        let destination = match reference {
+            Some(reference) => Destination {
+                scheme: reference.scheme,
+                host: reference.host.clone(),
+                expected: is_expected(&reference),
+                kind,
+            },
+            // A non-plain authority is exactly what must not be vouched for.
+            None => Destination {
+                scheme: "?",
+                host: "unparsed-authority".to_string(),
+                expected: false,
+                kind,
+            },
+        };
+        merge_destination(&mut destinations, destination);
+    }
+    destinations
+        .sort_by(|a, b| (a.scheme, &a.host, a.expected).cmp(&(b.scheme, &b.host, b.expected)));
+    destinations
+}
+
+/// Renders destinations for a result string, marking each as expected or not.
+/// Every distinct destination is listed: the record is the evidence for the
+/// assessment, so silently truncating it would break that contract.
+pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
+    destinations
+        .iter()
+        .map(|d| {
+            format!(
+                "{}://{} ({}, {})",
+                d.scheme,
+                d.host,
+                if d.expected {
+                    "expected host"
+                } else {
+                    "unexpected"
+                },
+                d.kind.label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+/// Result of the external-URL check: the outcome plus every destination seen.
+///
+/// Kept together so a caller cannot pass an outcome without the destinations
+/// that justify it (or vice versa).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalUrlAudit {
+    pub(crate) outcome: ExternalUrlOutcome,
+    pub(crate) destinations: Vec<Destination>,
+    /// Destinations in other analyzed files (scripts, code). Recorded and
+    /// classified for the reader, but outside the check: they never change the
+    /// outcome, a finding, or a grade (cli#317).
+    pub(crate) script_destinations: Vec<Destination>,
+}
+
+/// The record-only clause for destinations outside the check, or "" when
+/// there are none.
+pub(crate) fn script_destinations_note(destinations: &[Destination]) -> String {
+    if destinations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Script destinations (recorded only, not part of this check): {}.",
+            destinations_summary(destinations)
+        )
+    }
+}
+
 /// One allowlist entry.
 // The production set has no `Pattern` entries yet.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -181,27 +382,40 @@ fn entries() -> impl Iterator<Item = &'static HostEntry> {
     EXPECTED_HOSTS.iter().chain(extra)
 }
 
-fn compiled_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        entries()
-            .filter_map(|e| match e {
-                HostEntry::Pattern { regex, .. } => Some(anchored(regex)),
-                _ => None,
-            })
-            .collect()
-    })
-}
-
 fn anchored(regex: &str) -> Regex {
     Regex::new(&format!("^(?:{regex})$")).expect("bad expected-host pattern")
 }
 
-/// A parsed reference: its plain host and, when the path is safe to read,
-/// its lowercase first path segment.
+/// A parsed reference: its scheme, plain host, and, when the path is safe to
+/// read, its lowercase first path segment.
 struct UrlRef {
+    scheme: &'static str,
     host: String,
     first_segment: Option<String>,
+    /// False when the authority is not a plain DNS name (IP literal, port,
+    /// userinfo, non-ASCII, percent-encoding, empty). Such a reference is
+    /// recorded by destination but can never be expected.
+    plain: bool,
+}
+
+/// Best-effort destination identity for an authority `plain_host` rejects.
+/// Keeps the host visible (an IP is an exact destination) while dropping
+/// userinfo and a numeric port so no credential is copied into a result.
+fn opaque_host(authority: &str) -> String {
+    let after_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match after_userinfo.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => after_userinfo,
+    };
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    let printable = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'));
+    if host.is_empty() || !printable {
+        "unparsed-authority".to_string()
+    } else {
+        host
+    }
 }
 
 fn placeholder_re() -> &'static Regex {
@@ -268,6 +482,11 @@ fn first_segment(path: &str) -> Option<String> {
 /// Yields every `http(s)://` reference in `content`, or `None` for a
 /// reference whose authority is not a plain host.
 fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
+    extract_refs_at(content).map(|(_, r)| r)
+}
+
+/// [`extract_refs`] with the byte offset of each reference.
+fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>)> + '_ {
     static SCHEME_RE: OnceLock<Regex> = OnceLock::new();
     let re = SCHEME_RE.get_or_init(|| Regex::new(r"(?i)https?://").expect("bad scheme re"));
     re.find_iter(content).map(|m| {
@@ -299,20 +518,34 @@ fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
         } else {
             ":80"
         };
-        let host = match authority.strip_suffix(default_port).and_then(plain_host) {
-            Some(h) if h.starts_with("*.") => h,
-            _ => plain_host(authority)?,
+        let (host, plain) = match authority.strip_suffix(default_port).and_then(plain_host) {
+            Some(h) if h.starts_with("*.") => (h, true),
+            _ => match plain_host(authority) {
+                Some(h) => (h, true),
+                // Still a destination worth recording, but never vouched for.
+                None => (opaque_host(authority), false),
+            },
         };
         let first_segment = rest[end..].strip_prefix('/').and_then(first_segment);
-        Some(UrlRef {
-            host,
-            first_segment,
-        })
+        let scheme = if m.as_str().eq_ignore_ascii_case("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        (
+            m.start(),
+            Some(UrlRef {
+                scheme,
+                host,
+                first_segment,
+                plain,
+            }),
+        )
     })
 }
 
-fn is_expected(r: &UrlRef) -> bool {
-    entries().any(|e| match e {
+fn is_expected_with<'a>(mut entries: impl Iterator<Item = &'a HostEntry>, r: &UrlRef) -> bool {
+    entries.any(|e| match e {
         Exact(h) => *h == r.host,
         GitHubOrg(org) => r.host == "github.com" && r.first_segment.as_deref() == Some(*org),
         TemplatedSuffix(suffix) => {
@@ -322,8 +555,12 @@ fn is_expected(r: &UrlRef) -> bool {
             }
             rest.len() < r.host.len() && rest == *suffix
         }
-        HostEntry::Pattern { .. } => false,
-    }) || compiled_patterns().iter().any(|re| re.is_match(&r.host))
+        HostEntry::Pattern { regex, .. } => anchored(regex).is_match(&r.host),
+    })
+}
+
+fn is_expected(r: &UrlRef) -> bool {
+    r.plain && is_expected_with(entries(), r)
 }
 
 /// True when `content` references any URL outside the expected set.
@@ -378,6 +615,10 @@ mod tests {
             "https://expected.test@evil.test/",
             "https://user:pw@expected.test/",
             "https://127.0.0.1/",
+            "https://10.0.0.1/",
+            "https://192.168.1.1/",
+            "https://172.16.0.1/",
+            "https://169.254.169.254/",
             "https://[::1]/",
             "https://expécted.test/",
             "https://expected%2etest/",
@@ -513,6 +754,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_records_scheme_host_and_assessment_without_query() {
+        // The destination record is the exact destination identity: scheme and
+        // host. Query and fragment are omitted so a signed URL or token is not
+        // copied into a result.
+        let destinations = audit_destinations(
+            "See https://expected.test/path?token=secret#frag and http://evil.test/x",
+        );
+        assert_eq!(destinations.len(), 2);
+        let expected = destinations
+            .iter()
+            .find(|d| d.host == "expected.test")
+            .expect("expected host recorded");
+        assert_eq!(expected.scheme, "https");
+        assert!(expected.expected);
+        let unexpected = destinations
+            .iter()
+            .find(|d| d.host == "evil.test")
+            .expect("unexpected host recorded");
+        assert_eq!(unexpected.scheme, "http");
+        assert!(!unexpected.expected);
+
+        let summary = destinations_summary(&destinations);
+        assert!(
+            !summary.contains("token") && !summary.contains("frag"),
+            "query/fragment must not leak into the record: {summary}"
+        );
+        assert!(
+            summary.contains("https://expected.test (expected host, association)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("http://evil.test (unexpected, association)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn policy_version_is_pinned() {
+        // A version bump is a deliberate policy change, never an accident: the
+        // recorded version is what lets a reviewer tell the two apart.
+        assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-02");
+    }
+
+    /// Stable FNV-1a digest of the production list (test-only: no new dep).
+    fn expected_hosts_digest() -> u64 {
+        fn feed(hash: &mut u64, bytes: &[u8]) {
+            for &byte in bytes {
+                *hash ^= u64::from(byte);
+                *hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for entry in EXPECTED_HOSTS {
+            match entry {
+                Exact(host) => {
+                    feed(&mut hash, b"E");
+                    feed(&mut hash, host.as_bytes());
+                }
+                GitHubOrg(org) => {
+                    feed(&mut hash, b"G");
+                    feed(&mut hash, org.as_bytes());
+                }
+                TemplatedSuffix(suffix) => {
+                    feed(&mut hash, b"T");
+                    feed(&mut hash, suffix.as_bytes());
+                }
+                HostEntry::Pattern { regex, .. } => {
+                    feed(&mut hash, b"P");
+                    feed(&mut hash, regex.as_bytes());
+                }
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn policy_version_is_tied_to_the_host_list() {
+        // The version is recorded in every assessment; the digest makes an
+        // unnoticed list edit fail here instead of mislabeling a result.
+        assert_eq!(
+            expected_hosts_digest(),
+            14461354016487588110,
+            "expected-host list changed: bump EXPECTED_HOSTS_POLICY_VERSION and update this digest"
+        );
+    }
+
+    #[test]
+    fn every_destination_is_recorded_without_truncation() {
+        let mut content = String::new();
+        for i in 0..12 {
+            content.push_str(&format!("https://host{i}.invalid/x "));
+        }
+        let destinations = audit_destinations(&content);
+        assert_eq!(destinations.len(), 12);
+        let summary = destinations_summary(&destinations);
+        for i in 0..12 {
+            assert!(
+                summary.contains(&format!("https://host{i}.invalid")),
+                "destination {i} missing from summary: {summary}"
+            );
+        }
+        assert!(!summary.contains("more"));
+    }
+
+    #[test]
+    fn revoked_exception_no_longer_vouches() {
+        let reference = extract_refs("https://expected.test/x")
+            .next()
+            .expect("one reference")
+            .expect("plain host");
+        assert!(is_expected_with(TEST_HOSTS.iter(), &reference));
+        assert!(
+            !is_expected_with(std::iter::empty::<&HostEntry>(), &reference),
+            "removing an entry must revoke its assessment, not leave it implicit"
+        );
+    }
+
+    #[test]
+    fn mixed_expected_and_unexpected_is_flagged() {
+        assert!(has_unexpected_external_url(
+            "https://expected.test/a https://evil.test/b"
+        ));
+        let destinations = audit_destinations("https://expected.test/a https://evil.test/b");
+        assert!(destinations.iter().any(|d| d.expected));
+        assert!(destinations.iter().any(|d| !d.expected));
+    }
+
+    #[test]
+    fn duplicate_hosts_merge_fail_closed() {
+        // github.com hosts every account: one expected org path must not
+        // launder a second, unexpected org path on the same host.
+        let destinations =
+            audit_destinations("https://github.com/expected-org/a https://github.com/evil/b");
+        let github = destinations
+            .iter()
+            .find(|d| d.host == "github.com")
+            .expect("github host recorded");
+        assert!(!github.expected);
+    }
+
     fn scan_files(files: &[(&str, &str)]) -> crate::SkillScanResult {
         let text_files: HashMap<String, String> = files
             .iter()
@@ -568,7 +950,7 @@ mod tests {
         assert_eq!(finding.filepath.as_deref(), Some("references/a.md"));
         assert_eq!(
             finding.detail,
-            "External URL(s) detected in references/a.md — referenced content can change after audit"
+            "External URL(s) detected (first in references/a.md) — https://evil.test (unexpected, association), https://expected.test (expected host, association); host policy 2026-11-02; referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, false));

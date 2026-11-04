@@ -14,7 +14,11 @@ use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
     ReclassifiedAnalysis, RepoContext,
 };
-use crate::expected_hosts::{has_unexpected_external_url, ExternalUrlOutcome};
+use crate::evidence::annotate_evidence;
+use crate::expected_hosts::{
+    audit_destinations, destinations_summary, has_unexpected_external_url,
+    script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
+};
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
@@ -365,22 +369,19 @@ pub fn scan_skill_with_repo_context(
 
     // ── Security scan ────────────────────────────────────────────────────────
 
-    let (sensitive_findings, secrets_check_failed_pat) = scan_sensitive_patterns(text_files);
-    findings.extend(sensitive_findings);
+    let sensitive_scan = scan_sensitive_patterns(text_files);
+    findings.extend(sensitive_scan.findings);
 
     scan_entropy(text_files, &mut findings);
     scan_env_files(text_files, &mut findings);
 
-    let secrets_check_failed = secrets_check_failed_pat
-        || findings.iter().any(|f| {
-            f.category == FindingCategory::Security
-                && matches!(f.severity, Severity::Critical | Severity::High)
-        });
+    let secrets_check_failed = findings.iter().any(|f| {
+        f.category == FindingCategory::Security
+            && matches!(f.severity, Severity::Critical | Severity::High)
+    });
 
     let (base64_secrets_failed, base64_behavioral_failed) =
         check_base64_payloads(text_files, &mut findings);
-
-    let secrets_check_passed = !secrets_check_failed && !base64_secrets_failed;
 
     let (behavioral_findings, behavioral_check_failed) = scan_behavioral_patterns(text_files);
     findings.extend(behavioral_findings);
@@ -410,13 +411,44 @@ pub fn scan_skill_with_repo_context(
         targets
     };
 
+    // cli#317: outbound destinations and executable downloads mostly live in
+    // scripts. Record and classify them for the reader without widening the
+    // check, so no finding or grade changes.
+    let script_destinations = {
+        let mut others: Vec<(&String, &String)> = text_files
+            .iter()
+            .filter(|(p, _)| !url_target_files.iter().any(|(t, _)| *t == p.as_str()))
+            .collect();
+        others.sort_by_key(|(p, _)| *p);
+        audit_destinations(
+            &others
+                .iter()
+                .map(|(_, c)| c.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+
     let external_urls = if url_target_files.is_empty() {
-        ExternalUrlOutcome::NotChecked
+        ExternalUrlAudit {
+            outcome: ExternalUrlOutcome::NotChecked,
+            destinations: Vec::new(),
+            script_destinations,
+        }
     } else {
+        // Record every distinct destination even when the outcome is a
+        // finding, so the result names what was assessed rather than only that
+        // something was. Records are kept together with the outcome.
+        let joined = url_target_files
+            .iter()
+            .map(|(_, content)| *content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let destinations = audit_destinations(&joined);
         let url_file = url_target_files
             .iter()
             .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c));
-        if let Some((path, _)) = url_file {
+        let outcome = if let Some((path, _)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),
                 category: FindingCategory::Security,
@@ -424,7 +456,13 @@ pub fn scan_skill_with_repo_context(
                 label: "References external URL — review for indirect prompt injection risk"
                     .to_string(),
                 detail: format!(
-                    "External URL(s) detected in {path} — referenced content can change after audit"
+                    "External URL(s) detected (first in {path}) — {}; host policy {}; referenced content can change after audit{}",
+                    destinations_summary(&destinations),
+                    EXPECTED_HOSTS_POLICY_VERSION,
+                    match script_destinations_note(&script_destinations) {
+                        note if note.is_empty() => note,
+                        note => format!(";{}", note.trim_end_matches('.')),
+                    },
                 ),
                 filepath: Some(path.to_string()),
                 owasp_llm_category: None,
@@ -437,6 +475,11 @@ pub fn scan_skill_with_repo_context(
             ExternalUrlOutcome::ExpectedHostsOnly
         } else {
             ExternalUrlOutcome::NoUrls
+        };
+        ExternalUrlAudit {
+            outcome,
+            destinations,
+            script_destinations,
         }
     };
 
@@ -523,6 +566,15 @@ pub fn scan_skill_with_repo_context(
     };
     check_description_behavior_mismatch(&description_for_mismatch, &mut findings);
 
+    // The secrets attestation is decided after chain escalation: a critical
+    // chain must never coexist with a "Secrets scan passed" entry.
+    let secrets_check_passed = !secrets_check_failed && !base64_secrets_failed;
+
+    // Every critical/high finding must carry its evidence and its limits. This
+    // runs after chain detection so escalated findings are annotated too, and
+    // after all finding producers so nothing leaves the crate unqualified.
+    annotate_evidence(&mut findings);
+
     let clean_internal_references = has_internal_references(&parsed.body)
         && !has_unresolvable_internal_references(&parsed.body, all_paths, repo_context);
     let signals = emit_signals(
@@ -538,7 +590,7 @@ pub fn scan_skill_with_repo_context(
         text_files.contains_key(skill_key),
         secrets_check_passed,
         behavioral_check_passed,
-        external_urls,
+        &external_urls,
         validate_name(&parsed.name).is_none(),
         clean_internal_references,
     );

@@ -9,7 +9,10 @@ use yaml_rust2::Yaml;
 
 use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
-use crate::expected_hosts::ExternalUrlOutcome;
+use crate::expected_hosts::{
+    destinations_summary, script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome,
+    EXPECTED_HOSTS_POLICY_VERSION,
+};
 use crate::language::language_for_path;
 use crate::signal::Signal;
 use crate::signal_rules::*;
@@ -473,7 +476,7 @@ pub(crate) fn coverage_entries(
     skill_md_content_present: bool,
     secrets_check_passed: bool,
     behavioral_check_passed: bool,
-    external_urls: ExternalUrlOutcome,
+    external_urls: &ExternalUrlAudit,
     name_valid: bool,
     clean_internal_references: bool,
 ) -> Vec<CoverageEntry> {
@@ -483,48 +486,57 @@ pub(crate) fn coverage_entries(
         return Vec::new();
     }
     let mut entries = Vec::new();
-    let attestation_flags: [(&str, &str, &str, bool); 5] = [
+    let expected_hosts_detail = format!(
+        "External references point only to producer-associated expected hosts ({}), under host policy {}. Association only: this is not authorization to send data, follow redirects, or treat referenced content as safe. Redirect targets and host ownership are not observed and can change after audit.{}",
+        destinations_summary(&external_urls.destinations),
+        EXPECTED_HOSTS_POLICY_VERSION,
+        script_destinations_note(&external_urls.script_destinations),
+    );
+    let attestations: [(&str, &str, String, bool); 5] = [
         (
             "VTD-0091",
             "Secrets scan passed",
-            "No secrets or unsafe code patterns were detected.",
+            "Deterministic static matching found no secrets or unsafe code patterns. Limits: literal patterns plus bounded constant folding only; dynamic construction, unsupported languages, and non-literal multilingual intent are not decided, and runtime isolation is still required.".to_string(),
             secrets_check_passed,
         ),
         (
             "VTD-0092",
             "behavioral scan passed",
-            "No prompt-injection or jailbreak signals were detected.",
+            "No prompt-injection or jailbreak signals were detected.".to_string(),
             behavioral_check_passed,
         ),
         (
             "VTD-0093",
             "External URL scan passed",
-            "No external URLs were found in scanned skill text.",
-            external_urls == ExternalUrlOutcome::NoUrls,
+            format!(
+                "No external URLs were found in scanned skill text.{}",
+                script_destinations_note(&external_urls.script_destinations)
+            ),
+            external_urls.outcome == ExternalUrlOutcome::NoUrls,
         ),
         (
             "VTD-0124",
-            "External URLs limited to expected hosts",
-            "All external URLs in scanned skill text point to curated expected hosts.",
-            external_urls == ExternalUrlOutcome::ExpectedHostsOnly,
+            "External references limited to expected hosts (association only)",
+            expected_hosts_detail,
+            external_urls.outcome == ExternalUrlOutcome::ExpectedHostsOnly,
         ),
         (
             "VTD-0099",
             "Name validation passed",
-            "The declared skill name follows the supported naming rules.",
+            "The declared skill name follows the supported naming rules.".to_string(),
             // A SKILL.md detected only through `all_paths` carries no content
             // and no declared name; the fallback sentinel name is not a name
             // to validate. Do not attest name validation in that case.
             name_valid && skill_md_content_present,
         ),
     ];
-    for (rule_id, label, detail, passed) in attestation_flags {
+    for (rule_id, label, detail, passed) in attestations {
         if passed {
             entries.push(CoverageEntry {
                 kind: "attestation".to_string(),
                 rule_id: rule_id.to_string(),
                 label: label.to_string(),
-                detail: detail.to_string(),
+                detail,
                 category: Some("safety".to_string()),
             });
         }
