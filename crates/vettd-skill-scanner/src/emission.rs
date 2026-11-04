@@ -486,7 +486,7 @@ pub(crate) fn coverage_entries(
     }
     let mut entries = Vec::new();
     let expected_hosts_detail = format!(
-        "External references point only to producer-associated expected hosts ({}), under host policy {}. Association only: this is not authorization to send data, follow redirects, or treat referenced content as safe.",
+        "External references point only to producer-associated expected hosts ({}), under host policy {}. Association only: this is not authorization to send data, follow redirects, or treat referenced content as safe. Redirect targets and host ownership are not observed and can change after audit.",
         destinations_summary(&external_urls.destinations),
         EXPECTED_HOSTS_POLICY_VERSION,
     );

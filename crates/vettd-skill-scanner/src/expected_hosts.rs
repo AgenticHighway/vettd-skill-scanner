@@ -50,6 +50,91 @@ pub(crate) struct Destination {
     pub(crate) host: String,
     /// True only when the host (and, for GitHub, the org path) is expected.
     pub(crate) expected: bool,
+    /// What the analyzed text does with this destination (riskiest use wins).
+    pub(crate) kind: DestinationKind,
+}
+
+/// How analyzed text uses a destination, ordered from least to most risky.
+///
+/// Classified from the line that holds the reference. It records what the
+/// text appears to do, never what is allowed: no kind is an egress
+/// permission. Static text cannot see redirects or a later change of host
+/// ownership, so those stay stated limits of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DestinationKind {
+    /// Mentioned or linked, e.g. documentation.
+    Association,
+    /// Fetched and read as content (fetch, curl, wget, GET).
+    RetrievedContent,
+    /// Installed or cloned as a dependency.
+    DeclaredDependency,
+    /// Data is sent there (POST/PUT, upload, webhook).
+    OutboundDestination,
+    /// Downloaded and executed (piped to a shell, or an executable file).
+    ExecutableDownload,
+}
+
+impl DestinationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Association => "association",
+            Self::RetrievedContent => "retrieved content",
+            Self::DeclaredDependency => "declared dependency",
+            Self::OutboundDestination => "outbound destination",
+            Self::ExecutableDownload => "executable download",
+        }
+    }
+}
+
+/// Classifies one line of text by the riskiest use it shows. Ambiguous lines
+/// take the riskier reading (fail closed).
+pub(crate) fn classify_use(line: &str) -> DestinationKind {
+    static EXEC_RE: OnceLock<Regex> = OnceLock::new();
+    static OUT_RE: OnceLock<Regex> = OnceLock::new();
+    static DEP_RE: OnceLock<Regex> = OnceLock::new();
+    static GET_RE: OnceLock<Regex> = OnceLock::new();
+    let exec = EXEC_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\|\s*(sudo\s+)?(sh|bash|zsh|python3?|node|perl|ruby|iex)\b|invoke-expression|\biex\s*\(|https?://\S+\.(sh|ps1|bat|cmd|exe|msi|pkg|dmg|appimage|deb|rpm|bin|jar)\b|(bash|sh)\s+<\(\s*(curl|wget)",
+        )
+        .expect("bad exec re")
+    });
+    let out = OUT_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)-x\s*(post|put|patch)\b|--data|--upload-file|\s-(d|f|t)\s|\.(post|put|patch)\s*\(|method\s*[:=]\s*["']?(post|put|patch)|\bupload|\bwebhook|\bsend\b|\bexfil"#,
+        )
+        .expect("bad outbound re")
+    });
+    let dep = DEP_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(pip3?|uv|npm|pnpm|yarn|bun|cargo|go|gem|brew|apt(-get)?|poetry)\s+(install|add|get|i)\b|\bgit\s+(clone|submodule)\b|\bnpx\b|\buvx\b",
+        )
+        .expect("bad dependency re")
+    });
+    let get = GET_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(curl|wget|fetch|invoke-webrequest|iwr|irm|invoke-restmethod|webfetch|download)\b|\.get\s*\(|urlopen",
+        )
+        .expect("bad retrieval re")
+    });
+    if exec.is_match(line) {
+        DestinationKind::ExecutableDownload
+    } else if out.is_match(line) {
+        DestinationKind::OutboundDestination
+    } else if dep.is_match(line) {
+        DestinationKind::DeclaredDependency
+    } else if get.is_match(line) {
+        DestinationKind::RetrievedContent
+    } else {
+        DestinationKind::Association
+    }
+}
+
+/// The full line of `content` that holds byte offset `at`.
+fn line_at(content: &str, at: usize) -> &str {
+    let start = content[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = content[at..].find('\n').map_or(content.len(), |i| at + i);
+    &content[start..end]
 }
 
 /// Merges `dest` into `out`, keyed by `scheme://host`, failing closed: a host
@@ -60,6 +145,7 @@ fn merge_destination(out: &mut Vec<Destination>, dest: Destination) {
         .find(|e| e.scheme == dest.scheme && e.host == dest.host)
     {
         existing.expected &= dest.expected;
+        existing.kind = existing.kind.max(dest.kind);
     } else {
         out.push(dest);
     }
@@ -69,18 +155,21 @@ fn merge_destination(out: &mut Vec<Destination>, dest: Destination) {
 /// deterministically, with its assessment status.
 pub(crate) fn audit_destinations(content: &str) -> Vec<Destination> {
     let mut destinations = Vec::new();
-    for reference in extract_refs(content) {
+    for (at, reference) in extract_refs_at(content) {
+        let kind = classify_use(line_at(content, at));
         let destination = match reference {
             Some(reference) => Destination {
                 scheme: reference.scheme,
                 host: reference.host.clone(),
                 expected: is_expected(&reference),
+                kind,
             },
             // A non-plain authority is exactly what must not be vouched for.
             None => Destination {
                 scheme: "?",
                 host: "unparsed-authority".to_string(),
                 expected: false,
+                kind,
             },
         };
         merge_destination(&mut destinations, destination);
@@ -98,14 +187,15 @@ pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
         .iter()
         .map(|d| {
             format!(
-                "{}://{} ({})",
+                "{}://{} ({}, {})",
                 d.scheme,
                 d.host,
                 if d.expected {
                     "expected host"
                 } else {
                     "unexpected"
-                }
+                },
+                d.kind.label()
             )
         })
         .collect::<Vec<_>>()
@@ -375,6 +465,11 @@ fn first_segment(path: &str) -> Option<String> {
 /// Yields every `http(s)://` reference in `content`, or `None` for a
 /// reference whose authority is not a plain host.
 fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
+    extract_refs_at(content).map(|(_, r)| r)
+}
+
+/// [`extract_refs`] with the byte offset of each reference.
+fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>)> + '_ {
     static SCHEME_RE: OnceLock<Regex> = OnceLock::new();
     let re = SCHEME_RE.get_or_init(|| Regex::new(r"(?i)https?://").expect("bad scheme re"));
     re.find_iter(content).map(|m| {
@@ -420,12 +515,15 @@ fn extract_refs(content: &str) -> impl Iterator<Item = Option<UrlRef>> + '_ {
         } else {
             "http"
         };
-        Some(UrlRef {
-            scheme,
-            host,
-            first_segment,
-            plain,
-        })
+        (
+            m.start(),
+            Some(UrlRef {
+                scheme,
+                host,
+                first_segment,
+                plain,
+            }),
+        )
     })
 }
 
@@ -667,11 +765,11 @@ mod tests {
             "query/fragment must not leak into the record: {summary}"
         );
         assert!(
-            summary.contains("https://expected.test (expected host)"),
+            summary.contains("https://expected.test (expected host, association)"),
             "{summary}"
         );
         assert!(
-            summary.contains("http://evil.test (unexpected)"),
+            summary.contains("http://evil.test (unexpected, association)"),
             "{summary}"
         );
     }
@@ -835,7 +933,7 @@ mod tests {
         assert_eq!(finding.filepath.as_deref(), Some("references/a.md"));
         assert_eq!(
             finding.detail,
-            "External URL(s) detected (first in references/a.md) — https://evil.test (unexpected), https://expected.test (expected host); host policy 2026-11-02; referenced content can change after audit"
+            "External URL(s) detected (first in references/a.md) — https://evil.test (unexpected, association), https://expected.test (expected host, association); host policy 2026-11-02; referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
