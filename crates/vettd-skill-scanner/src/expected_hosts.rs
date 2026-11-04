@@ -209,6 +209,23 @@ pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
 pub(crate) struct ExternalUrlAudit {
     pub(crate) outcome: ExternalUrlOutcome,
     pub(crate) destinations: Vec<Destination>,
+    /// Destinations in other analyzed files (scripts, code). Recorded and
+    /// classified for the reader, but outside the check: they never change the
+    /// outcome, a finding, or a grade (cli#317).
+    pub(crate) script_destinations: Vec<Destination>,
+}
+
+/// The record-only clause for destinations outside the check, or "" when
+/// there are none.
+pub(crate) fn script_destinations_note(destinations: &[Destination]) -> String {
+    if destinations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Script destinations (recorded only, not part of this check): {}.",
+            destinations_summary(destinations)
+        )
+    }
 }
 
 /// One allowlist entry.

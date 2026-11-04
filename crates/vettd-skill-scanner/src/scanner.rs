@@ -16,8 +16,8 @@ use crate::emission::{
 };
 use crate::evidence::annotate_evidence;
 use crate::expected_hosts::{
-    audit_destinations, destinations_summary, has_unexpected_external_url, ExternalUrlAudit,
-    ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
+    audit_destinations, destinations_summary, has_unexpected_external_url,
+    script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
@@ -411,10 +411,29 @@ pub fn scan_skill_with_repo_context(
         targets
     };
 
+    // cli#317: outbound destinations and executable downloads mostly live in
+    // scripts. Record and classify them for the reader without widening the
+    // check, so no finding or grade changes.
+    let script_destinations = {
+        let mut others: Vec<(&String, &String)> = text_files
+            .iter()
+            .filter(|(p, _)| !url_target_files.iter().any(|(t, _)| *t == p.as_str()))
+            .collect();
+        others.sort_by_key(|(p, _)| *p);
+        audit_destinations(
+            &others
+                .iter()
+                .map(|(_, c)| c.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+
     let external_urls = if url_target_files.is_empty() {
         ExternalUrlAudit {
             outcome: ExternalUrlOutcome::NotChecked,
             destinations: Vec::new(),
+            script_destinations,
         }
     } else {
         // Record every distinct destination even when the outcome is a
@@ -437,9 +456,13 @@ pub fn scan_skill_with_repo_context(
                 label: "References external URL — review for indirect prompt injection risk"
                     .to_string(),
                 detail: format!(
-                    "External URL(s) detected (first in {path}) — {}; host policy {}; referenced content can change after audit",
+                    "External URL(s) detected (first in {path}) — {}; host policy {}; referenced content can change after audit{}",
                     destinations_summary(&destinations),
                     EXPECTED_HOSTS_POLICY_VERSION,
+                    match script_destinations_note(&script_destinations) {
+                        note if note.is_empty() => note,
+                        note => format!(";{}", note.trim_end_matches('.')),
+                    },
                 ),
                 filepath: Some(path.to_string()),
                 owasp_llm_category: None,
@@ -456,6 +479,7 @@ pub fn scan_skill_with_repo_context(
         ExternalUrlAudit {
             outcome,
             destinations,
+            script_destinations,
         }
     };
 

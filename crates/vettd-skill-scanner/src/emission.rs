@@ -10,7 +10,8 @@ use yaml_rust2::Yaml;
 use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
 use crate::expected_hosts::{
-    destinations_summary, ExternalUrlAudit, ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
+    destinations_summary, script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome,
+    EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::language::language_for_path;
 use crate::signal::Signal;
@@ -486,9 +487,10 @@ pub(crate) fn coverage_entries(
     }
     let mut entries = Vec::new();
     let expected_hosts_detail = format!(
-        "External references point only to producer-associated expected hosts ({}), under host policy {}. Association only: this is not authorization to send data, follow redirects, or treat referenced content as safe. Redirect targets and host ownership are not observed and can change after audit.",
+        "External references point only to producer-associated expected hosts ({}), under host policy {}. Association only: this is not authorization to send data, follow redirects, or treat referenced content as safe. Redirect targets and host ownership are not observed and can change after audit.{}",
         destinations_summary(&external_urls.destinations),
         EXPECTED_HOSTS_POLICY_VERSION,
+        script_destinations_note(&external_urls.script_destinations),
     );
     let attestations: [(&str, &str, String, bool); 5] = [
         (
@@ -506,7 +508,10 @@ pub(crate) fn coverage_entries(
         (
             "VTD-0093",
             "External URL scan passed",
-            "No external URLs were found in scanned skill text.".to_string(),
+            format!(
+                "No external URLs were found in scanned skill text.{}",
+                script_destinations_note(&external_urls.script_destinations)
+            ),
             external_urls.outcome == ExternalUrlOutcome::NoUrls,
         ),
         (
