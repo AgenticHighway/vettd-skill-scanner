@@ -22,10 +22,7 @@ use crate::expected_hosts::{
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
 use crate::rules::*;
-use crate::skill_md::body::{
-    has_checklist, has_cli_hint, has_examples, has_external_url, has_gotchas, has_usage_context,
-    has_validation, has_workflow, is_likely_cli_script,
-};
+use crate::skill_md::body::{has_checklist, has_cli_hint, has_external_url, is_likely_cli_script};
 use crate::skill_md::validate::validate_name;
 use crate::skill_md::{parse_skill_md, ParsedSkillMd};
 
@@ -274,17 +271,7 @@ pub fn scan_skill_with_repo_context(
         reclassified.description_present = !parsed.description.is_empty();
         if !parsed.description.is_empty() {
             reclassified.description_char_count = parsed.description.chars().count();
-            reclassified.description_usage_context = has_usage_context(&parsed.description);
             reclassified.description_word_count = parsed.description.split_whitespace().count();
-
-            {
-                static OVERCLAIM_RE: OnceLock<Regex> = OnceLock::new();
-                let overclaim_re = OVERCLAIM_RE.get_or_init(|| {
-                    Regex::new(r"(?i)\b(?:anything|everything|all\s+(?:files?|data|tasks?|requests?|inputs?|things?)|any\s+(?:file|task|request|input|thing)|whatever)\b")
-                        .expect("bad overclaim re")
-                });
-                reclassified.description_overclaimed = overclaim_re.is_match(&parsed.description);
-            }
         }
 
         // Body quality checks (VTD-0101 removed; VTD-0102..0108 → reclassified
@@ -293,11 +280,7 @@ pub fn scan_skill_with_repo_context(
         // entirely.
         if !parsed.body.trim().is_empty() {
             reclassified.body_present = true;
-            reclassified.gotchas_section = has_gotchas(&parsed.body);
-            reclassified.examples = has_examples(&parsed.body);
             reclassified.checklist_pattern = has_checklist(&parsed.body);
-            reclassified.step_by_step_workflow = has_workflow(&parsed.body);
-            reclassified.validation_loop = has_validation(&parsed.body);
 
             let body_refs_files = parsed.body.contains("references/")
                 || parsed.body.contains("scripts/")
@@ -310,20 +293,6 @@ pub fn scan_skill_with_repo_context(
                 };
             reclassified.progressive_disclosure =
                 body_refs_files && (has_references || has_scripts || has_assets);
-
-            const GENERIC_PHRASES: &[&str] = &[
-                "follow best practices",
-                "handle errors appropriately",
-                "use proper",
-                "ensure quality",
-            ];
-            let body_lower = parsed.body.to_lowercase();
-            // VTD-0108 fired once per matched phrase (0-4x). The signal is one
-            // row whose detail states the count — see emission.
-            reclassified.generic_instruction_count = GENERIC_PHRASES
-                .iter()
-                .filter(|phrase| body_lower.contains(**phrase))
-                .count();
         }
     }
 
