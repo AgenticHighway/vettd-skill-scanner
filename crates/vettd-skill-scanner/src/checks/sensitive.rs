@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::checks::folding::{expand_line, literal_bindings};
 use crate::consts::DEFAULT_SOURCE;
 use crate::finding::{Finding, FindingCategory, Intent, Severity};
 use crate::rules::*;
@@ -801,30 +802,57 @@ fn build_line_detail(
     format!("Detected in {path}:{line_num} — `{snippet}`")
 }
 
+/// Result of the sensitive-pattern pass.
+pub(crate) struct SensitiveScan {
+    pub(crate) findings: Vec<Finding>,
+    pub(crate) secrets_check_failed: bool,
+}
+
+/// Keeps the strongest severity; the earliest match breaks a tie.
+fn keep_best(
+    best: &mut Option<(Severity, usize, usize, bool)>,
+    candidate: (Severity, usize, usize, bool),
+) {
+    if best.as_ref().is_none_or(|current| candidate.0 > current.0) {
+        *best = Some(candidate);
+    }
+}
+
 /// scans all text files against every pattern in `SENSITIVE_PATTERNS`.
 ///
 /// for `.md` files, patterns with `code_only` set are skipped, and `doc_severity`
-/// overrides `severity` when set. only the first matching line per pattern per file is reported.
-/// patterns with `redact_match` set never surface the matched secret bytes in `detail`
-/// (see [`build_line_detail`]).
+/// overrides `severity` when set. one finding is reported per rule per file:
+/// the highest-severity match wins, and the earliest line breaks a tie. every
+/// match keeps its configured severity; lexical context is never used to lower
+/// it. patterns with `redact_match` set never surface the matched secret bytes
+/// in `detail` (see [`build_line_detail`]).
 ///
 /// # Parameters
 /// - `text_files` — map of normalized relative paths to decoded UTF-8 file content.
 ///
 /// # Returns
-/// `(findings, secrets_check_failed)` — `secrets_check_failed` is `true` if any
-/// critical or high-severity finding was produced.
-pub(crate) fn scan_sensitive_patterns(
-    text_files: &HashMap<String, String>,
-) -> (Vec<Finding>, bool) {
-    let mut findings: Vec<Finding> = Vec::new();
+/// A [`SensitiveScan`]; `secrets_check_failed` is `true` if any critical or
+/// high-severity finding was produced.
+pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> SensitiveScan {
+    let mut scan = SensitiveScan {
+        findings: Vec::new(),
+        secrets_check_failed: false,
+    };
     let regexes = get_sensitive_regexes();
 
     let mut sorted_files: Vec<(&String, &String)> = text_files.iter().collect();
     sorted_files.sort_by_key(|(p, _)| p.as_str());
     for (path, content) in sorted_files {
         let is_doc = path.to_lowercase().ends_with(".md");
+        let bindings = literal_bindings(content);
         let lines: Vec<&str> = content.split('\n').collect();
+        // Expansion is a function of the line and the file's bindings, so it
+        // is computed once per line rather than once per pattern per line.
+        let folded_lines: Vec<Option<String>> = lines
+            .iter()
+            .map(|line| expand_line(line, &bindings))
+            .collect();
+        let mut best_by_rule: HashMap<&'static str, usize> = HashMap::new();
 
         for (i_pat, pat) in SENSITIVE_PATTERNS.iter().enumerate() {
             if pat.code_only && is_doc {
@@ -838,33 +866,81 @@ pub(crate) fn scan_sensitive_patterns(
                 pat.severity.clone()
             };
             let re = &regexes[i_pat];
+            let mut best: Option<(Severity, usize, usize, bool)> = None;
+
             for (i_line, line) in lines.iter().enumerate() {
-                if let Some(m) = re.find(line) {
-                    let redact_from = pat.redact_match.then_some(m.start());
-                    let detail = build_line_detail(path, i_line + 1, line, redact_from);
-                    findings.push(Finding {
-                        rule_id: pat.rule_id.to_string(),
-                        category: FindingCategory::Security,
-                        severity: effective_severity,
-                        label: pat.label.to_string(),
-                        detail,
-                        filepath: Some(path.clone()),
-                        owasp_llm_category: None,
-                        chain_id: None,
-                        intent: Some(pat.intent.clone()),
-                        source: DEFAULT_SOURCE.to_string(),
-                    });
-                    break; // first match per pattern per file only
+                // Keep the strongest match on the line; a lower-severity
+                // pattern for the same rule must not hide a later match.
+                let mut direct_found = false;
+                for found in re.find_iter(line) {
+                    direct_found = true;
+                    keep_best(
+                        &mut best,
+                        (effective_severity.clone(), i_line, found.start(), false),
+                    );
+                }
+                // A bounded folded view of the same line catches a literal
+                // split by trivial concatenation, a local literal binding, or a
+                // short base64 literal. Severity is unchanged.
+                if !direct_found
+                    && folded_lines[i_line]
+                        .as_deref()
+                        .is_some_and(|view| re.is_match(view))
+                {
+                    keep_best(&mut best, (effective_severity.clone(), i_line, 0, true));
+                }
+            }
+
+            let Some((severity, i_line, match_start, folded)) = best else {
+                continue;
+            };
+            let line = lines[i_line];
+            // A folded match has no reliable offset into the original line, so
+            // a secret-literal pattern redacts the whole view rather than
+            // guessing a prefix.
+            let redact_from = pat
+                .redact_match
+                .then_some(if folded { 0 } else { match_start });
+            let mut detail = build_line_detail(path, i_line + 1, line, redact_from);
+            if folded {
+                detail.push_str(" [after bounded constant folding]");
+            }
+            let candidate = Finding {
+                rule_id: pat.rule_id.to_string(),
+                category: FindingCategory::Security,
+                severity: severity.clone(),
+                label: pat.label.to_string(),
+                detail,
+                filepath: Some(path.clone()),
+                owasp_llm_category: None,
+                chain_id: None,
+                intent: Some(pat.intent.clone()),
+                source: DEFAULT_SOURCE.to_string(),
+            };
+            match best_by_rule.get(pat.rule_id) {
+                Some(&idx) => {
+                    // A later pattern for the same rule may be stronger than the
+                    // one kept so far (`--force` after `--no-verify`), so
+                    // compare rather than drop.
+                    if severity > scan.findings[idx].severity {
+                        scan.findings[idx] = candidate;
+                    }
+                }
+                None => {
+                    let idx = scan.findings.len();
+                    scan.findings.push(candidate);
+                    best_by_rule.insert(pat.rule_id, idx);
                 }
             }
         }
     }
 
-    let secrets_check_failed = findings
+    scan.secrets_check_failed = scan
+        .findings
         .iter()
         .any(|f| matches!(f.severity, Severity::Critical | Severity::High));
 
-    (findings, secrets_check_failed)
+    scan
 }
 
 fn shannon_entropy(s: &str) -> f64 {
@@ -1121,7 +1197,7 @@ mod tests {
     fn every_sensitive_pattern_rule_fires() {
         for &(snippet, expected_rule) in PATTERN_CASES {
             let tf = files(&[("scripts/x.sh", snippet)]);
-            let (findings, _) = scan_sensitive_patterns(&tf);
+            let findings = scan_sensitive_patterns(&tf).findings;
             assert!(
                 findings.iter().any(|f| f.rule_id == expected_rule),
                 "rule {expected_rule} did not fire for snippet: {snippet:?}"
@@ -1148,7 +1224,7 @@ mod tests {
     fn code_only_pattern_skipped_in_md() {
         // VTD-0017 (eval) is code_only — must not fire on .md files.
         let tf = files(&[("SKILL.md", "eval(user_input)")]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         assert!(
             !findings
                 .iter()
@@ -1161,7 +1237,7 @@ mod tests {
     fn doc_severity_override_applied_in_md() {
         // VTD-0005 has doc_severity = Some(Medium) — must produce Medium in .md.
         let tf = files(&[("SKILL.md", "cat ~/.aws/credentials")]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         let f = findings
             .iter()
             .find(|f| f.rule_id == RULE_CLOUD_CREDENTIAL_FILE)
@@ -1178,7 +1254,7 @@ mod tests {
         // Three matching lines for VTD-0001 — only one finding should be emitted.
         let content = "-----BEGIN RSA PRIVATE KEY-----\n-----BEGIN EC PRIVATE KEY-----\n-----BEGIN DSA PRIVATE KEY-----";
         let tf = files(&[("scripts/x.sh", content)]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         let count = findings
             .iter()
             .filter(|f| f.rule_id == RULE_EMBEDDED_PRIVATE_KEY)
@@ -1194,7 +1270,7 @@ mod tests {
         let token = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012";
         let content = format!("AUTH = \"{token}\"");
         let tf = files(&[("scripts/x.sh", content.as_str())]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         let f = findings
             .iter()
             .find(|f| f.rule_id == RULE_POTENTIAL_API_TOKEN)
@@ -1221,7 +1297,7 @@ mod tests {
     fn private_key_body_after_header_is_dropped_not_just_masked() {
         let content = r#"PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretkeybytesabcdefgh\n-----END RSA PRIVATE KEY-----""#;
         let tf = files(&[("scripts/x.sh", content)]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         let f = findings
             .iter()
             .find(|f| f.rule_id == RULE_EMBEDDED_PRIVATE_KEY)
@@ -1245,7 +1321,7 @@ mod tests {
         let blob = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==";
         let content = format!(r#"PAYLOAD="{blob}""#);
         let tf = files(&[("scripts/x.sh", content.as_str())]);
-        let (findings, _) = scan_sensitive_patterns(&tf);
+        let findings = scan_sensitive_patterns(&tf).findings;
         let f = findings
             .iter()
             .find(|f| f.rule_id == RULE_SHELL_BASE64_LITERAL)
@@ -1273,7 +1349,7 @@ mod tests {
                 continue;
             }
             let tf = files(&[("scripts/x.sh", snippet)]);
-            let (findings, _) = scan_sensitive_patterns(&tf);
+            let findings = scan_sensitive_patterns(&tf).findings;
             let f = findings
                 .iter()
                 .find(|f| f.rule_id == expected_rule)
