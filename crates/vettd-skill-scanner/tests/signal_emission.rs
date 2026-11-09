@@ -815,19 +815,16 @@ fn default_repo_context_behaves_exactly_like_scan_skill() {
 #[test]
 fn body_quality_facts_are_present_absent_states_with_no_grade_effect() {
     // Body rules are facts now, not pass/fail twin findings: one row whose
-    // valueText is the state. A body with gotchas/examples/checklist/workflow/
-    // validation shows "present" for those and "absent" for what it lacks; an
-    // empty body emits none of them (there is no body to describe).
+    // valueText is the state. A body with a checklist shows "present" for it and
+    // "absent" for what it lacks; an empty body emits none of them (there is no
+    // body to describe). The judgments about meaning (gotchas, examples,
+    // validation loop, step-by-step workflow) moved to System 1.
     let result = scan(
         "---\nname: quality\n---\n## Gotchas\nWatch out.\n\n## Examples\n```py\npass\n```\n\n## Checklist\n- [ ] do it\n\n1. First step\n\nRun the validator.\n",
         &["SKILL.md"],
     );
     for (rule_id, expected) in [
-        ("reliability/gotchas-section", "present"),
-        ("reliability/examples", "present"),
         ("reliability/checklist-pattern", "present"),
-        ("reliability/validation-loop", "present"),
-        ("reliability/step-by-step-workflow", "present"),
         ("performance/progressive-disclosure", "absent"),
     ] {
         let fact = signal(&result, rule_id);
@@ -843,11 +840,7 @@ fn body_quality_facts_are_present_absent_states_with_no_grade_effect() {
 
     let empty = scan("---\nname: empty\n---\n", &["SKILL.md"]);
     for rule_id in [
-        "reliability/gotchas-section",
-        "reliability/examples",
         "reliability/checklist-pattern",
-        "reliability/validation-loop",
-        "reliability/step-by-step-workflow",
         "reliability/progressive-disclosure",
     ] {
         assert!(
@@ -888,16 +881,7 @@ fn description_findings_emit_only_failure_branches_with_preserved_severity() {
     let brevity = signal(&brief, "reliability/description-briefness");
     assert_eq!(brevity.severity.as_deref(), Some("info"));
 
-    // Broad trigger words → reliability/description-overclaim (low).
-    let overclaim = scan(
-        "---\nname: overclaim-desc\ndescription: Handles anything and everything.\n---\nBody.",
-        &["SKILL.md"],
-    );
-    let scope = signal(&overclaim, "reliability/description-overclaim");
-    assert_eq!(scope.severity.as_deref(), Some("low"));
-
-    // A good description emits none of the failure branches, only the
-    // usage-context fact.
+    // A good description emits none of the failure branches.
     let good = scan(
         "---\nname: good-desc\ndescription: Use this skill when you need to format and validate JSON documents quickly.\n---\nBody.",
         &["SKILL.md"],
@@ -906,49 +890,12 @@ fn description_findings_emit_only_failure_branches_with_preserved_severity() {
         "reliability/description-presence",
         "cost/description-length",
         "reliability/description-briefness",
-        "reliability/description-overclaim",
     ] {
         assert!(
             !good.signals.iter().any(|s| s.rule_id == rule_id),
             "clean description must not emit the failure branch: {rule_id}"
         );
     }
-    let context = signal(&good, "reliability/description-usage-context");
-    assert_eq!(context.value_text.as_deref(), Some("present"));
-    assert_eq!(context.derivation.as_deref(), Some("read"));
-}
-
-#[test]
-fn generic_instruction_collapses_to_one_finding_with_count_in_detail() {
-    // VTD-0108 fired once per matched phrase (0-4x); the signal must be a
-    // single row whose detail states how many phrases matched.
-    let result = scan(
-        "---\nname: generic\n---\nFollow best practices and handle errors appropriately. Use proper tooling.",
-        &["SKILL.md"],
-    );
-    let rows: Vec<_> = result
-        .signals
-        .iter()
-        .filter(|s| s.rule_id == "reliability/generic-instruction")
-        .collect();
-    assert_eq!(rows.len(), 1, "generic-instruction must be a single row");
-    assert_eq!(rows[0].severity.as_deref(), Some("info"));
-    assert_eq!(
-        rows[0].detail.as_deref(),
-        Some("3 generic instruction phrase(s) detected")
-    );
-
-    let clean = scan(
-        "---\nname: specific\n---\nRun `scripts/check.py --strict` then review the diff.\n",
-        &["SKILL.md"],
-    );
-    assert!(
-        !clean
-            .signals
-            .iter()
-            .any(|s| s.rule_id == "reliability/generic-instruction"),
-        "no generic phrases means no generic-instruction row"
-    );
 }
 
 #[test]

@@ -37,21 +37,11 @@ pub(crate) struct ReclassifiedAnalysis {
     pub description_char_count: usize,
     /// Description word count (drives `reliability/description-briefness`).
     pub description_word_count: usize,
-    /// Description carries "use when..."-style usage context.
-    pub description_usage_context: bool,
-    /// Description overclaims scope with broad trigger words.
-    pub description_overclaimed: bool,
     // ── body-derived ─────────────────────────────────────────────────────
     /// SKILL.md body is non-empty — the body facts gate on this.
     pub body_present: bool,
-    pub gotchas_section: bool,
-    pub examples: bool,
     pub checklist_pattern: bool,
-    pub validation_loop: bool,
-    pub step_by_step_workflow: bool,
     pub progressive_disclosure: bool,
-    /// Number of generic-instruction phrases matched (collapsed to one row).
-    pub generic_instruction_count: usize,
     // ── script-derived (aggregated across analyzed CLI scripts) ──────────
     /// At least one CLI script was analyzed — the 4 script signals gate on
     /// this (no scripts means no interface to describe).
@@ -142,19 +132,17 @@ fn emit_scalar_signals(
     ]
 }
 
-/// The 21 reclassified non-safety signals (see the reclassify plan §3-§4).
+/// The reclassified non-safety signals (see the reclassify plan §3-§4), minus
+/// the seven judgments of meaning now owned by System 1.
 ///
 /// Emission rules differ by kind:
 /// - **Facts** collapse the old pass/fail twin findings into one row whose
 ///   `value_text` is the state (`"present"`/`"absent"`), with `derivation:
 ///   read`. Body facts emit for every skill with a non-empty body (presence
-///   is itself information); the description usage-context fact emits only
-///   when a description exists; the repository-link and eval-file-format
-///   facts emit whenever the thing they describe exists.
+///   is itself information); the repository-link and eval-file-format facts
+///   emit whenever the thing they describe exists.
 /// - **Findings** emit only their failure branch (severity-bearing), e.g.
 ///   `cost/description-length` only when the description exceeds the limit.
-///   `reliability/generic-instruction` collapses 0..n phrase matches into one
-///   row whose `detail` carries the count.
 /// - **Measurements** emit a `value_num` + `method`; no derivation.
 ///
 /// All rows are gated upstream on `skill_md_content_present` (this fn is only
@@ -189,15 +177,6 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             )
         });
     } else {
-        // reliability/description-usage-context — fact. Requires a description
-        // to speak about; a missing description is covered by description-presence.
-        signals.push(fact(
-            DESCRIPTION_USAGE_CONTEXT,
-            "Description usage context",
-            state(analysis.description_usage_context),
-            observed_at,
-        ));
-
         // cost/description-length — finding, only when over the limit (the
         // "within limit" twin is dropped; the token measurement already covers
         // the healthy state).
@@ -228,56 +207,14 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
                 ..base_signal(DESCRIPTION_BRIEFNESS, observed_at, "Description too brief")
             });
         }
-
-        // reliability/description-overclaim — finding, low severity (preserved
-        // from VTD-0113; a graded finding no longer lands in Safety).
-        if analysis.description_overclaimed {
-            signals.push(Signal {
-                severity: Some("low".to_string()),
-                detail: Some(
-                    "Broad trigger words (anything, everything, all files, etc.) widen \
-                     attack surface — narrow to specific use cases"
-                        .to_string(),
-                ),
-                ..base_signal(
-                    DESCRIPTION_OVERCLAIM,
-                    observed_at,
-                    "Description overclaims scope",
-                )
-            });
-        }
     }
 
     // ── body-derived facts ───────────────────────────────────────────────
     if analysis.body_present {
         signals.push(fact(
-            GOTCHAS_SECTION,
-            "Gotchas section",
-            state(analysis.gotchas_section),
-            observed_at,
-        ));
-        signals.push(fact(
-            EXAMPLES,
-            "Examples",
-            state(analysis.examples),
-            observed_at,
-        ));
-        signals.push(fact(
             CHECKLIST_PATTERN,
             "Checklist pattern",
             state(analysis.checklist_pattern),
-            observed_at,
-        ));
-        signals.push(fact(
-            VALIDATION_LOOP,
-            "Validation loop",
-            state(analysis.validation_loop),
-            observed_at,
-        ));
-        signals.push(fact(
-            STEP_BY_STEP_WORKFLOW,
-            "Step-by-step workflow",
-            state(analysis.step_by_step_workflow),
             observed_at,
         ));
         signals.push(fact(
@@ -286,23 +223,6 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             state(analysis.progressive_disclosure),
             observed_at,
         ));
-
-        // reliability/generic-instruction — finding, collapsed to a single row
-        // whose detail states how many phrases matched (0..n per-skill today).
-        if analysis.generic_instruction_count > 0 {
-            signals.push(Signal {
-                severity: Some("info".to_string()),
-                detail: Some(format!(
-                    "{} generic instruction phrase(s) detected",
-                    analysis.generic_instruction_count
-                )),
-                ..base_signal(
-                    GENERIC_INSTRUCTION,
-                    observed_at,
-                    "Generic instruction detected",
-                )
-            });
-        }
     }
 
     // ── script-derived (aggregated per-skill, gated on scripts existing) ──

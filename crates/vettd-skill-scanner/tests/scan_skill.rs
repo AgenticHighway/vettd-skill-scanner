@@ -184,9 +184,41 @@ fn benign_skill_emits_no_findings_quality_lives_on_signals() {
         result
             .signals
             .iter()
-            .any(|s| s.rule_id == "reliability/examples"),
+            .any(|s| s.rule_id == "reliability/checklist-pattern"),
         "body quality is observable on the signal channel"
     );
+}
+
+#[test]
+fn judgments_about_meaning_are_not_emitted_by_the_engine() {
+    // Seven regex judgments (description overclaim and usage context, generic instruction,
+    // examples, validation loop, step-by-step workflow, gotchas section) moved to the model-based
+    // System 1 scanner, which owns them under its own ids. Emitting them here too would
+    // double-report, so the engine must stay silent on them whatever the skill says.
+    let (mut text_files, all_paths) = with_skill_md();
+    text_files.insert(
+        "SKILL.md".to_string(),
+        "---\nname: demo-skill\ndescription: Does anything and everything. Use this when asked.\n---\n\
+         ## Gotchas\nFollow best practices.\n\n## Steps\n1. Validate the output.\n\n```\nexample\n```\n"
+            .to_string(),
+    );
+    let result = scan(&text_files, &all_paths);
+    let retired = [
+        "reliability/description-overclaim",
+        "reliability/description-usage-context",
+        "reliability/generic-instruction",
+        "reliability/examples",
+        "reliability/validation-loop",
+        "reliability/step-by-step-workflow",
+        "reliability/gotchas-section",
+    ];
+    for signal in &result.signals {
+        assert!(
+            !retired.contains(&signal.rule_id.as_str()),
+            "retired signal still emitted: {}",
+            signal.rule_id
+        );
+    }
 }
 
 #[test]
