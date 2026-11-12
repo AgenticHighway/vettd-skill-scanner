@@ -34,7 +34,7 @@ pub(crate) enum ExternalUrlOutcome {
 /// The unit tests pin a digest of [`EXPECTED_HOSTS`]: editing the list without
 /// bumping this version fails them, so the recorded version can never silently
 /// describe a different policy than the one that ran.
-pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-02";
+pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-11";
 
 /// One external destination observed in analyzed text.
 ///
@@ -152,8 +152,10 @@ fn merge_destination(out: &mut Vec<Destination>, dest: Destination) {
 }
 
 /// Records every distinct external destination in `content`, sorted
-/// deterministically, with its assessment status.
-pub(crate) fn audit_destinations(content: &str) -> Vec<Destination> {
+/// deterministically, with its assessment status. `own` carries the hosts the
+/// skill itself declares (frontmatter repository/homepage — see
+/// [`own_hosts`]).
+pub(crate) fn audit_destinations(content: &str, own: &[String]) -> Vec<Destination> {
     let mut destinations = Vec::new();
     for (at, reference) in extract_refs_at(content) {
         let kind = classify_use(line_at(content, at));
@@ -161,7 +163,7 @@ pub(crate) fn audit_destinations(content: &str) -> Vec<Destination> {
             Some(reference) => Destination {
                 scheme: reference.scheme,
                 host: reference.host.clone(),
-                expected: is_expected(&reference),
+                expected: is_expected(&reference, own),
                 kind,
             },
             // A non-plain authority is exactly what must not be vouched for.
@@ -186,17 +188,24 @@ pub(crate) fn destinations_summary(destinations: &[Destination]) -> String {
     destinations
         .iter()
         .map(|d| {
-            format!(
-                "{}://{} ({}, {})",
-                d.scheme,
-                d.host,
-                if d.expected {
-                    "expected host"
-                } else {
-                    "unexpected"
-                },
-                d.kind.label()
-            )
+            // An unreadable authority is a record of a reference the scanner
+            // could not parse, not a URL destination: rendering it with a
+            // `scheme://` shape reported a URL that does not exist (#28).
+            if d.scheme == "?" || d.host == "unparsed-authority" {
+                format!("unreadable authority (unexpected, {})", d.kind.label())
+            } else {
+                format!(
+                    "{}://{} ({}, {})",
+                    d.scheme,
+                    d.host,
+                    if d.expected {
+                        "expected host"
+                    } else {
+                        "unexpected"
+                    },
+                    d.kind.label()
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -253,7 +262,8 @@ pub(crate) enum HostEntry {
 use HostEntry::{Exact, GitHubOrg, TemplatedSuffix};
 
 /// The curated set, derived from the provider-associated URLs in the
-/// 2026-10-26 cohort security reports (#24). The PR records the per-entry
+/// 2026-10-26 cohort security reports (#24), plus the same-vendor subdomain
+/// and GitHub-org gaps measured in #29. The PR records the per-entry
 /// evidence.
 const EXPECTED_HOSTS: &[HostEntry] = &[
     // awesome-claude-skills (ComposioHQ)
@@ -345,11 +355,14 @@ const EXPECTED_HOSTS: &[HostEntry] = &[
     GitHubOrg("remotion-dev"),
     // resend
     Exact("resend.com"),
+    Exact("api.resend.com"),
     GitHubOrg("resend"),
     // sentry-skills
     Exact("develop.sentry.dev"),
     Exact("sentry.sentry.io"),
     Exact("us.sentry.io"),
+    Exact("mcp.sentry.dev"),
+    GitHubOrg("getsentry"),
     // supabase
     Exact("supabase.com"),
     Exact("mcp.supabase.com"),
@@ -357,21 +370,29 @@ const EXPECTED_HOSTS: &[HostEntry] = &[
     // trailofbits-skills
     Exact("blog.trailofbits.com"),
     GitHubOrg("trailofbits"),
+    GitHubOrg("crytic"),
+    GitHubOrg("anthropics"),
     // vercel-agent-skills
     Exact("vercel.com"),
+    // Same-vendor subdomains of already-listed registrable domains (#29):
+    // a producer's own properties, accessed through a subdomain.
+    Exact("docs.github.com"),
+    Exact("www.browserbase.com"),
+    Exact("cdnjs.cloudflare.com"),
+    Exact("docs.microsoft.com"),
 ];
 
 /// Fixture entries on the reserved `.test` TLD (RFC 2606), so tests never
 /// depend on the production set.
 #[cfg(test)]
 const TEST_HOSTS: &[HostEntry] = &[
-    Exact("expected.test"),
+    Exact("expected.fixture"),
     HostEntry::Pattern {
-        regex: r"[a-z0-9-]+\.docs\.expected\.test",
-        example: "api.docs.expected.test",
+        regex: r"[a-z0-9-]+\.docs\.expected\.fixture",
+        example: "api.docs.expected.fixture",
     },
     GitHubOrg("expected-org"),
-    TemplatedSuffix("tenant.expected.test"),
+    TemplatedSuffix("tenant.expected.fixture"),
 ];
 
 fn entries() -> impl Iterator<Item = &'static HostEntry> {
@@ -497,8 +518,23 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
         let mut end = 0;
         while let Some(c) = rest[end..].chars().next() {
             if let Some(m) = placeholder_re().find(&rest[end..]) {
+                // A host template ends at its last placeholder: in
+                // `{site}{_API_BASE}` the authority is `{site}` and everything
+                // after is a path template. But a placeholder glued after a
+                // concrete host (`tenant…${sas}`) is *not* an authority
+                // boundary — consuming it keeps the host non-plain, which
+                // fails closed instead of vouching the prefix.
+                let after = &rest[end + m.end()..];
                 end += m.end();
-            } else if c.is_alphanumeric()
+                if after.starts_with('{') || after.starts_with('$') {
+                    // Another template expression follows: this placeholder
+                    // was the last host label, so the authority ends here
+                    // *including* it (`{site}{_API_BASE}` → `{site}`).
+                    break;
+                }
+                continue;
+            }
+            if c.is_alphanumeric()
                 || matches!(
                     c,
                     '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%' | '$' | '{' | '}'
@@ -559,13 +595,87 @@ fn is_expected_with<'a>(mut entries: impl Iterator<Item = &'a HostEntry>, r: &Ur
     })
 }
 
-fn is_expected(r: &UrlRef) -> bool {
-    r.plain && is_expected_with(entries(), r)
+/// Hosts no live destination can resolve to: loopback names, RFC 2606/6761
+/// reserved TLDs, the RFC example domains, and placeholder-only hosts
+/// (`{site}`, `${VAR}` normalize to `*`). A reference to one of these is
+/// documentation shape, not an external destination.
+fn reserved_host(host: &str) -> bool {
+    if host == "*" || host == "localhost" {
+        return true;
+    }
+    if matches!(host, "example.com" | "example.org" | "example.net") {
+        return true;
+    }
+    matches!(
+        host.rsplit('.').next(),
+        Some("test" | "example" | "invalid" | "localhost" | "internal" | "local")
+    )
+}
+
+/// Non-plain loopback authorities (`localhost`, `127.0.0.1`, `0.0.0.0`,
+/// `::1`, with or without a port) are the machine itself, not an external
+/// destination. Every other non-plain authority stays unexpected.
+fn loopback_authority(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+}
+
+/// True when `r` points at a host the skill declares as its own. A
+/// `github.com/<org>` own entry vouches for that org path only, mirroring
+/// [`HostEntry::GitHubOrg`].
+fn is_own(r: &UrlRef, own: &[String]) -> bool {
+    own.iter().any(|o| match o.strip_prefix("github.com/") {
+        Some(org) => r.host == "github.com" && r.first_segment.as_deref() == Some(org),
+        None => *o == r.host,
+    })
+}
+
+fn is_expected(r: &UrlRef, own: &[String]) -> bool {
+    if !r.plain {
+        // Non-plain authorities fail closed — except loopback and reserved
+        // hosts read through an opaque authority (an example config value
+        // like `https://vault.internal:8200`): those name no live
+        // destination whether or not a port is attached.
+        return loopback_authority(&r.host) || reserved_host(&r.host);
+    }
+    is_own(r, own) || reserved_host(&r.host) || is_expected_with(entries(), r)
+}
+
+/// Hosts the skill's own frontmatter declares: the `repository` and
+/// `homepage` URLs, parsed with the same reference reader the check uses.
+/// A `github.com/<org>` URL yields `github.com/<org>` so it vouches for the
+/// org path, not for all of github.com.
+pub(crate) fn own_hosts(repository: &str, homepage: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for source in [repository, homepage] {
+        if source.is_empty() {
+            continue;
+        }
+        let with_scheme = if source.contains("://") {
+            source.to_string()
+        } else {
+            format!("https://{source}")
+        };
+        for r in extract_refs(&with_scheme).flatten() {
+            if !r.plain {
+                continue;
+            }
+            if r.host == "github.com" {
+                if let Some(org) = r.first_segment {
+                    out.push(format!("github.com/{org}"));
+                }
+            } else {
+                out.push(r.host);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// True when `content` references any URL outside the expected set.
-pub(crate) fn has_unexpected_external_url(content: &str) -> bool {
-    extract_refs(content).any(|r| !r.is_some_and(|r| is_expected(&r)))
+pub(crate) fn has_unexpected_external_url(content: &str, own: &[String]) -> bool {
+    extract_refs(content).any(|r| !r.is_some_and(|r| is_expected(&r, own)))
 }
 
 #[cfg(test)]
@@ -576,33 +686,33 @@ mod tests {
     use crate::scanner::scan_skill;
 
     fn unexpected(url: &str) -> bool {
-        has_unexpected_external_url(&format!("See {url} for details."))
+        has_unexpected_external_url(&format!("See {url} for details."), &[])
     }
 
     #[test]
     fn exact_host_is_expected() {
-        assert!(!unexpected("https://expected.test/guide"));
-        assert!(!unexpected("http://expected.test"));
+        assert!(!unexpected("https://expected.fixture/guide"));
+        assert!(!unexpected("http://expected.fixture"));
     }
 
     #[test]
     fn host_match_ignores_case_and_trailing_dot() {
         assert!(!unexpected("HTTPS://Expected.TEST/guide"));
-        assert!(!unexpected("https://expected.test./guide"));
+        assert!(!unexpected("https://expected.fixture./guide"));
     }
 
     #[test]
     fn exact_entry_does_not_cover_subdomains() {
         // Subdomain coverage must be opted into per entry; otherwise a
         // producer-owned apex would vouch for hosts it may not control.
-        assert!(unexpected("https://evil.expected.test/"));
+        assert!(unexpected("https://evil.expected.fixture/"));
     }
 
     #[test]
     fn pattern_entry_covers_its_subdomains_only() {
-        assert!(!unexpected("https://api.docs.expected.test/v1"));
-        assert!(unexpected("https://docs.expected.test/"));
-        assert!(unexpected("https://a.b.docs.expected.test/"));
+        assert!(!unexpected("https://api.docs.expected.fixture/v1"));
+        assert!(unexpected("https://docs.expected.fixture/"));
+        assert!(unexpected("https://a.b.docs.expected.fixture/"));
     }
 
     #[test]
@@ -610,16 +720,14 @@ mod tests {
         // Each of these could resolve somewhere other than the allowlisted
         // name, so none may suppress the finding.
         for url in [
-            "https://expected.test:8443/",
-            "https://expected.test:443/",
-            "https://expected.test@evil.test/",
-            "https://user:pw@expected.test/",
-            "https://127.0.0.1/",
+            "https://expected.fixture:8443/",
+            "https://expected.fixture:443/",
+            "https://expected.fixture@evil.fixture/",
+            "https://user:pw@expected.fixture/",
             "https://10.0.0.1/",
             "https://192.168.1.1/",
             "https://172.16.0.1/",
             "https://169.254.169.254/",
-            "https://[::1]/",
             "https://expécted.test/",
             "https://expected%2etest/",
             "https:///path",
@@ -630,16 +738,42 @@ mod tests {
     }
 
     #[test]
+    fn loopback_and_reserved_hosts_are_expected() {
+        // #28: localhost and the loopback IPs are the machine itself, not an
+        // external destination; placeholders and reserved TLDs name no real
+        // host at all.
+        for url in [
+            "http://localhost:5173/",
+            "https://127.0.0.1/",
+            "http://127.0.0.1:8200/v1/kv",
+            "https://0.0.0.0/",
+            "https://[::1]/",
+            "https://vault.internal/v1/kv",
+            "https://{site}/wiki/rest/api",
+            "https://${ENDPOINT}/api",
+            "https://service.internal/x",
+            "https://example.com/page",
+        ] {
+            assert!(
+                !unexpected(url),
+                "{url} is loopback/reserved and must be expected"
+            );
+        }
+    }
+
+    #[test]
     fn markdown_punctuation_ends_the_host() {
         assert!(!has_unexpected_external_url(
-            "[guide](https://expected.test/guide) and <https://expected.test>, **https://expected.test**"
+            "[guide](https://expected.fixture/guide) and <https://expected.fixture>, **https://expected.fixture**",
+            &[]
         ));
     }
 
     #[test]
     fn one_unexpected_reference_among_expected_ones_is_flagged() {
         assert!(has_unexpected_external_url(
-            "https://expected.test/a then https://evil.test/b"
+            "https://expected.fixture/a then https://evil.fixture/b",
+            &[]
         ));
     }
 
@@ -675,7 +809,7 @@ mod tests {
             "https://github.com/expected-org-evil/repo",
             "https://github.com/evil/expected-org",
             "https://gitlab.com/expected-org/repo",
-            "https://api.github.com.evil.test/expected-org",
+            "https://api.github.com.evil.fixture/expected-org",
         ] {
             assert!(unexpected(url), "{url} must count as unexpected");
         }
@@ -697,26 +831,35 @@ mod tests {
     fn templated_hosts_match_only_listed_zones() {
         // Placeholder hosts name no concrete destination, so they pass only
         // inside a zone the provider runs; anywhere else they stay flagged.
-        assert!(!unexpected("https://<account>.tenant.expected.test/x"));
-        assert!(!unexpected("https://${account}.tenant.expected.test"));
+        assert!(!unexpected("https://<account>.tenant.expected.fixture/x"));
+        assert!(!unexpected("https://${account}.tenant.expected.fixture"));
         assert!(!unexpected(
-            "https://{account}.<region>.tenant.expected.test"
+            "https://{account}.<region>.tenant.expected.fixture"
         ));
-        assert!(!unexpected("https://<account>.tenant.expected.test:443/"));
+        assert!(!unexpected(
+            "https://<account>.tenant.expected.fixture:443/"
+        ));
         for url in [
-            "https://<account>.evil.test/",
-            "https://<endpoint>/",
-            "https://$FQDN/",
-            "https://tenant.expected.test/",
-            "https://<a>-b.tenant.expected.test/",
-            "https://x.<a>.tenant.expected.test/",
-            "https://<a>.tenant.expected.test:8443/",
-            "http://<a>.tenant.expected.test:443/",
-            "https://expected.test:443/x",
-            "https://<a>.tenant.expected.test${sas}",
-            "https://<a>.expected.test/",
+            "https://<account>.evil.fixture/",
+            "https://tenant.expected.fixture/",
+            "https://<a>-b.tenant.expected.fixture/",
+            "https://x.<a>.tenant.expected.fixture/",
+            "https://<a>.tenant.expected.fixture:8443/",
+            "http://<a>.tenant.expected.fixture:443/",
+            "https://expected.fixture:443/x",
+            "https://<a>.tenant.expected.fixture${sas}",
+            "https://<a>.expected.fixture/",
         ] {
             assert!(unexpected(url), "{url} must count as unexpected");
+        }
+        // A placeholder-only host names no concrete destination at all, so
+        // a brace/angle-bracket placeholder template is expected regardless
+        // of zone (#28, C18: the confluence `{site}` f-string template).
+        // `$FQDN` without a placeholder delimiter stays unexpected: it is
+        // not parseable as a placeholder, only as a malformed host.
+        assert!(unexpected("https://$FQDN/"));
+        for url in ["https://<endpoint>/", "https://{site}/x"] {
+            assert!(!unexpected(url), "{url} must count as expected");
         }
     }
 
@@ -736,14 +879,14 @@ mod tests {
     fn patterns_reject_lookalikes_of_their_example() {
         // Catches unescaped dots and patterns broad enough to match hosts
         // outside the producer's domain, e.g. `.*expected\.test` matching
-        // `evilexpected.test`.
+        // `evilexpected.fixture`.
         for e in entries() {
             let HostEntry::Pattern { regex, example } = e else {
                 continue;
             };
             let re = anchored(regex);
             assert!(re.is_match(example), "{regex} must match its example");
-            let mut lookalikes = vec![format!("{example}.evil.test")];
+            let mut lookalikes = vec![format!("{example}.evil.fixture")];
             for (i, _) in example.match_indices('.') {
                 lookalikes.push(format!("{}{}", &example[..i], &example[i + 1..]));
                 lookalikes.push(format!("{}x{}", &example[..i], &example[i + 1..]));
@@ -760,18 +903,19 @@ mod tests {
         // host. Query and fragment are omitted so a signed URL or token is not
         // copied into a result.
         let destinations = audit_destinations(
-            "See https://expected.test/path?token=secret#frag and http://evil.test/x",
+            "See https://expected.fixture/path?token=secret#frag and http://evil.fixture/x",
+            &[],
         );
         assert_eq!(destinations.len(), 2);
         let expected = destinations
             .iter()
-            .find(|d| d.host == "expected.test")
+            .find(|d| d.host == "expected.fixture")
             .expect("expected host recorded");
         assert_eq!(expected.scheme, "https");
         assert!(expected.expected);
         let unexpected = destinations
             .iter()
-            .find(|d| d.host == "evil.test")
+            .find(|d| d.host == "evil.fixture")
             .expect("unexpected host recorded");
         assert_eq!(unexpected.scheme, "http");
         assert!(!unexpected.expected);
@@ -782,11 +926,11 @@ mod tests {
             "query/fragment must not leak into the record: {summary}"
         );
         assert!(
-            summary.contains("https://expected.test (expected host, association)"),
+            summary.contains("https://expected.fixture (expected host, association)"),
             "{summary}"
         );
         assert!(
-            summary.contains("http://evil.test (unexpected, association)"),
+            summary.contains("http://evil.fixture (unexpected, association)"),
             "{summary}"
         );
     }
@@ -795,7 +939,7 @@ mod tests {
     fn policy_version_is_pinned() {
         // A version bump is a deliberate policy change, never an accident: the
         // recorded version is what lets a reviewer tell the two apart.
-        assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-02");
+        assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-11");
     }
 
     /// Stable FNV-1a digest of the production list (test-only: no new dep).
@@ -836,7 +980,7 @@ mod tests {
         // unnoticed list edit fail here instead of mislabeling a result.
         assert_eq!(
             expected_hosts_digest(),
-            14461354016487588110,
+            18076536785543940251,
             "expected-host list changed: bump EXPECTED_HOSTS_POLICY_VERSION and update this digest"
         );
     }
@@ -847,7 +991,7 @@ mod tests {
         for i in 0..12 {
             content.push_str(&format!("https://host{i}.invalid/x "));
         }
-        let destinations = audit_destinations(&content);
+        let destinations = audit_destinations(&content, &[]);
         assert_eq!(destinations.len(), 12);
         let summary = destinations_summary(&destinations);
         for i in 0..12 {
@@ -861,7 +1005,7 @@ mod tests {
 
     #[test]
     fn revoked_exception_no_longer_vouches() {
-        let reference = extract_refs("https://expected.test/x")
+        let reference = extract_refs("https://expected.fixture/x")
             .next()
             .expect("one reference")
             .expect("plain host");
@@ -875,9 +1019,11 @@ mod tests {
     #[test]
     fn mixed_expected_and_unexpected_is_flagged() {
         assert!(has_unexpected_external_url(
-            "https://expected.test/a https://evil.test/b"
+            "https://expected.fixture/a https://evil.fixture/b",
+            &[]
         ));
-        let destinations = audit_destinations("https://expected.test/a https://evil.test/b");
+        let destinations =
+            audit_destinations("https://expected.fixture/a https://evil.fixture/b", &[]);
         assert!(destinations.iter().any(|d| d.expected));
         assert!(destinations.iter().any(|d| !d.expected));
     }
@@ -886,8 +1032,10 @@ mod tests {
     fn duplicate_hosts_merge_fail_closed() {
         // github.com hosts every account: one expected org path must not
         // launder a second, unexpected org path on the same host.
-        let destinations =
-            audit_destinations("https://github.com/expected-org/a https://github.com/evil/b");
+        let destinations = audit_destinations(
+            "https://github.com/expected-org/a https://github.com/evil/b",
+            &[],
+        );
         let github = destinations
             .iter()
             .find(|d| d.host == "github.com")
@@ -919,7 +1067,7 @@ mod tests {
         // say the check ran and found URLs: VTD-0124, distinct from VTD-0093.
         let result = scan_files(&[(
             "SKILL.md",
-            &format!("{SKILL_HEAD}See https://expected.test."),
+            &format!("{SKILL_HEAD}See https://expected.fixture."),
         )]);
         assert_eq!(has_rule(&result, "VTD-0088"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, true));
@@ -938,9 +1086,9 @@ mod tests {
         let result = scan_files(&[
             (
                 "SKILL.md",
-                &format!("{SKILL_HEAD}See https://expected.test."),
+                &format!("{SKILL_HEAD}See https://expected.fixture."),
             ),
-            ("references/a.md", "https://evil.test/payload"),
+            ("references/a.md", "https://evil.fixture/payload"),
         ]);
         let finding = result
             .findings
@@ -950,7 +1098,7 @@ mod tests {
         assert_eq!(finding.filepath.as_deref(), Some("references/a.md"));
         assert_eq!(
             finding.detail,
-            "External URL(s) detected (first in references/a.md) — https://evil.test (unexpected, association), https://expected.test (expected host, association); host policy 2026-11-02; referenced content can change after audit"
+            "External URL(s) detected (first in references/a.md) — https://evil.fixture (unexpected, association), https://expected.fixture (expected host, association); host policy 2026-11-11; referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
