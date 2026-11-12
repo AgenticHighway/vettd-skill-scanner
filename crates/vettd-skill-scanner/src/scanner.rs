@@ -408,14 +408,29 @@ pub fn scan_skill_with_repo_context(
         &parsed.repository,
         parsed.frontmatter["homepage"].as_str().unwrap_or(""),
     );
-    // LICENSE boilerplate links (Apache/GNU/…) are license text, not skill
-    // references: a LICENSE* file under references/ never flags its hosts.
+    // License boilerplate links (Apache/GNU/…) are license text, not skill
+    // references — but only in *real* license files. An exact-name match
+    // keeps an arbitrary `references/LICENSE-payload.md` fully checked, so
+    // a renamed file cannot smuggle unexpected hosts past the rule.
+    const LICENSE_FILE_NAMES: &[&str] = &[
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "LICENSE.rst",
+        "COPYING",
+        "COPYING.md",
+        "COPYING.txt",
+        "COPYING.LESSER",
+        "COPYING.GPL",
+        "NOTICE",
+        "NOTICE.md",
+        "NOTICE.txt",
+    ];
     let is_license = |p: &str| {
-        p.rsplit('/')
-            .next()
-            .unwrap_or(p)
-            .to_uppercase()
-            .starts_with("LICENSE")
+        let name = p.rsplit('/').next().unwrap_or(p);
+        LICENSE_FILE_NAMES
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
     };
     let url_target_files: Vec<(&str, &str)> = {
         let mut targets: Vec<(&str, &str)> = Vec::new();
