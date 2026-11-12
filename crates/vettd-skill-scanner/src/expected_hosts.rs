@@ -596,14 +596,23 @@ fn is_expected_with<'a>(mut entries: impl Iterator<Item = &'a HostEntry>, r: &Ur
 }
 
 /// Hosts no live destination can resolve to: loopback names, RFC 2606/6761
-/// reserved TLDs, the RFC example domains, and placeholder-only hosts
-/// (`{site}`, `${VAR}` normalize to `*`). A reference to one of these is
-/// documentation shape, not an external destination.
+/// reserved TLDs, the RFC example domains, placeholder-only hosts (`{site}`,
+/// `${VAR}` normalize to `*`), and dotless single-label names. A reference to
+/// one of these is documentation shape or the machine's own environment, not
+/// an external destination.
 fn reserved_host(host: &str) -> bool {
     if host == "*" || host == "localhost" {
         return true;
     }
     if matches!(host, "example.com" | "example.org" | "example.net") {
+        return true;
+    }
+    // A dotless single-label name (`http://api`, `http://db:5432`) is a
+    // docker-compose service name or an environment-local alias: public DNS
+    // never resolves a name without a TLD, so like `.internal`/`.local` it
+    // names the machine's own environment, not an external host. The
+    // unreadable-authority sentinel is not a hostname and stays unexpected.
+    if !host.contains('.') && host != "unparsed-authority" {
         return true;
     }
     matches!(
@@ -757,6 +766,38 @@ mod tests {
             assert!(
                 !unexpected(url),
                 "{url} is loopback/reserved and must be expected"
+            );
+        }
+    }
+
+    #[test]
+    fn dotless_service_names_are_expected() {
+        // Compose healthchecks and intra-container calls use single-label
+        // service names (`http://api`, `http://db:5432`). Public DNS never
+        // resolves a dotless name, so it is the machine's own environment —
+        // the same class as `.internal`/`.local` — not an external host.
+        for url in [
+            "http://api",
+            "http://api:3000/health",
+            "https://db:5432/pg_isready",
+            "http://worker/",
+        ] {
+            assert!(
+                !unexpected(url),
+                "{url} is a dotless environment name and must be expected"
+            );
+        }
+        // Real external hosts — dotted names, IP literals beyond loopback —
+        // keep failing closed, and so does the unreadable-authority sentinel.
+        for url in [
+            "https://api.stripe.com/v1/charge",
+            "https://sub.example.org/wiki",
+            "https://8.8.8.8/",
+            "https://evil.example.com/",
+        ] {
+            assert!(
+                unexpected(url),
+                "{url} is external and must stay unexpected"
             );
         }
     }
