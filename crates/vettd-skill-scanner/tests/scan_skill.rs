@@ -157,6 +157,29 @@ fn present_skill_md_emits_no_structure_finding() {
     );
 }
 
+// The labelled-corpus false positive this pins: a pipeline that capped text
+// files at 200 KB silently dropped a 4,735-line SKILL.md from *both* input
+// maps, and the scanner then reported the file "missing". Presence is a
+// structural fact about the package, decided from `all_paths` — a caller
+// that declines to load a file's text must still list its path there, and
+// the scanner must then treat the file as present rather than missing.
+#[test]
+fn skill_md_listed_as_path_only_is_not_reported_missing() {
+    let mut text_files = HashMap::new();
+    text_files.insert("scripts/run.sh".to_string(), "echo hello\n".to_string());
+    let all_paths = vec!["SKILL.md".to_string(), "scripts/run.sh".to_string()];
+    let result = scan(&text_files, &all_paths);
+    assert!(result.has_skill_md);
+    assert!(
+        !result
+            .findings
+            .iter()
+            .any(|f| f.label.to_lowercase().contains("skill.md missing")),
+        "a SKILL.md listed in all_paths must not be reported missing: {:?}",
+        result.findings
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Category and severity variety tests
 // ---------------------------------------------------------------------------
