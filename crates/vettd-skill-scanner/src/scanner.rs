@@ -64,7 +64,11 @@ impl std::error::Error for ScanError {}
 ///   Binary files must be excluded by the caller. Keyed by the same paths that
 ///   appear in `all_paths`.
 /// - `all_paths` — complete list of normalized relative paths in the package,
-///   including binary files. Used for structural presence checks.
+///   including binary files. Used for structural presence checks. A caller
+///   that declines to load some file's text (a size cap, an undecodable
+///   encoding) must still list its path here: presence facts — SKILL.md
+///   above all — are decided from this list, so a dropped path is reported
+///   as a missing file even though it exists on disk.
 /// - `observed_at` — caller-supplied RFC3339 time at which this bundle was
 ///   observed. Signals carry it unmodified; the pure scanner never reads a clock.
 ///
