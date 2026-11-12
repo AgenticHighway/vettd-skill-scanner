@@ -7,6 +7,7 @@ use crate::checks::behavioral::scan_behavioral_patterns;
 use crate::checks::chains::{detect_exfiltration_chains, detect_malicious_activity_chains};
 use crate::checks::description::check_description_behavior_mismatch;
 use crate::checks::encoding::{check_base64_payloads, scan_hidden_unicode};
+use crate::checks::lookalike::{scan_lookalike_characters, scan_remote_unpinned_execution};
 use crate::checks::sensitive::{scan_entropy, scan_env_files, scan_sensitive_patterns};
 use crate::checks::typosquat::check_typosquat;
 use crate::consts::{DEFAULT_SOURCE, EVAL_JSON_CANDIDATES};
@@ -16,7 +17,7 @@ use crate::emission::{
 };
 use crate::evidence::annotate_evidence;
 use crate::expected_hosts::{
-    audit_destinations, destinations_summary, has_unexpected_external_url,
+    audit_destinations, destinations_summary, has_unexpected_external_url, own_hosts,
     script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::finding::{Finding, FindingCategory, Severity};
@@ -390,10 +391,32 @@ pub fn scan_skill_with_repo_context(
 
     scan_hidden_unicode(text_files, &mut findings);
 
+    // Supply-chain checks (C20/C23): look-alike characters and remote
+    // unpinned code execution. Both fire for inline code in SKILL.md as well
+    // as bundled scripts, so they take every text file.
+    scan_lookalike_characters(text_files, &mut findings);
+    scan_remote_unpinned_execution(text_files, &mut findings);
+
     // External URL check. A URL to a host outside the curated expected set
     // (expected_hosts.rs) stays a Medium finding. A scan with no URLs (VTD-0093)
     // or only expected-host URLs (VTD-0124) is a pass attestation on the
     // coverage channel, not a finding — see coverage_entries().
+    // The skill's own frontmatter repository/homepage hosts are expected
+    // (#28/#29): a producer's links to their own properties are the class of
+    // reference the allowlist exists to exempt.
+    let own = own_hosts(
+        &parsed.repository,
+        parsed.frontmatter["homepage"].as_str().unwrap_or(""),
+    );
+    // LICENSE boilerplate links (Apache/GNU/…) are license text, not skill
+    // references: a LICENSE* file under references/ never flags its hosts.
+    let is_license = |p: &str| {
+        p.rsplit('/')
+            .next()
+            .unwrap_or(p)
+            .to_uppercase()
+            .starts_with("LICENSE")
+    };
     let url_target_files: Vec<(&str, &str)> = {
         let mut targets: Vec<(&str, &str)> = Vec::new();
         for name in &["SKILL.md", "skill.md"] {
@@ -403,7 +426,7 @@ pub fn scan_skill_with_repo_context(
         }
         let mut refs: Vec<(&str, &str)> = text_files
             .iter()
-            .filter(|(p, _)| p.to_lowercase().starts_with("references/"))
+            .filter(|(p, _)| p.to_lowercase().starts_with("references/") && !is_license(p))
             .map(|(p, c)| (p.as_str(), c.as_str()))
             .collect();
         refs.sort_by_key(|(p, _)| *p);
@@ -419,13 +442,14 @@ pub fn scan_skill_with_repo_context(
             .iter()
             .filter(|(p, _)| !url_target_files.iter().any(|(t, _)| *t == p.as_str()))
             .collect();
-        others.sort_by_key(|(p, _)| *p);
+        others.sort_by_key(|(p, _)| p.as_str());
         audit_destinations(
             &others
                 .iter()
                 .map(|(_, c)| c.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
+            &own,
         )
     };
 
@@ -444,10 +468,10 @@ pub fn scan_skill_with_repo_context(
             .map(|(_, content)| *content)
             .collect::<Vec<_>>()
             .join("\n");
-        let destinations = audit_destinations(&joined);
+        let destinations = audit_destinations(&joined, &own);
         let url_file = url_target_files
             .iter()
-            .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c));
+            .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c, &own));
         let outcome = if let Some((path, _)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),

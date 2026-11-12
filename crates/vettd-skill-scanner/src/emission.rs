@@ -117,21 +117,30 @@ fn emit_scalar_signals(
     observed_at: &str,
     skill_md_content_present: bool,
 ) -> Vec<Signal> {
+    // A doc-only bundle (no scripts/) has no operative language to report:
+    // the path-derived share would label Markdown "primary" for a skill that
+    // ships no code (C29). Emit the signal only when scripts exist.
+    let has_scripts = all_paths.iter().any(|p| p.starts_with("scripts/"));
     if !skill_md_content_present {
         // A SKILL.md detected only through `all_paths` carries no content, so
         // frontmatter-derived facts and the body token measurement would
-        // falsely claim declarations were inspected. The only bundle-derived
-        // signal then is the path-derived primary language.
-        return vec![primary_language(all_paths, observed_at)];
+        // falsely claim declarations were inspected.
+        return if has_scripts {
+            vec![primary_language(all_paths, observed_at)]
+        } else {
+            Vec::new()
+        };
     }
-    vec![
-        fact(
-            DECLARED_LICENSE,
-            "Declared license",
-            scalar(&parsed.frontmatter, "license"),
-            observed_at,
-        ),
-        primary_language(all_paths, observed_at),
+    let mut signals = vec![fact(
+        DECLARED_LICENSE,
+        "Declared license",
+        scalar(&parsed.frontmatter, "license"),
+        observed_at,
+    )];
+    if has_scripts {
+        signals.push(primary_language(all_paths, observed_at));
+    }
+    signals.extend(vec![
         static_context_tokens(&parsed.body, observed_at),
         fact(
             DECLARED_ENVIRONMENT_ASSUMPTIONS,
@@ -139,7 +148,8 @@ fn emit_scalar_signals(
             scalar(&parsed.frontmatter, "compatibility"),
             observed_at,
         ),
-    ]
+    ]);
+    signals
 }
 
 /// The 21 reclassified non-safety signals (see the reclassify plan §3-§4).
