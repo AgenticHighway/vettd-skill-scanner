@@ -434,6 +434,8 @@ struct UrlRef {
     /// userinfo, non-ASCII, percent-encoding, empty). Such a reference is
     /// recorded by destination but can never be expected.
     plain: bool,
+    /// True for a dotless service name (see [`service_name`]).
+    service_name: bool,
 }
 
 /// Best-effort destination identity for an authority `plain_host` rejects.
@@ -454,6 +456,26 @@ fn opaque_host(authority: &str) -> String {
     } else {
         host
     }
+}
+
+/// True when `authority` is a dotless single-label name with at most a
+/// numeric port (`api`, `db:5432`): a docker-compose service name or an
+/// environment-local alias, resolved by the local environment, not public
+/// DNS. Judged on the raw authority so userinfo, IPv6 literals and
+/// numeric-only or `0x` hex labels (which resolvers read as IPv4 addresses,
+/// e.g. `134744072` or `0x08080808` = 8.8.8.8) never qualify.
+fn service_name(authority: &str) -> bool {
+    let name = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let lower = name.to_ascii_lowercase();
+    !lower.is_empty()
+        && lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && lower.bytes().any(|b| b.is_ascii_alphabetic())
+        && !lower.starts_with("0x")
 }
 
 fn placeholder_re() -> &'static Regex {
@@ -530,7 +552,8 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
     re.find_iter(content).map(|m| {
         let rest = &content[m.end()..];
         // Characters that can belong to an authority are consumed (including
-        // ones `plain_host` rejects, like `@`, `:` and non-ASCII), so they
+        // ones `plain_host` rejects, like `@`, `:`, non-ASCII, and the IDNA
+        // dot equivalents `。` `．` `｡` that browsers map to `.`), so they
         // fail closed rather than truncating to a trusted-looking prefix.
         let mut end = 0;
         while let Some(c) = rest[end..].chars().next() {
@@ -554,7 +577,19 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
             if c.is_alphanumeric()
                 || matches!(
                     c,
-                    '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%' | '$' | '{' | '}'
+                    '.' | '-'
+                        | '_'
+                        | ':'
+                        | '@'
+                        | '['
+                        | ']'
+                        | '%'
+                        | '$'
+                        | '{'
+                        | '}'
+                        | '\u{3002}'
+                        | '\u{FF0E}'
+                        | '\u{FF61}'
                 )
             {
                 end += c.len_utf8();
@@ -592,6 +627,7 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
                 host,
                 first_segment,
                 plain,
+                service_name: service_name(authority),
             }),
         )
     })
@@ -670,6 +706,9 @@ fn is_own(r: &UrlRef, own: &[String]) -> bool {
 /// hosts count as expected boilerplate. This never widens the check for
 /// other files, and non-plain authorities still fail closed everywhere.
 fn is_expected(r: &UrlRef, own: &[String], license: bool) -> bool {
+    if r.service_name {
+        return true;
+    }
     if !r.plain {
         // Non-plain authorities fail closed — except loopback and reserved
         // hosts read through an opaque authority (an example config value
@@ -800,6 +839,52 @@ mod tests {
             assert!(
                 !unexpected(url),
                 "{url} is loopback/reserved and must be expected"
+            );
+        }
+    }
+
+    #[test]
+    fn dotless_service_names_are_expected() {
+        // Compose healthchecks and intra-container calls use single-label
+        // service names (`http://api`, `http://db:5432`). Public DNS never
+        // resolves a dotless name, so it is the machine's own environment —
+        // the same class as `.internal`/`.local` — not an external host.
+        for url in [
+            "http://api",
+            "http://api:3000/health",
+            "https://db:5432/pg_isready",
+            "http://worker/",
+        ] {
+            assert!(
+                !unexpected(url),
+                "{url} is a dotless environment name and must be expected"
+            );
+        }
+        // Real external hosts — dotted names, IP literals beyond loopback —
+        // keep failing closed, and so does the unreadable-authority sentinel.
+        for url in [
+            "https://api.stripe.com/v1/charge",
+            "https://sub.example.org/wiki",
+            "https://8.8.8.8/",
+            "https://evil.example.com/",
+            // IPv6 literals lose their brackets and have no dot.
+            "https://[2606:4700:4700::1111]/x",
+            "https://[::ffff:808:808]/x",
+            // Dotless IPv4 forms resolvers accept: decimal and `0x` hex
+            // (8.8.8.8, and 169.254.169.254 cloud metadata).
+            "http://134744072/x",
+            "http://2852039166/latest/meta-data",
+            "http://0x08080808/x",
+            // IDNA dot equivalents resolve as `evil.com`.
+            "https://evil\u{3002}com/x",
+            "https://evil\u{FF0E}com/x",
+            "https://evil\u{FF61}com/x",
+            // Userinfo keeps failing closed even on a dotless name.
+            "https://user:pw@evil/x",
+        ] {
+            assert!(
+                unexpected(url),
+                "{url} is external and must stay unexpected"
             );
         }
     }
