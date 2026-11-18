@@ -34,7 +34,7 @@ pub(crate) enum ExternalUrlOutcome {
 /// The unit tests pin a digest of [`EXPECTED_HOSTS`]: editing the list without
 /// bumping this version fails them, so the recorded version can never silently
 /// describe a different policy than the one that ran.
-pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-11";
+pub(crate) const EXPECTED_HOSTS_POLICY_VERSION: &str = "2026-11-17";
 
 /// One external destination observed in analyzed text.
 ///
@@ -154,8 +154,9 @@ fn merge_destination(out: &mut Vec<Destination>, dest: Destination) {
 /// Records every distinct external destination in `content`, sorted
 /// deterministically, with its assessment status. `own` carries the hosts the
 /// skill itself declares (frontmatter repository/homepage — see
-/// [`own_hosts`]).
-pub(crate) fn audit_destinations(content: &str, own: &[String]) -> Vec<Destination> {
+/// [`own_hosts`]). `license` marks real license-family content, where the
+/// license-steward hosts of [`LICENSE_BOILERPLATE_HOSTS`] are expected.
+pub(crate) fn audit_destinations(content: &str, own: &[String], license: bool) -> Vec<Destination> {
     let mut destinations = Vec::new();
     for (at, reference) in extract_refs_at(content) {
         let kind = classify_use(line_at(content, at));
@@ -163,7 +164,7 @@ pub(crate) fn audit_destinations(content: &str, own: &[String]) -> Vec<Destinati
             Some(reference) => Destination {
                 scheme: reference.scheme,
                 host: reference.host.clone(),
-                expected: is_expected(&reference, own),
+                expected: is_expected(&reference, own, license),
                 kind,
             },
             // A non-plain authority is exactly what must not be vouched for.
@@ -179,6 +180,22 @@ pub(crate) fn audit_destinations(content: &str, own: &[String]) -> Vec<Destinati
     destinations
         .sort_by(|a, b| (a.scheme, &a.host, a.expected).cmp(&(b.scheme, &b.host, b.expected)));
     destinations
+}
+
+/// Merges per-file audits into one record: a host unexpected in any file
+/// stays unexpected, and the deterministic order of
+/// [`audit_destinations`] is restored for the merged result.
+pub(crate) fn merge_destination_audits(
+    per_file: impl IntoIterator<Item = Vec<Destination>>,
+) -> Vec<Destination> {
+    let mut out = Vec::new();
+    for destinations in per_file {
+        for destination in destinations {
+            merge_destination(&mut out, destination);
+        }
+    }
+    out.sort_by(|a, b| (a.scheme, &a.host, a.expected).cmp(&(b.scheme, &b.host, b.expected)));
+    out
 }
 
 /// Renders destinations for a result string, marking each as expected or not.
@@ -632,11 +649,12 @@ fn is_expected_with<'a>(mut entries: impl Iterator<Item = &'a HostEntry>, r: &Ur
 }
 
 /// Hosts no live destination can resolve to: loopback names, RFC 2606/6761
-/// reserved TLDs, the RFC example domains, and placeholder-only hosts
-/// (`{site}`, `${VAR}` normalize to `*`). A reference to one of these is
-/// documentation shape, not an external destination.
+/// reserved TLDs, and the RFC example domains. A placeholder-only host
+/// (`{site}`, `${VAR}` normalize to `*`) is *not* reserved: whatever replaces
+/// the placeholder comes from the environment or a config file the scanner
+/// cannot see, so such a reference stays reviewable instead of expected.
 fn reserved_host(host: &str) -> bool {
-    if host == "*" || host == "localhost" {
+    if host == "localhost" {
         return true;
     }
     if matches!(host, "example.com" | "example.org" | "example.net") {
@@ -655,6 +673,24 @@ fn loopback_authority(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
 }
 
+/// Hosts of the organizations that steward the common open-source licenses
+/// (Apache, GNU, SPDX, OSI, Mozilla, Creative Commons). Real license files
+/// (`LICENSE*`, `NOTICE*`, `COPYING*`) quote these in their boilerplate; the
+/// same host anywhere else — or any other host in a license file — stays
+/// unexpected.
+const LICENSE_BOILERPLATE_HOSTS: &[&str] = &[
+    "apache.org",
+    "www.apache.org",
+    "gnu.org",
+    "www.gnu.org",
+    "opensource.org",
+    "www.opensource.org",
+    "spdx.org",
+    "mozilla.org",
+    "www.mozilla.org",
+    "creativecommons.org",
+];
+
 /// True when `r` points at a host the skill declares as its own. A
 /// `github.com/<org>` own entry vouches for that org path only, mirroring
 /// [`HostEntry::GitHubOrg`].
@@ -665,7 +701,11 @@ fn is_own(r: &UrlRef, own: &[String]) -> bool {
     })
 }
 
-fn is_expected(r: &UrlRef, own: &[String]) -> bool {
+/// True when `r` is expected. `license` marks a real license-family file
+/// (`LICENSE*`, `NOTICE*`, `COPYING*`), where the standard license-steward
+/// hosts count as expected boilerplate. This never widens the check for
+/// other files, and non-plain authorities still fail closed everywhere.
+fn is_expected(r: &UrlRef, own: &[String], license: bool) -> bool {
     if r.service_name {
         return true;
     }
@@ -675,6 +715,9 @@ fn is_expected(r: &UrlRef, own: &[String]) -> bool {
         // like `https://vault.internal:8200`): those name no live
         // destination whether or not a port is attached.
         return loopback_authority(&r.host) || reserved_host(&r.host);
+    }
+    if license && LICENSE_BOILERPLATE_HOSTS.contains(&r.host.as_str()) {
+        return true;
     }
     is_own(r, own) || reserved_host(&r.host) || is_expected_with(entries(), r)
 }
@@ -712,9 +755,10 @@ pub(crate) fn own_hosts(repository: &str, homepage: &str) -> Vec<String> {
     out
 }
 
-/// True when `content` references any URL outside the expected set.
-pub(crate) fn has_unexpected_external_url(content: &str, own: &[String]) -> bool {
-    extract_refs(content).any(|r| !r.is_some_and(|r| is_expected(&r, own)))
+/// True when `content` references any URL outside the expected set. `license`
+/// marks real license-family content (see [`LICENSE_BOILERPLATE_HOSTS`]).
+pub(crate) fn has_unexpected_external_url(content: &str, own: &[String], license: bool) -> bool {
+    extract_refs(content).any(|r| !r.is_some_and(|r| is_expected(&r, own, license)))
 }
 
 #[cfg(test)]
@@ -725,7 +769,7 @@ mod tests {
     use crate::scanner::scan_skill;
 
     fn unexpected(url: &str) -> bool {
-        has_unexpected_external_url(&format!("See {url} for details."), &[])
+        has_unexpected_external_url(&format!("See {url} for details."), &[], false)
     }
 
     #[test]
@@ -779,8 +823,9 @@ mod tests {
     #[test]
     fn loopback_and_reserved_hosts_are_expected() {
         // #28: localhost and the loopback IPs are the machine itself, not an
-        // external destination; placeholders and reserved TLDs name no real
-        // host at all.
+        // external destination; reserved TLDs name no real host at all.
+        // Placeholder-only hosts are deliberately absent: see
+        // `templated_hosts_match_only_listed_zones`.
         for url in [
             "http://localhost:5173/",
             "https://127.0.0.1/",
@@ -788,8 +833,6 @@ mod tests {
             "https://0.0.0.0/",
             "https://[::1]/",
             "https://vault.internal/v1/kv",
-            "https://{site}/wiki/rest/api",
-            "https://${ENDPOINT}/api",
             "https://service.internal/x",
             "https://example.com/page",
         ] {
@@ -850,7 +893,8 @@ mod tests {
     fn markdown_punctuation_ends_the_host() {
         assert!(!has_unexpected_external_url(
             "[guide](https://expected.fixture/guide) and <https://expected.fixture>, **https://expected.fixture**",
-            &[]
+            &[],
+            false
         ));
     }
 
@@ -858,7 +902,8 @@ mod tests {
     fn one_unexpected_reference_among_expected_ones_is_flagged() {
         assert!(has_unexpected_external_url(
             "https://expected.fixture/a then https://evil.fixture/b",
-            &[]
+            &[],
+            false
         ));
     }
 
@@ -937,14 +982,13 @@ mod tests {
         ] {
             assert!(unexpected(url), "{url} must count as unexpected");
         }
-        // A placeholder-only host names no concrete destination at all, so
-        // a brace/angle-bracket placeholder template is expected regardless
-        // of zone (#28, C18: the confluence `{site}` f-string template).
-        // `$FQDN` without a placeholder delimiter stays unexpected: it is
-        // not parseable as a placeholder, only as a malformed host.
-        assert!(unexpected("https://$FQDN/"));
-        for url in ["https://<endpoint>/", "https://{site}/x"] {
-            assert!(!unexpected(url), "{url} must count as expected");
+        // A placeholder-only host (`{site}`, `<endpoint>`, `${ENDPOINT}`)
+        // stays unexpected: the value that replaces the placeholder comes
+        // from the environment or a config the scanner cannot see, so the
+        // reference must stay reviewable (round 3 review). `$FQDN` without
+        // a placeholder delimiter is unexpected the same way.
+        for url in ["https://<endpoint>/", "https://{site}/x", "https://$FQDN/"] {
+            assert!(unexpected(url), "{url} must count as unexpected");
         }
     }
 
@@ -958,6 +1002,37 @@ mod tests {
         ));
         assert!(!unexpected("https://<vault-name>.vault.azure.net/"));
         assert!(unexpected("https://github.com/microsoft-evil/skills"));
+    }
+
+    #[test]
+    fn license_steward_hosts_are_expected_only_in_license_files() {
+        // Round 3 review: a license-family file is checked like any other
+        // reference, but its boilerplate steward hosts (Apache, GNU, SPDX,
+        // OSI, Mozilla, Creative Commons) are expected there. The same
+        // hosts anywhere else — and any other host in a license file —
+        // stay unexpected.
+        for url in [
+            "https://www.apache.org/licenses/LICENSE-2.0",
+            "https://www.gnu.org/licenses/gpl-3.0.html",
+            "https://spdx.org/licenses/MIT",
+            "https://opensource.org/licenses/MIT",
+            "https://www.mozilla.org/MPL/2.0/",
+            "https://creativecommons.org/licenses/by/4.0/",
+        ] {
+            assert!(
+                !has_unexpected_external_url(&format!("See {url}."), &[], true),
+                "{url} is license boilerplate and must be expected in a license file"
+            );
+            assert!(
+                has_unexpected_external_url(&format!("See {url}."), &[], false),
+                "{url} must stay checked outside a license file"
+            );
+        }
+        assert!(has_unexpected_external_url(
+            "See https://attacker.fixture/run.",
+            &[],
+            true
+        ));
     }
 
     #[test]
@@ -990,6 +1065,7 @@ mod tests {
         let destinations = audit_destinations(
             "See https://expected.fixture/path?token=secret#frag and http://evil.fixture/x",
             &[],
+            false,
         );
         assert_eq!(destinations.len(), 2);
         let expected = destinations
@@ -1024,7 +1100,7 @@ mod tests {
     fn policy_version_is_pinned() {
         // A version bump is a deliberate policy change, never an accident: the
         // recorded version is what lets a reviewer tell the two apart.
-        assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-11");
+        assert_eq!(EXPECTED_HOSTS_POLICY_VERSION, "2026-11-17");
     }
 
     /// Stable FNV-1a digest of the production list (test-only: no new dep).
@@ -1076,7 +1152,7 @@ mod tests {
         for i in 0..12 {
             content.push_str(&format!("https://host{i}.invalid/x "));
         }
-        let destinations = audit_destinations(&content, &[]);
+        let destinations = audit_destinations(&content, &[], false);
         assert_eq!(destinations.len(), 12);
         let summary = destinations_summary(&destinations);
         for i in 0..12 {
@@ -1105,10 +1181,14 @@ mod tests {
     fn mixed_expected_and_unexpected_is_flagged() {
         assert!(has_unexpected_external_url(
             "https://expected.fixture/a https://evil.fixture/b",
-            &[]
+            &[],
+            false
         ));
-        let destinations =
-            audit_destinations("https://expected.fixture/a https://evil.fixture/b", &[]);
+        let destinations = audit_destinations(
+            "https://expected.fixture/a https://evil.fixture/b",
+            &[],
+            false,
+        );
         assert!(destinations.iter().any(|d| d.expected));
         assert!(destinations.iter().any(|d| !d.expected));
     }
@@ -1120,6 +1200,7 @@ mod tests {
         let destinations = audit_destinations(
             "https://github.com/expected-org/a https://github.com/evil/b",
             &[],
+            false,
         );
         let github = destinations
             .iter()
@@ -1183,7 +1264,7 @@ mod tests {
         assert_eq!(finding.filepath.as_deref(), Some("references/a.md"));
         assert_eq!(
             finding.detail,
-            "External URL(s) detected (first in references/a.md) — https://evil.fixture (unexpected, association), https://expected.fixture (expected host, association); host policy 2026-11-11; referenced content can change after audit"
+            "External URL(s) detected (first in references/a.md) — https://evil.fixture (unexpected, association), https://expected.fixture (expected host, association); host policy 2026-11-17; referenced content can change after audit"
         );
         assert_eq!(has_rule(&result, "VTD-0093"), (false, false));
         assert_eq!(has_rule(&result, "VTD-0124"), (false, false));
