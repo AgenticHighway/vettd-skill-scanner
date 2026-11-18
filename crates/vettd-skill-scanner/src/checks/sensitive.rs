@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -853,6 +854,10 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
             .map(|line| expand_line(line, &bindings))
             .collect();
         let mut best_by_rule: HashMap<&'static str, usize> = HashMap::new();
+        // Flow facts for the fetch/decode gates, built lazily once per file:
+        // the gate must cost a fixed number of passes over the file, not one
+        // whole-file rescan per occurrence.
+        let mut flow_facts: Option<FlowFacts> = None;
 
         for (i_pat, pat) in SENSITIVE_PATTERNS.iter().enumerate() {
             if pat.code_only && is_doc {
@@ -884,15 +889,18 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                     direct_found = true;
                     if flow_sensitive {
                         let var = assigned_var(line, found.start());
-                        // Unknown flow fails closed: the finding is kept
-                        // unless the value reaches a positively recognized
-                        // harmless consumer (json/yaml/csv parsing, printing,
-                        // or a plain string decode).
-                        let executed = var.as_deref().is_some_and(|v| reaches_sink(content, v));
-                        let harmless = !executed
-                            && var
-                                .as_deref()
-                                .is_some_and(|v| reaches_harmless_consumer(content, v));
+                        // Unknown flow fails closed: the occurrence is kept
+                        // unless *every* use of the variable is a positively
+                        // recognized harmless consumer (json/yaml/csv
+                        // parsing or printing). One unrecognized use — an
+                        // alias, a helper call, a sink — keeps full severity.
+                        let facts = flow_facts.get_or_insert_with(|| FlowFacts::build(content));
+                        let harmless = var.as_deref().is_some_and(|v| {
+                            facts.all_uses_harmless(
+                                v,
+                                pat.rule_id == RULE_PYTHON_BASE64_DECODE_VARIABLE,
+                            )
+                        });
                         match pat.rule_id {
                             RULE_PYTHON_REMOTE_FETCH if harmless => {}
                             RULE_PYTHON_BASE64_DECODE_VARIABLE => {
@@ -981,32 +989,157 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
     scan
 }
 
-/// True when `var`'s value can reach a code-execution sink anywhere in
-/// `content`: eval/exec on it, a subprocess or os.system call carrying it, or
-/// an import of it. Line-level approximation: a same-file flow check, not a
-/// taint analysis — an unknown flow never suppresses a finding, it only
-/// fails to raise one beyond its base severity.
-fn reaches_sink(content: &str, var: &str) -> bool {
-    // Per-variable pattern: a OnceLock would pin the first variable seen.
-    let re = Regex::new(&format!(
-        r#"(?i)(?:eval|exec)\s*\([^)]*\b{var}\b|__import__\s*\(\s*{var}\b|import\s+{var}\b|importlib\.import_module\s*\(\s*{var}\b|subprocess\.\w+\s*\([^)]*\b{var}\b|os\.(?:system|popen)\s*\([^)]*\b{var}\b"#
-    ))
-    .expect("bad sink re");
-    re.is_match(content)
+/// Flow facts for one file's fetch/decode gating, computed in a fixed number
+/// of linear passes over the file instead of rescanning the whole file for
+/// every occurrence (which made the cost occurrences × file size). Built
+/// lazily, once per file, at the first flow-sensitive occurrence.
+struct FlowFacts {
+    /// Variables whose value reaches a code-execution sink anywhere in the
+    /// file: eval/exec arguments, a subprocess or os.system call carrying
+    /// them, `__import__`/`importlib.import_module` of them, or an import.
+    /// Line-level approximation: a same-file flow check, not a taint
+    /// analysis — an unknown flow never suppresses a finding, it only fails
+    /// to raise one beyond its base severity.
+    sink_vars: HashSet<String>,
+    /// Non-assignment occurrences of each variable — a "use". A use that is
+    /// not positively recognized as harmless keeps the finding, so unknown
+    /// flows (aliases, helper calls, cross-file) fail closed.
+    uses: HashMap<String, usize>,
+    /// Uses covered by a recognized harmless consumer call or `.json(`
+    /// parse: JSON/YAML parsing, CSV reading, printing.
+    consumer_uses: HashMap<String, usize>,
+    /// Uses as `var.decode(...)` — a plain bytes→str decode. Not harmless
+    /// for fetched content: decoding is the normal step before `exec`, so
+    /// it only ever proves harmlessness for the base64-decode rule.
+    decode_uses: HashMap<String, usize>,
 }
 
-/// True when `var`'s value reaches a positively recognized harmless consumer:
-/// JSON/YAML parsing, CSV reading, printing, or a plain string decode. This
-/// is the only recognized proof that a fetched or decoded value is not
-/// executed — absence of a sink is NOT proof, so unknown flows keep the
-/// finding at full severity (aliases, helper calls and cross-file flows are
-/// unknown by construction of this same-file check).
-fn reaches_harmless_consumer(content: &str, var: &str) -> bool {
-    let re = Regex::new(&format!(
-        r#"(?i)(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader|print)\s*\([^)]*\b{var}\b|\b{var}\s*\.\s*(?:decode|json)\s*\("#
-    ))
-    .expect("bad harmless re");
-    re.is_match(content)
+impl FlowFacts {
+    fn build(content: &str) -> Self {
+        static SINK_RE: OnceLock<Regex> = OnceLock::new();
+        static CONSUMER_RE: OnceLock<Regex> = OnceLock::new();
+        static DECODE_JSON_RE: OnceLock<Regex> = OnceLock::new();
+        static ASSIGN_LHS_RE: OnceLock<Regex> = OnceLock::new();
+        static WORD_RE: OnceLock<Regex> = OnceLock::new();
+        let sink_re = SINK_RE.get_or_init(|| {
+            // One capture per alternative: the sink's arguments (tokenized
+            // below) or the imported/looked-up name. Only argument tokens
+            // are marked, so a method named like a variable (`run`) is not.
+            Regex::new(
+                r"(?i)(?:eval|exec)\s*\(([^)]*)|__import__\s*\(\s*(\w+)|import\s+(\w+)|importlib\.import_module\s*\(\s*(\w+)|subprocess\.\w+\s*\(([^)]*)|os\.(?:system|popen)\s*\(([^)]*)",
+            )
+            .expect("bad sink re")
+        });
+        let consumer_re = CONSUMER_RE.get_or_init(|| {
+            // Left boundary on every consumer (`fingerprint(`, `myjson.loads(`
+            // must not match); `print` also excludes a leading `.` (an
+            // `obj.print(` method is not the builtin). Arguments stop at the
+            // line end: an unclosed `print(` must not reach a later line.
+            Regex::new(
+                r"(?i)(?:\b(?:json\.loads|yaml\.safe_load|csv\.reader|csv\.dictreader)|(?:^|[^.\w])print)\s*\(([^)\n]*)",
+            )
+            .expect("bad harmless re")
+        });
+        let decode_json_re = DECODE_JSON_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(\w+)\s*\.\s*(decode|json)\s*\(").expect("bad decode re")
+        });
+        let assign_lhs_re = ASSIGN_LHS_RE.get_or_init(|| {
+            // The regex crate has no look-ahead, so `==` is filtered after
+            // the match (a second `=` right after the matched one).
+            Regex::new(r"([A-Za-z_]\w*)\s*=").expect("bad assignment re")
+        });
+        let word_re = WORD_RE.get_or_init(|| Regex::new(r"\w+").expect("bad word re"));
+
+        let mut facts = FlowFacts {
+            sink_vars: HashSet::new(),
+            uses: HashMap::new(),
+            consumer_uses: HashMap::new(),
+            decode_uses: HashMap::new(),
+        };
+
+        // Sinks: mark every word inside sink arguments, plus imported names.
+        for caps in sink_re.captures_iter(content) {
+            for group in [1, 2, 3, 4, 5, 6] {
+                if let Some(args) = caps.get(group) {
+                    for word in word_re.find_iter(args.as_str()) {
+                        facts.sink_vars.insert(word.as_str().to_lowercase());
+                    }
+                }
+            }
+        }
+
+        // Harmless consumers and `.decode(`/`.json(` attributes, recorded by
+        // offset: a use counts as covered only at the offset where it is
+        // actually consumed, never because the same name appears in a
+        // consumer call somewhere else in the file.
+        let mut consumer_offsets: HashSet<usize> = HashSet::new();
+        let mut decode_offsets: HashSet<usize> = HashSet::new();
+        for caps in consumer_re.captures_iter(content) {
+            let Some(args) = caps.get(1) else { continue };
+            for word in word_re.find_iter(args.as_str()) {
+                consumer_offsets.insert(args.start() + word.start());
+            }
+        }
+        for caps in decode_json_re.captures_iter(content) {
+            let var = caps.get(1).expect("capture 1 always present");
+            let which = caps.get(2).expect("capture 2 always present").as_str();
+            let offsets = if which.eq_ignore_ascii_case("decode") {
+                &mut decode_offsets
+            } else {
+                &mut consumer_offsets
+            };
+            offsets.insert(var.start());
+        }
+
+        // Uses: every word occurrence that is not the left-hand side of an
+        // assignment (`==` comparisons are not assignments). Keywords,
+        // strings and comments count as uses too — that only ever fails
+        // closed (keeps the finding).
+        let lhs_starts: HashSet<usize> = assign_lhs_re
+            .captures_iter(content)
+            .filter(|caps| content.as_bytes().get(caps.get(0).expect("match").end()) != Some(&b'='))
+            .filter_map(|caps| caps.get(1).map(|m| m.start()))
+            .collect();
+        for word in word_re.find_iter(content) {
+            if lhs_starts.contains(&word.start()) {
+                continue;
+            }
+            let var = word.as_str().to_lowercase();
+            *facts.uses.entry(var.clone()).or_insert(0) += 1;
+            // A use is covered at most once: a consumer call first, else a
+            // plain decode, so `json.loads(r.decode())` cannot double-cover.
+            if consumer_offsets.contains(&word.start()) {
+                *facts.consumer_uses.entry(var).or_insert(0) += 1;
+            } else if decode_offsets.contains(&word.start()) {
+                *facts.decode_uses.entry(var).or_insert(0) += 1;
+            }
+        }
+        facts
+    }
+
+    /// True when every use of `var` is a positively recognized harmless
+    /// consumer and at least one use exists — a single unrecognized use
+    /// (including one in a shape the matcher does not know) keeps the finding
+    /// at full severity. `count_decode` also accepts `var.decode(...)`, the
+    /// labelled plain-string shape for the base64-decode rule; it is never
+    /// harmless for fetched content, where decoding is the step before
+    /// execution.
+    fn all_uses_harmless(&self, var: &str, count_decode: bool) -> bool {
+        let var = var.to_lowercase();
+        let Some(&uses) = self.uses.get(&var) else {
+            return false;
+        };
+        if uses == 0 || self.sink_vars.contains(&var) {
+            return false;
+        }
+        let covered = self.consumer_uses.get(&var).copied().unwrap_or(0)
+            + if count_decode {
+                self.decode_uses.get(&var).copied().unwrap_or(0)
+            } else {
+                0
+            };
+        covered >= uses
+    }
 }
 
 /// The variable assigned on a `VAR = <fetch/decode>` match: the pattern
@@ -1637,5 +1770,118 @@ mod tests {
         let scan = scan_sensitive_patterns(&tf);
         let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
         assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    // ── Flow-gate review round 2 ───────────────────────────────────────────
+    //
+    // Suppression requires *every* use of the variable to be a recognized
+    // harmless consumer; a single unrecognized use (even alongside a
+    // recognized one) keeps the finding, and a fetched value's `.decode()`
+    // is not itself proof of harmlessness.
+
+    #[test]
+    fn printed_use_alongside_unrecognized_use_keeps_the_fetch_finding() {
+        // `print(payload)` proves nothing about the other use: the finding
+        // the PR body promises ("unknown flows keep full severity") must
+        // survive a recognized consumer co-existing with an unknown sink.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(u).text\nprint(payload)\ngetattr(builtins, 'ex'+'ec')(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0024")
+            .expect("an unrecognized use must keep the fetch finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+    }
+
+    #[test]
+    fn printed_use_alongside_pickle_load_keeps_the_fetch_finding() {
+        // pickle.loads is not in the recognized consumer set: any other use
+        // keeps the finding at full severity.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(u).text\nprint(payload)\npickle.loads(payload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "an unrecognized consumer must keep the fetch finding"
+        );
+    }
+
+    #[test]
+    fn fetched_content_decoded_then_executed_still_flags_the_fetch() {
+        // `.decode()` is the normal step before `exec`, so it must not count
+        // as proof of harmlessness for fetched content.
+        let tf = files(&[(
+            "scripts/app.py",
+            "r = requests.get(u).content\nsrc = r.decode()\nexec(src)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        let hit = rule_severity(&scan.findings, "VTD-0024")
+            .expect("decode-then-exec must keep the fetch finding");
+        assert!(matches!(hit.1, Severity::High | Severity::Critical));
+        assert!(
+            rule_severity(&scan.findings, "VTD-0026").is_some(),
+            "the exec itself must keep its own finding"
+        );
+    }
+
+    #[test]
+    fn consumer_lookalike_calls_are_not_harmless_consumers() {
+        // `fingerprint(payload)` and `myjson.loads(payload)` must not match
+        // the consumer set: a missing left word boundary previously let
+        // them suppress the fetch finding entirely.
+        for content in [
+            "payload = requests.get(u).text\nfingerprint(payload)\nrun(payload)\n",
+            "payload = requests.get(u).text\nmyjson.loads(payload)\nrun(payload)\n",
+        ] {
+            let tf = files(&[("scripts/app.py", content)]);
+            let scan = scan_sensitive_patterns(&tf);
+            assert!(
+                rule_severity(&scan.findings, "VTD-0024").is_some(),
+                "a lookalike consumer name must not suppress: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_print_cannot_reach_a_later_line() {
+        // Consumer arguments stop at the line end: an unclosed `print(` must
+        // not "reach" a use on the next line.
+        let tf = files(&[(
+            "scripts/app.py",
+            "payload = requests.get(url).text\nprint(\npayload)\n",
+        )]);
+        let scan = scan_sensitive_patterns(&tf);
+        assert!(
+            rule_severity(&scan.findings, "VTD-0024").is_some(),
+            "an unclosed print( must not cover a use on the next line"
+        );
+    }
+
+    #[test]
+    fn flow_gate_cost_stays_linear_in_occurrence_count() {
+        // Regression: the gate once compiled fresh per-variable regexes and
+        // rescanned the whole file for every fetch/decode occurrence, so
+        // cost grew occurrences × file size — minutes for a few thousand
+        // occurrences. The per-file facts pass must keep a large generated
+        // file within a generous bound.
+        let mut content = String::new();
+        for i in 0..6000 {
+            content.push_str(&format!("v{i} = base64.b64decode(a{i})\nprint(v{i})\n"));
+        }
+        let tf = files(&[("scripts/big.py", content.as_str())]);
+        let start = std::time::Instant::now();
+        let scan = scan_sensitive_patterns(&tf);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 25,
+            "flow gating must not rescan per occurrence; took {elapsed:?}"
+        );
+        // The scan must still assess correctly: every decode is printed, so
+        // the decode rule fires once, downgraded to Low.
+        let hit = rule_severity(&scan.findings, "VTD-0025").expect("decode still fires");
+        assert!(matches!(hit.1, Severity::Low));
     }
 }

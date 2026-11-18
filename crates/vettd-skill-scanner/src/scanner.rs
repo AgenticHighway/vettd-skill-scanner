@@ -17,8 +17,9 @@ use crate::emission::{
 };
 use crate::evidence::annotate_evidence;
 use crate::expected_hosts::{
-    audit_destinations, destinations_summary, has_unexpected_external_url, own_hosts,
-    script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
+    audit_destinations, destinations_summary, has_unexpected_external_url,
+    merge_destination_audits, own_hosts, script_destinations_note, ExternalUrlAudit,
+    ExternalUrlOutcome, EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::finding::{Finding, FindingCategory, Severity};
 use crate::result::SkillScanResult;
@@ -408,10 +409,11 @@ pub fn scan_skill_with_repo_context(
         &parsed.repository,
         parsed.frontmatter["homepage"].as_str().unwrap_or(""),
     );
-    // License boilerplate links (Apache/GNU/…) are license text, not skill
-    // references — but only in *real* license files. An exact-name match
-    // keeps an arbitrary `references/LICENSE-payload.md` fully checked, so
-    // a renamed file cannot smuggle unexpected hosts past the rule.
+    // License-family files (LICENSE/NOTICE/COPYING) are checked like every
+    // other reference file, but their known license-steward hosts count as
+    // expected boilerplate (expected_hosts.rs). An exact-name match keeps an
+    // arbitrary `references/LICENSE-payload.md` fully checked, so a renamed
+    // file cannot smuggle unexpected hosts past the rule.
     const LICENSE_FILE_NAMES: &[&str] = &[
         "LICENSE",
         "LICENSE.md",
@@ -432,19 +434,19 @@ pub fn scan_skill_with_repo_context(
             .iter()
             .any(|n| name.eq_ignore_ascii_case(n))
     };
-    let url_target_files: Vec<(&str, &str)> = {
-        let mut targets: Vec<(&str, &str)> = Vec::new();
+    let url_target_files: Vec<(&str, &str, bool)> = {
+        let mut targets: Vec<(&str, &str, bool)> = Vec::new();
         for name in &["SKILL.md", "skill.md"] {
             if let Some(c) = text_files.get(*name) {
-                targets.push((name, c.as_str()));
+                targets.push((name, c.as_str(), false));
             }
         }
-        let mut refs: Vec<(&str, &str)> = text_files
+        let mut refs: Vec<(&str, &str, bool)> = text_files
             .iter()
-            .filter(|(p, _)| p.to_lowercase().starts_with("references/") && !is_license(p))
-            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .filter(|(p, _)| p.to_lowercase().starts_with("references/"))
+            .map(|(p, c)| (p.as_str(), c.as_str(), is_license(p)))
             .collect();
-        refs.sort_by_key(|(p, _)| *p);
+        refs.sort_by_key(|(p, _, _)| *p);
         targets.extend(refs);
         targets
     };
@@ -455,7 +457,7 @@ pub fn scan_skill_with_repo_context(
     let script_destinations = {
         let mut others: Vec<(&String, &String)> = text_files
             .iter()
-            .filter(|(p, _)| !url_target_files.iter().any(|(t, _)| *t == p.as_str()))
+            .filter(|(p, _)| !url_target_files.iter().any(|(t, _, _)| *t == p.as_str()))
             .collect();
         others.sort_by_key(|(p, _)| p.as_str());
         audit_destinations(
@@ -465,6 +467,7 @@ pub fn scan_skill_with_repo_context(
                 .collect::<Vec<_>>()
                 .join("\n"),
             &own,
+            false,
         )
     };
 
@@ -477,17 +480,19 @@ pub fn scan_skill_with_repo_context(
     } else {
         // Record every distinct destination even when the outcome is a
         // finding, so the result names what was assessed rather than only that
-        // something was. Records are kept together with the outcome.
-        let joined = url_target_files
-            .iter()
-            .map(|(_, content)| *content)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let destinations = audit_destinations(&joined, &own);
-        let url_file = url_target_files
-            .iter()
-            .find(|(_, c)| has_external_url(c) && has_unexpected_external_url(c, &own));
-        let outcome = if let Some((path, _)) = url_file {
+        // something was. Records are kept together with the outcome. Each
+        // target file is audited with its own license flag and the audits are
+        // merged, so boilerplate steward hosts stay visible as records while
+        // a host unexpected in any file stays unexpected.
+        let destinations = merge_destination_audits(
+            url_target_files
+                .iter()
+                .map(|(_, content, license)| audit_destinations(content, &own, *license)),
+        );
+        let url_file = url_target_files.iter().find(|(_, c, license)| {
+            has_external_url(c) && has_unexpected_external_url(c, &own, *license)
+        });
+        let outcome = if let Some((path, _, _)) = url_file {
             findings.push(Finding {
                 rule_id: RULE_EXTERNAL_URL_REFERENCE.to_string(),
                 category: FindingCategory::Security,
@@ -510,7 +515,7 @@ pub fn scan_skill_with_repo_context(
                 source: DEFAULT_SOURCE.to_string(),
             });
             ExternalUrlOutcome::Flagged
-        } else if url_target_files.iter().any(|(_, c)| has_external_url(c)) {
+        } else if url_target_files.iter().any(|(_, c, _)| has_external_url(c)) {
             ExternalUrlOutcome::ExpectedHostsOnly
         } else {
             ExternalUrlOutcome::NoUrls
