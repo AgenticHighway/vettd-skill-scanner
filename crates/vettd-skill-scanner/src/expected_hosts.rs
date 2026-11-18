@@ -417,6 +417,8 @@ struct UrlRef {
     /// userinfo, non-ASCII, percent-encoding, empty). Such a reference is
     /// recorded by destination but can never be expected.
     plain: bool,
+    /// True for a dotless service name (see [`service_name`]).
+    service_name: bool,
 }
 
 /// Best-effort destination identity for an authority `plain_host` rejects.
@@ -437,6 +439,26 @@ fn opaque_host(authority: &str) -> String {
     } else {
         host
     }
+}
+
+/// True when `authority` is a dotless single-label name with at most a
+/// numeric port (`api`, `db:5432`): a docker-compose service name or an
+/// environment-local alias, resolved by the local environment, not public
+/// DNS. Judged on the raw authority so userinfo, IPv6 literals and
+/// numeric-only or `0x` hex labels (which resolvers read as IPv4 addresses,
+/// e.g. `134744072` or `0x08080808` = 8.8.8.8) never qualify.
+fn service_name(authority: &str) -> bool {
+    let name = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let lower = name.to_ascii_lowercase();
+    !lower.is_empty()
+        && lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && lower.bytes().any(|b| b.is_ascii_alphabetic())
+        && !lower.starts_with("0x")
 }
 
 fn placeholder_re() -> &'static Regex {
@@ -514,7 +536,9 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
         let rest = &content[m.end()..];
         // Characters that can belong to an authority are consumed (including
         // ones `plain_host` rejects, like `@`, `:` and non-ASCII), so they
-        // fail closed rather than truncating to a trusted-looking prefix.
+        // IDNA dot equivalents (`。` `．` `｡`) are consumed too: browsers
+        // map them to `.`, so `evil。com` must not end the host at `evil`.
+        // All of these fail closed rather than truncating to a trusted-looking prefix.
         let mut end = 0;
         while let Some(c) = rest[end..].chars().next() {
             if let Some(m) = placeholder_re().find(&rest[end..]) {
@@ -537,7 +561,19 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
             if c.is_alphanumeric()
                 || matches!(
                     c,
-                    '.' | '-' | '_' | ':' | '@' | '[' | ']' | '%' | '$' | '{' | '}'
+                    '.' | '-'
+                        | '_'
+                        | ':'
+                        | '@'
+                        | '['
+                        | ']'
+                        | '%'
+                        | '$'
+                        | '{'
+                        | '}'
+                        | '\u{3002}'
+                        | '\u{FF0E}'
+                        | '\u{FF61}'
                 )
             {
                 end += c.len_utf8();
@@ -575,6 +611,7 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
                 host,
                 first_segment,
                 plain,
+                service_name: service_name(authority),
             }),
         )
     })
@@ -596,23 +633,14 @@ fn is_expected_with<'a>(mut entries: impl Iterator<Item = &'a HostEntry>, r: &Ur
 }
 
 /// Hosts no live destination can resolve to: loopback names, RFC 2606/6761
-/// reserved TLDs, the RFC example domains, placeholder-only hosts (`{site}`,
-/// `${VAR}` normalize to `*`), and dotless single-label names. A reference to
-/// one of these is documentation shape or the machine's own environment, not
-/// an external destination.
+/// reserved TLDs, the RFC example domains, and placeholder-only hosts
+/// (`{site}`, `${VAR}` normalize to `*`). A reference to one of these is
+/// documentation shape, not an external destination.
 fn reserved_host(host: &str) -> bool {
     if host == "*" || host == "localhost" {
         return true;
     }
     if matches!(host, "example.com" | "example.org" | "example.net") {
-        return true;
-    }
-    // A dotless single-label name (`http://api`, `http://db:5432`) is a
-    // docker-compose service name or an environment-local alias: public DNS
-    // never resolves a name without a TLD, so like `.internal`/`.local` it
-    // names the machine's own environment, not an external host. The
-    // unreadable-authority sentinel is not a hostname and stays unexpected.
-    if !host.contains('.') && host != "unparsed-authority" {
         return true;
     }
     matches!(
@@ -639,6 +667,9 @@ fn is_own(r: &UrlRef, own: &[String]) -> bool {
 }
 
 fn is_expected(r: &UrlRef, own: &[String]) -> bool {
+    if r.service_name {
+        return true;
+    }
     if !r.plain {
         // Non-plain authorities fail closed — except loopback and reserved
         // hosts read through an opaque authority (an example config value
@@ -794,6 +825,20 @@ mod tests {
             "https://sub.example.org/wiki",
             "https://8.8.8.8/",
             "https://evil.example.com/",
+            // IPv6 literals lose their brackets and have no dot.
+            "https://[2606:4700:4700::1111]/x",
+            "https://[::ffff:808:808]/x",
+            // Dotless IPv4 forms resolvers accept: decimal and `0x` hex
+            // (8.8.8.8, and 169.254.169.254 cloud metadata).
+            "http://134744072/x",
+            "http://2852039166/latest/meta-data",
+            "http://0x08080808/x",
+            // IDNA dot equivalents resolve as `evil.com`.
+            "https://evil\u{3002}com/x",
+            "https://evil\u{FF0E}com/x",
+            "https://evil\u{FF61}com/x",
+            // Userinfo keeps failing closed even on a dotless name.
+            "https://user:pw@evil/x",
         ] {
             assert!(
                 unexpected(url),
