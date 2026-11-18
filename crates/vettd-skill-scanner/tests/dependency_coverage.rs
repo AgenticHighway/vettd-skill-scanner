@@ -48,6 +48,7 @@ fn wrapper_pointing_at_shared_workflow_is_partial() {
     let ctx = RepoContext {
         bundle_path: "skills/google-ads-assets",
         repo_paths: &repo_paths,
+        skill_dir_name: None,
     };
     let result = scan_skill_with_repo_context(&text, &paths, &ctx, OBSERVED).unwrap();
     let partial = partial_entries(&result);
@@ -79,6 +80,7 @@ fn target_missing_from_repository_is_not_a_dependency() {
     let ctx = RepoContext {
         bundle_path: "skills/google-ads-assets",
         repo_paths: &repo_paths,
+        skill_dir_name: None,
     };
     let result = scan_skill_with_repo_context(&text, &paths, &ctx, OBSERVED).unwrap();
     assert!(partial_entries(&result).is_empty());

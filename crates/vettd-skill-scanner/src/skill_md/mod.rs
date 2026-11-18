@@ -3,8 +3,23 @@ pub(crate) mod validate;
 
 use yaml_rust2::{Yaml, YamlLoader};
 
+/// How the SKILL.md frontmatter block read. The `"unknown"` name sentinel is a scan fallback, not
+/// a validated name, so format checks key off this state instead of the name string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontmatterState {
+    /// No `---` fenced block at the top of the file.
+    Absent,
+    /// A fenced block exists but is not valid YAML (fields recovered by the lenient line-scan).
+    Unparseable,
+    /// A fenced block that parsed as YAML.
+    Parsed,
+}
+
 /// frontmatter fields and body extracted from a `SKILL.md` file.
 pub(crate) struct ParsedSkillMd {
+    pub(crate) frontmatter_state: FrontmatterState,
+    /// Whether the frontmatter carried a non-empty `name` value (as opposed to the sentinel).
+    pub(crate) name_declared: bool,
     /// value of the `name:` field; `"unknown"` if absent or unparseable.
     pub(crate) name: String,
     /// value of the `description:` field; empty string if absent.
@@ -34,6 +49,8 @@ pub(crate) struct ParsedSkillMd {
 /// whatever scalars can be recovered rather than reading as absent.
 pub(crate) fn parse_skill_md(content: &str) -> ParsedSkillMd {
     let empty = ParsedSkillMd {
+        frontmatter_state: FrontmatterState::Absent,
+        name_declared: false,
         name: "unknown".to_string(),
         description: String::new(),
         repository: String::new(),
@@ -74,6 +91,13 @@ pub(crate) fn parse_skill_md(content: &str) -> ParsedSkillMd {
         Err(_) => None,
     };
 
+    let (state, name_declared) = match &doc {
+        Some(doc) => (
+            FrontmatterState::Parsed,
+            scalar_to_string(&doc["name"]).is_some_and(|n| !n.is_empty()),
+        ),
+        None => (FrontmatterState::Unparseable, false),
+    };
     let (name, description, repository, frontmatter) = match doc {
         Some(doc) => {
             let field = |key: &str, default: &str| {
@@ -94,6 +118,8 @@ pub(crate) fn parse_skill_md(content: &str) -> ParsedSkillMd {
     };
 
     ParsedSkillMd {
+        frontmatter_state: state,
+        name_declared,
         name,
         description,
         repository,

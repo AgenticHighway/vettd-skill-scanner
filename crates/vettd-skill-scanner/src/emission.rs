@@ -15,9 +15,11 @@ use crate::expected_hosts::{
     EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::language::language_for_path;
+use crate::rules::RULE_SKILL_NAME_VALIDITY;
 use crate::signal::Signal;
 use crate::signal_rules::*;
 use crate::skill_md::ParsedSkillMd;
+use crate::spec_validation::spec_signals;
 
 const SCAN_SOURCE_CLASS: &str = "scan";
 
@@ -85,6 +87,9 @@ pub(crate) fn emit_signals(
         signals.extend(emit_declared_claims(parsed, observed_at));
         signals.extend(emit_reclassified_signals(reclassified, observed_at));
     }
+    if skill_md_content_present {
+        signals.extend(spec_signals(parsed, repo_context, observed_at));
+    }
     signals.extend(internal_reference_signal(
         &parsed.body,
         all_paths,
@@ -110,6 +115,10 @@ pub struct RepoContext<'a> {
     /// influences structural presence flags (hasScripts/hasReferences/hasEvals), which stay
     /// scoped to `all_paths` alone.
     pub repo_paths: &'a [String],
+    /// The skill folder's own name, when the caller knows it (a local scan knows the directory
+    /// it read). `None` falls back to the last segment of `bundle_path`; with neither, the
+    /// declared name cannot be checked against its folder and is reported as unverified.
+    pub skill_dir_name: Option<&'a str>,
 }
 
 fn emit_scalar_signals(
@@ -216,7 +225,7 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             signals.push(Signal {
                 severity: Some("info".to_string()),
                 detail: Some(format!(
-                    "Description is {} characters (max: {DESCRIPTION_MAX_LENGTH})",
+                    "Description is {} characters; the Agent Skills specification allows at most {DESCRIPTION_MAX_LENGTH}",
                     analysis.description_char_count
                 )),
                 ..base_signal(
@@ -547,9 +556,9 @@ pub(crate) fn coverage_entries(
             external_urls.outcome == ExternalUrlOutcome::ExpectedHostsOnly,
         ),
         (
-            "VTD-0099",
+            RULE_SKILL_NAME_VALIDITY,
             "Name validation passed",
-            "The declared skill name follows the supported naming rules.".to_string(),
+            "The frontmatter parsed, and the declared skill name follows the naming rules and matches its folder.".to_string(),
             // A SKILL.md detected only through `all_paths` carries no content
             // and no declared name; the fallback sentinel name is not a name
             // to validate. Do not attest name validation in that case.
@@ -563,7 +572,14 @@ pub(crate) fn coverage_entries(
                 rule_id: rule_id.to_string(),
                 label: label.to_string(),
                 detail,
-                category: Some("safety".to_string()),
+                category: Some(
+                    if rule_id == RULE_SKILL_NAME_VALIDITY {
+                        "compatibility"
+                    } else {
+                        "safety"
+                    }
+                    .to_string(),
+                ),
             });
         }
     }
@@ -581,7 +597,7 @@ pub(crate) fn coverage_entries(
     entries
 }
 
-fn base_signal(rule_id: &str, observed_at: &str, label: &str) -> Signal {
+pub(crate) fn base_signal(rule_id: &str, observed_at: &str, label: &str) -> Signal {
     Signal {
         data_category: rule_id.split('/').next().unwrap_or_default().to_string(),
         source_class: SCAN_SOURCE_CLASS.to_string(),

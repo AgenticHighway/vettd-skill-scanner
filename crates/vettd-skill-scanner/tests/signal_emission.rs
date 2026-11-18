@@ -34,6 +34,7 @@ fn scan_with_repo(
         &RepoContext {
             bundle_path,
             repo_paths: &repo_paths,
+            skill_dir_name: None,
         },
         OBSERVED_AT,
     )
@@ -878,7 +879,7 @@ fn description_findings_emit_only_failure_branches_with_preserved_severity() {
     assert_eq!(length.severity.as_deref(), Some("info"));
     assert_eq!(
         length.detail.as_deref(),
-        Some("Description is 1025 characters (max: 1024)")
+        Some("Description is 1025 characters; the Agent Skills specification allows at most 1024")
     );
 
     // <5 words → reliability/description-briefness (info).

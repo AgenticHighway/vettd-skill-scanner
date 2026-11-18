@@ -381,6 +381,7 @@ mod tests {
             &RepoContext {
                 bundle_path,
                 repo_paths: &repo_paths,
+                skill_dir_name: None,
             },
         )
     }

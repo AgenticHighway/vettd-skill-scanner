@@ -29,8 +29,8 @@ use crate::skill_md::body::{
     has_checklist, has_cli_hint, has_examples, has_external_url, has_gotchas, has_usage_context,
     has_validation, has_workflow, is_likely_cli_script,
 };
-use crate::skill_md::validate::validate_name;
-use crate::skill_md::{parse_skill_md, ParsedSkillMd};
+use crate::skill_md::{parse_skill_md, FrontmatterState, ParsedSkillMd};
+use crate::spec_validation::name_attestable;
 
 /// Error returned when a scan cannot be performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +156,8 @@ pub fn scan_skill_with_repo_context(
         .get(skill_key)
         .map(|content| parse_skill_md(content))
         .unwrap_or_else(|| ParsedSkillMd {
+            frontmatter_state: FrontmatterState::Absent,
+            name_declared: false,
             name: "unknown".to_string(),
             description: String::new(),
             repository: String::new(),
@@ -190,17 +192,9 @@ pub fn scan_skill_with_repo_context(
     if has_skill_md {
         check_typosquat(&parsed.name, &mut findings);
 
-        if let Some(err) = validate_name(&parsed.name) {
-            findings.push(f!(
-                RULE_SKILL_NAME_VALIDITY,
-                FindingCategory::Structure,
-                Severity::Critical,
-                "Invalid name field",
-                err.to_string()
-            ));
-        }
-        // A valid name is a pass attestation on the coverage channel
-        // (VTD-0099), not a finding — see coverage_entries().
+        // Format validity (frontmatter, name, folder) is reported as compatibility
+        // signals and, when it holds, as the name attestation. It never raises a
+        // finding: spec conformance is not a safety verdict.
 
         // Name collision check (VTD-0100)
         const WELL_KNOWN_SKILL_NAMES: &[&str] = &[
@@ -645,7 +639,7 @@ pub fn scan_skill_with_repo_context(
             skill_md_content_present: text_files.contains_key(skill_key),
             secrets_check_passed,
             behavioral_check_passed,
-            name_valid: validate_name(&parsed.name).is_none(),
+            name_valid: name_attestable(&parsed, repo_context),
             clean_internal_references,
         },
         &external_urls,

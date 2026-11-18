@@ -47,6 +47,7 @@ mod scanner;
 mod signal;
 mod signal_rules;
 mod skill_md;
+mod spec_validation;
 
 pub use coverage::CoverageEntry;
 pub use emission::RepoContext;

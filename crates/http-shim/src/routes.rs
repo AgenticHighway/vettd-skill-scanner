@@ -94,6 +94,7 @@ async fn scan(
         let repo_context = RepoContext {
             bundle_path: &req.bundle_path,
             repo_paths: &req.repo_paths,
+            ..RepoContext::default()
         };
         scan_skill_with_repo_context(&req.text_files, &req.all_paths, &repo_context, &observed_at)
     })
