@@ -275,8 +275,9 @@ fn classify(
 
     // Link targets and explicit relative paths are both relative to the SKILL.md.
     let Some(resolved) = resolve(bundle_path, reference) else {
-        // Climbs above the repository root: can never be a repository path.
-        return (DependencyClass::Ignored, reference.to_string());
+        // Climbs above the repository root: whatever it names is outside every tree this scan
+        // can see, so it cannot be treated as assessed.
+        return (DependencyClass::Unverifiable, reference.to_string());
     };
     // Files only: a directory reference is not a dependency.
     if !repo.contains(resolved.as_str()) {
@@ -441,14 +442,15 @@ mod tests {
     }
 
     #[test]
-    fn root_escape_is_rejected() {
+    fn root_escape_is_unverifiable() {
         let r = report(
             "See ../../../../etc/x.md",
             &["SKILL.md"],
             &["skills/a/SKILL.md"],
             "skills/a",
         );
-        assert_eq!(r, DependencyReport::default());
+        assert_eq!(r.unverifiable, vec!["../../../../etc/x.md"]);
+        assert!(r.is_partial());
     }
 
     #[test]
