@@ -165,7 +165,8 @@ pub(crate) fn extract_references(body: &str) -> Vec<String> {
     static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
     let link_re = LINK_RE
         .get_or_init(|| Regex::new(r"\]\(\s*<?([^)\s>]+)").expect("valid link-target regex"));
-    // `./x`, `../x`, or a repo-root-relative `a/b.ext` (a slash and a file extension).
+    // Explicit `./x` and `../x` paths only. A bare `a/b.ext` in prose is ambiguous between the
+    // skill's repository and the user's own project, so only link targets cover that spelling.
     let token_re = TOKEN_RE.get_or_init(|| {
         Regex::new(
             r"(?:\.{1,2}/)+[A-Za-z0-9._/-]+|[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)+",
@@ -272,18 +273,13 @@ fn classify(
         };
     }
 
-    let Some(resolved) = (if relative_lead {
-        resolve(bundle_path, reference)
-    } else if repo.contains(reference) || is_dir(repo, reference) {
-        Some(reference.to_string())
-    } else {
-        resolve(bundle_path, reference)
-    }) else {
+    // Link targets and explicit relative paths are both relative to the SKILL.md.
+    let Some(resolved) = resolve(bundle_path, reference) else {
         // Climbs above the repository root: can never be a repository path.
         return (DependencyClass::Ignored, reference.to_string());
     };
-
-    if !(repo.contains(resolved.as_str()) || is_dir(repo, &resolved)) {
+    // Files only: a directory reference is not a dependency.
+    if !repo.contains(resolved.as_str()) {
         // Does not exist: existing missing-path handling applies, not a dependency.
         return (DependencyClass::Ignored, resolved);
     }
@@ -303,11 +299,6 @@ fn ends_in_bundle(reference: &str, bundle: &BTreeSet<&str>) -> bool {
     bundle
         .iter()
         .any(|entry| reference.ends_with(&format!("/{entry}")))
-}
-
-fn is_dir(repo: &BTreeSet<&str>, path: &str) -> bool {
-    let prefix = format!("{path}/");
-    repo.iter().any(|p| p.starts_with(&prefix))
 }
 
 /// `path` equals `dir` or sits under it. An empty `dir` (skill at repo root) contains everything.
@@ -461,14 +452,45 @@ mod tests {
     }
 
     #[test]
-    fn repo_root_relative_reference_resolves() {
+    fn bare_prose_root_path_that_exists_is_not_a_dependency() {
+        // Ambiguous between the skill's repo and the user's own project.
         let r = report(
-            "Run shared/scripts/check.py",
+            "Run tests/conftest.py and shared/scripts/check.py first",
             &["SKILL.md"],
-            &["skills/a/SKILL.md", "shared/scripts/check.py"],
+            &[
+                "skills/a/SKILL.md",
+                "tests/conftest.py",
+                "shared/scripts/check.py",
+            ],
             "skills/a",
         );
-        assert_eq!(r.shared, vec!["shared/scripts/check.py"]);
+        assert_eq!(r, DependencyReport::default());
+    }
+
+    #[test]
+    fn bare_link_target_resolves_relative_to_the_skill() {
+        let r = report(
+            "See [notes](notes/extra.md) and [up](../shared/x.md)",
+            &["SKILL.md"],
+            &[
+                "skills/a/SKILL.md",
+                "skills/a/notes/extra.md",
+                "skills/shared/x.md",
+            ],
+            "skills/a",
+        );
+        assert_eq!(r.shared, vec!["skills/shared/x.md"]);
+    }
+
+    #[test]
+    fn directory_reference_is_not_a_dependency() {
+        let r = report(
+            "Browse ../../shared/ and [dir](../../shared)",
+            &["SKILL.md"],
+            &["skills/a/SKILL.md", "shared/x.md"],
+            "skills/a",
+        );
+        assert_eq!(r, DependencyReport::default());
     }
 
     #[test]
