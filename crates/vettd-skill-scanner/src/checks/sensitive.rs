@@ -761,9 +761,22 @@ pub(crate) fn get_sensitive_regexes() -> &'static [Regex] {
 static ASSIGNMENT_QUOTED_VALUE_STR: &str =
     r#"(?:["']?([A-Za-z_][A-Za-z0-9_.:-]*)["']?\s*[:=]\s*["']([^"'\r\n]{20,})["'])"#;
 static SUSPICIOUS_SECRET_KEY_STR: &str = r"(?i)(?:^|[-_.])(?:api[-_.]?key|access[-_.]?token|auth[-_.]?token|refresh[-_.]?token|token|secret|password|passwd|pwd|private[-_.]?key|client[-_.]?secret|credential|credentials|bearer)(?:$|[-_.])";
+// Variable-reference constructs a value can be built from without holding any
+// literal of its own: shell parameter expansions (`$VAR`, `${VAR}`,
+// `${VAR:-}`, `${VAR:-$OTHER}`), container/IDE interpolations
+// (`${localEnv:VAR}`), command substitutions (`$(...)`), and
+// mustache/handlebars template slots (`{{VAR}}`).
+//
+// Round 3 review: only reference-only shapes are stripped. `${VAR:-<literal>}`
+// supplies a literal default when the variable is unset, so it leaves the
+// literal behind and keeps the value checkable.
+static VARIABLE_REFERENCE_STR: &str = r#"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*:-\}|\$\{[A-Za-z_][A-Za-z0-9_]*:-\$[A-Za-z_][A-Za-z0-9_]*\}|\$\{localEnv:[A-Za-z_][A-Za-z0-9_]*:?\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^{}]*\}\}|\$\([^)]*\)"#;
 
 static ASSIGNMENT_QUOTED_VALUE_RE: OnceLock<Regex> = OnceLock::new();
 static SUSPICIOUS_SECRET_KEY_RE: OnceLock<Regex> = OnceLock::new();
+static VARIABLE_REFERENCE_RE: OnceLock<Regex> = OnceLock::new();
+static CMD_SUBST_RE: OnceLock<Regex> = OnceLock::new();
+static SUBST_LITERAL_RE: OnceLock<Regex> = OnceLock::new();
 
 /// caps `s` to at most `max_chars` UTF-8 characters, cutting on a character boundary.
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -1171,10 +1184,96 @@ fn shannon_entropy(s: &str) -> f64 {
         .sum()
 }
 
+/// True when `key` names, by standing convention, *where* a credential lives
+/// or *which* public identifier to use — never the credential itself. A key
+/// ending in `_file` follows the docker-secrets `*_FILE` convention (e.g.
+/// `POSTGRES_PASSWORD_FILE`, `BRAINSTORM_TOKEN_FILE`): the value is the path
+/// the credential is read from at runtime. A key ending in `_program_id`
+/// names a public on-chain program identifier (Solana's `*_PROGRAM_ID`
+/// constants are public addresses by construction). Neither convention has a
+/// form in which the value is the secret, so skipping them cannot hide a
+/// hardcoded credential; every other key shape fails closed.
+///
+/// Round 3 review: the `*_FILE` skip is gated on the value being
+/// path-shaped or a reference — the docker-secrets convention is "the value
+/// is a path". A secret-shaped value under a `_FILE` key fails closed.
+fn is_conventional_non_secret_key(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if key.ends_with("_file") {
+        return value.contains('/') || value.contains("${");
+    }
+    key.ends_with("_program_id")
+}
+
+/// True when `value` is made up entirely of variable-reference constructs,
+/// leaving no literal residue once they are stripped. Assigning `$OTHER_VAR`,
+/// `${OTHER_VAR:-}` or a `$(...)` that only reads runtime state into a
+/// secret-named variable copies runtime state; nothing is hardcoded. A value
+/// that mixes references with literal text keeps a residue and fails closed:
+/// it is evaluated exactly as before, reference bytes still counted toward
+/// its entropy.
+///
+/// Round 3 review: a literal inside a command substitution is still a
+/// literal. `$(echo <secret-shaped run>)` is checked before the strip pass;
+/// a path-like body (`cat /run/secrets/brainstorm-token`) has no 20-char
+/// alphanumeric run and stays a reference.
+fn is_pure_variable_reference(value: &str) -> bool {
+    let subst_re =
+        CMD_SUBST_RE.get_or_init(|| Regex::new(r"\$\(([^)]*)\)").expect("bad cmd-subst regex"));
+    let literal_re = SUBST_LITERAL_RE
+        .get_or_init(|| Regex::new(r"[A-Za-z0-9]{20,}").expect("bad literal-run re"));
+    for caps in subst_re.captures_iter(value) {
+        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if literal_re
+            .find_iter(body)
+            .any(|m| shannon_entropy(m.as_str()) >= 3.5)
+        {
+            return false;
+        }
+    }
+    let re = VARIABLE_REFERENCE_RE
+        .get_or_init(|| Regex::new(VARIABLE_REFERENCE_STR).expect("bad var-ref regex"));
+    re.replace_all(value, "").trim().is_empty()
+}
+
+/// True when `value` reads as placeholder prose because every `...` in it
+/// stands alone — surrounded by spaces/brackets or at the value's edges
+/// (`[ ... 64-byte JSON array ... ]`). Round 3 review: a `...` glued to
+/// word characters is not placeholder prose; the encodings a real secret
+/// takes never contain three consecutive dots mid-token, so a trailing
+/// `xK9m...` keeps firing.
+fn is_placeholder_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut any = false;
+    for (i, _) in value.match_indices("...") {
+        any = true;
+        let before_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'[' | b']');
+        let after = i + 3;
+        let after_ok = after == bytes.len() || matches!(bytes[after], b' ' | b'[' | b']');
+        if !before_ok || !after_ok {
+            return false;
+        }
+    }
+    any
+}
+
 /// scans non-markdown files for high-entropy assignment expressions that resemble hardcoded secrets.
 ///
 /// matches `key = "value"` and `key: "value"` forms where the key name contains a
 /// secret-related word (token, api_key, password, etc.) and the value has Shannon entropy ≥ 3.5.
+///
+/// three shapes that name or dereference a secret without storing it are
+/// skipped — each is provably not a hardcoded credential, so anything else
+/// fails closed and keeps firing (no context-based severity downgrades):
+/// - keys ending in `_program_id` — a public on-chain program identifier —
+///   and `*_FILE` keys whose value is path-shaped or a reference, the
+///   docker-secrets convention for *where* a credential lives: neither
+///   convention has a form in which the value is the secret;
+/// - values made up entirely of variable references (`$VAR`, `${...}`,
+///   `$(...)` bodies without a secret-shaped literal, `{{...}}` template
+///   slots) — runtime state, no literal bytes;
+/// - values whose every `...` stands alone — placeholder prose from usage
+///   documentation.
 ///
 /// # Parameters
 /// - `text_files` — map of normalized relative paths to decoded UTF-8 file content.
@@ -1199,6 +1298,15 @@ pub(crate) fn scan_entropy(text_files: &HashMap<String, String>, findings: &mut 
                     continue;
                 }
                 if !key_re.is_match(key) {
+                    continue;
+                }
+                if is_conventional_non_secret_key(key, value) {
+                    continue;
+                }
+                if is_placeholder_value(value) {
+                    continue;
+                }
+                if is_pure_variable_reference(value) {
                     continue;
                 }
                 if shannon_entropy(value) >= 3.5 {
@@ -1622,6 +1730,197 @@ mod tests {
         let mut findings = Vec::new();
         scan_entropy(&tf, &mut findings);
         assert!(findings.is_empty(), "scan_entropy must not flag .md files");
+    }
+
+    // ── Labelled false-positive shapes (VTD-0003) ───────────────────────────
+    //
+    // Every wrong shape from the labelling run sits in the same file as a
+    // real hardcoded secret (and, where a carve is anchored to a key suffix,
+    // a secret under a near-miss key). The shape lines all pass the length,
+    // key-name and entropy gates on their own, so each test fails if its
+    // carve regresses (extra findings) or is loosened too far (missing ones).
+
+    // Shape: a secret-named variable that only copies another variable, a
+    // parameter expansion, a command substitution, a container/IDE
+    // interpolation, or a mustache template slot — runtime state, not a
+    // stored literal.
+    #[test]
+    fn scan_entropy_skips_pure_variable_reference_values() {
+        let content = r#"API_TOKEN="$CLOUDFLARE_API_TOKEN"
+token="${CLOUDFLARE_API_TOKEN:-}"
+oauth_token="${localEnv:CLAUDE_CODE_OAUTH_TOKEN:}"
+bearer="$(cat /run/secrets/brainstorm-token)"
+password_hash="{{ADMIN_PASSWORD_HASH}}"
+api_key = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX" // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the real secret may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("api_key = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // A variable reference glued to real literal bytes keeps a literal
+    // residue, so it must not be treated as a pure copy — mixed values fail
+    // closed and keep today's behavior.
+    #[test]
+    fn scan_entropy_still_fires_on_mixed_variable_and_literal_value() {
+        let content = "api_key = \"${PREFIX}xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0e\"";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal residue next to a variable reference must still fire"
+        );
+    }
+
+    // Shape: a `*_FILE` key holds *where* the credential lives (docker-secrets
+    // convention), not the credential. `FILE_TOKEN` guards the suffix anchor:
+    // a key that merely contains `file` still fires.
+    #[test]
+    fn scan_entropy_skips_credential_file_path_keys() {
+        let content = r#"export BRAINSTORM_TOKEN_FILE="${PROJECT_DIR}/.superpowers/brainstorm/.last-token"
+FILE_TOKEN = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX" // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/start-server.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the non-_FILE key may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("FILE_TOKEN = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // Shape: public on-chain program identifiers (Solana `*_PROGRAM_ID`) are
+    // public addresses by construction. `TOKEN_ID` guards the suffix anchor:
+    // a key ending in plain `_id` still fires.
+    #[test]
+    fn scan_entropy_skips_public_program_id_constants() {
+        let content = r#"const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_ID = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX"; // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/simulate-tx.ts", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the non-PROGRAM_ID key may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("TOKEN_ID = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // Shape: a usage-comment placeholder — `[ ... 64-byte JSON array ... ]`
+    // is documentation prose; no real secret encoding contains `...`.
+    #[test]
+    fn scan_entropy_skips_placeholder_in_usage_comment() {
+        let content = r#" *   export SOLANA_SECRET="[ ... 64-byte JSON array ... ]"
+const API_KEY = "xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX"; // gitleaks:allow
+"#;
+        let tf = files(&[("scripts/list-markets.ts", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the real secret may fire: {findings:?}"
+        );
+        assert!(
+            findings[0].detail.contains("API_KEY = [REDACTED]"),
+            "the finding must be for the real secret: {}",
+            findings[0].detail
+        );
+    }
+
+    // ── Round 3 review: the skips must not swallow literals ───────────────
+
+    #[test]
+    fn scan_entropy_fires_on_literal_default_in_parameter_expansion() {
+        // `${API_KEY:-<literal>}` supplies the literal whenever the variable
+        // is unset: the default is a value, so it stays checked.
+        let content = "api_key=\"${API_KEY:-xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX}\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal default is a value and must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_literal_inside_command_substitution() {
+        // `$(echo <secret>)` hardcodes the secret in the command text: the
+        // substitution body is checked before the reference strip.
+        let content =
+            "api_key=\"$(echo xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX)\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a literal inside command substitution must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_secret_value_under_a_file_key() {
+        // `*_FILE` skips a path or a reference, the docker-secrets
+        // convention; the secret itself under a `_FILE` key fails closed.
+        let content =
+            "API_TOKEN_FILE=\"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a secret-shaped value under a _FILE key must still fire: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_entropy_fires_on_real_secret_with_trailing_ellipsis() {
+        // A `...` glued to word characters is not placeholder prose: a
+        // real-looking secret with a trailing `...` keeps firing.
+        let content =
+            "api_key=\"xK9mP2qRzT8wLvN3sY6cB1jH4dF7gA0eUiOhWkMnS5tX...\" // gitleaks:allow\n";
+        let tf = files(&[("scripts/env.sh", content)]);
+        let mut findings = Vec::new();
+        scan_entropy(&tf, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RULE_HIGH_ENTROPY_SECRET),
+            "a trailing ellipsis on a real secret must not suppress it: {findings:?}"
+        );
     }
 
     #[test]
