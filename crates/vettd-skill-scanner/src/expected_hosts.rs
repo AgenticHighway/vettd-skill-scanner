@@ -535,10 +535,9 @@ fn extract_refs_at(content: &str) -> impl Iterator<Item = (usize, Option<UrlRef>
     re.find_iter(content).map(|m| {
         let rest = &content[m.end()..];
         // Characters that can belong to an authority are consumed (including
-        // ones `plain_host` rejects, like `@`, `:` and non-ASCII), so they
-        // IDNA dot equivalents (`。` `．` `｡`) are consumed too: browsers
-        // map them to `.`, so `evil。com` must not end the host at `evil`.
-        // All of these fail closed rather than truncating to a trusted-looking prefix.
+        // ones `plain_host` rejects, like `@`, `:`, non-ASCII, and the IDNA
+        // dot equivalents `。` `．` `｡` that browsers map to `.`), so they
+        // fail closed rather than truncating to a trusted-looking prefix.
         let mut end = 0;
         while let Some(c) = rest[end..].chars().next() {
             if let Some(m) = placeholder_re().find(&rest[end..]) {
