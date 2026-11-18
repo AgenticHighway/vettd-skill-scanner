@@ -559,9 +559,10 @@ fn path_only_skill_md_emits_no_frontmatter_derived_signals() {
     // no frontmatter. License/environment facts, declared claims, their
     // fact-list markers, and the body token measurement would falsely claim
     // declarations were inspected; only the path-derived primary-language
-    // signal may remain.
+    // signal may remain — and it requires a scripts/ bundle (C29), hence
+    // the fixture's scripts/tool.ts.
     let text_files = HashMap::new();
-    let paths = ["SKILL.md".to_string(), "src/tool.ts".to_string()];
+    let paths = ["SKILL.md".to_string(), "scripts/tool.ts".to_string()];
     let result = scan_skill(&text_files, &paths, OBSERVED_AT).expect("valid RFC3339 timestamp");
 
     for rule_id in [

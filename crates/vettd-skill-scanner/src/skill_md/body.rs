@@ -122,8 +122,15 @@ pub(crate) fn has_usage_context(description: &str) -> bool {
     false
 }
 
+/// True when `content` references any external URL.
+///
+/// Schemes are case-insensitive per RFC 3986, so the test cannot be a
+/// case-sensitive substring match: `HTTPS://example.com/page` is a URL
+/// reference just like its lowercase twin (skill-scanner #28).
 pub(crate) fn has_external_url(content: &str) -> bool {
-    content.contains("http://") || content.contains("https://")
+    static URL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = URL_RE.get_or_init(|| Regex::new(r"(?i)https?://").expect("bad url re"));
+    re.is_match(content)
 }
 
 pub(crate) fn has_cli_hint(content: &str) -> bool {

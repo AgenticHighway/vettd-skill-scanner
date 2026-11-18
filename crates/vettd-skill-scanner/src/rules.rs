@@ -99,6 +99,10 @@ pub(crate) const RULE_EXTERNAL_URL_REFERENCE: &str = "VTD-0088";
 pub(crate) const RULE_CREDENTIAL_EXFILTRATION_CHAIN: &str = "VTD-0089";
 pub(crate) const RULE_MALICIOUS_ACTIVITY_CHAIN: &str = "VTD-0090";
 
+// Security — look-alike / supply chain
+pub(crate) const RULE_LOOKALIKE_CHARACTERS: &str = "VTD-0125";
+pub(crate) const RULE_REMOTE_UNPINNED_EXECUTION: &str = "VTD-0126";
+
 // Structure
 pub(crate) const RULE_SKILL_MD: &str = "VTD-0095";
 pub(crate) const RULE_SKILL_NAME_VALIDITY: &str = "VTD-0099";
