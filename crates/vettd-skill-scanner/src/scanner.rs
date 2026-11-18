@@ -11,9 +11,10 @@ use crate::checks::lookalike::{scan_lookalike_characters, scan_remote_unpinned_e
 use crate::checks::sensitive::{scan_entropy, scan_env_files, scan_sensitive_patterns};
 use crate::checks::typosquat::check_typosquat;
 use crate::consts::{DEFAULT_SOURCE, EVAL_JSON_CANDIDATES};
+use crate::dependency_coverage::analyze_dependencies;
 use crate::emission::{
     coverage_entries, emit_signals, has_internal_references, has_unresolvable_internal_references,
-    ReclassifiedAnalysis, RepoContext,
+    CoverageFacts, ReclassifiedAnalysis, RepoContext,
 };
 use crate::evidence::annotate_evidence;
 use crate::expected_hosts::{
@@ -625,6 +626,11 @@ pub fn scan_skill_with_repo_context(
 
     let clean_internal_references = has_internal_references(&parsed.body)
         && !has_unresolvable_internal_references(&parsed.body, all_paths, repo_context);
+    let dependencies = if text_files.contains_key(skill_key) {
+        analyze_dependencies(&parsed.body, all_paths, repo_context)
+    } else {
+        Default::default()
+    };
     let signals = emit_signals(
         &parsed,
         all_paths,
@@ -634,13 +640,16 @@ pub fn scan_skill_with_repo_context(
         &reclassified,
     );
     let coverage = coverage_entries(
-        has_skill_md,
-        text_files.contains_key(skill_key),
-        secrets_check_passed,
-        behavioral_check_passed,
+        &CoverageFacts {
+            has_skill_md,
+            skill_md_content_present: text_files.contains_key(skill_key),
+            secrets_check_passed,
+            behavioral_check_passed,
+            name_valid: validate_name(&parsed.name).is_none(),
+            clean_internal_references,
+        },
         &external_urls,
-        validate_name(&parsed.name).is_none(),
-        clean_internal_references,
+        &dependencies,
     );
 
     Ok(SkillScanResult {

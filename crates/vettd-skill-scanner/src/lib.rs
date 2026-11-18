@@ -34,6 +34,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod checks;
 mod coverage;
+mod dependency_coverage;
 mod emission;
 mod evidence;
 mod expected_hosts;

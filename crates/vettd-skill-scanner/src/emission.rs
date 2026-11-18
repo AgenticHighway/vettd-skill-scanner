@@ -9,6 +9,7 @@ use yaml_rust2::Yaml;
 
 use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
+use crate::dependency_coverage::{dependency_coverage_entries, DependencyReport};
 use crate::expected_hosts::{
     destinations_summary, script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome,
     EXPECTED_HOSTS_POLICY_VERSION,
@@ -481,15 +482,30 @@ fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal
     signals
 }
 
+/// Boolean facts the attestation and coverage entries are decided from.
+#[derive(Clone, Copy)]
+pub(crate) struct CoverageFacts {
+    pub has_skill_md: bool,
+    pub skill_md_content_present: bool,
+    pub secrets_check_passed: bool,
+    pub behavioral_check_passed: bool,
+    pub name_valid: bool,
+    pub clean_internal_references: bool,
+}
+
 pub(crate) fn coverage_entries(
-    has_skill_md: bool,
-    skill_md_content_present: bool,
-    secrets_check_passed: bool,
-    behavioral_check_passed: bool,
+    facts: &CoverageFacts,
     external_urls: &ExternalUrlAudit,
-    name_valid: bool,
-    clean_internal_references: bool,
+    dependencies: &DependencyReport,
 ) -> Vec<CoverageEntry> {
+    let CoverageFacts {
+        has_skill_md,
+        skill_md_content_present,
+        secrets_check_passed,
+        behavioral_check_passed,
+        name_valid,
+        clean_internal_references,
+    } = *facts;
     if !has_skill_md {
         // A package without its required definition is not a completed skill
         // scan. Do not attest partial checks or emit coverage for it.
@@ -551,7 +567,9 @@ pub(crate) fn coverage_entries(
             });
         }
     }
-    if clean_internal_references {
+    entries.extend(dependency_coverage_entries(dependencies));
+    // A closed-resolution claim cannot stand next to a partial: the outside content was not read.
+    if clean_internal_references && !dependencies.is_partial() {
         entries.push(CoverageEntry {
             kind: "coverage".to_string(),
             rule_id: UNRESOLVABLE_INTERNAL_REFERENCES.to_string(),
