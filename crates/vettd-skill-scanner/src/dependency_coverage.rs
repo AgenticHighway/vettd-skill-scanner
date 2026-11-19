@@ -22,16 +22,18 @@ const MAX_REFERENCES: usize = 200;
 const MAX_REFERENCE_LEN: usize = 300;
 const MAX_LISTED_PATHS: usize = 5;
 
-/// Repo-level documents that are not behavior: ignored, never a dependency.
-const REPO_DOC_STEMS: &[&str] = &[
+/// Repo-level documents that are not behavior: ignored, never a dependency, but only at the
+/// repository root. A README or similar inside a subfolder (e.g. `hooks/README.md`) can carry
+/// real instructions, so it counts as shared content like any other file.
+const ROOT_DOC_STEMS: &[&str] = &[
     "readme",
-    "license",
     "changelog",
     "contributing",
     "code_of_conduct",
     "security",
-    "notice",
 ];
+/// Legal notices are never behavior, wherever they sit.
+const ANYWHERE_DOC_STEMS: &[&str] = &["license", "notice"];
 
 /// Where one reference points, relative to the scanned bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,7 +332,7 @@ fn resolve(bundle_path: &str, reference: &str) -> Option<String> {
 fn is_repo_doc(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name);
-    REPO_DOC_STEMS.contains(&stem)
+    ANYWHERE_DOC_STEMS.contains(&stem) || (!path.contains('/') && ROOT_DOC_STEMS.contains(&stem))
 }
 
 /// Nearest ancestor directory of `path` (inclusive of the file's own folder) holding a SKILL.md.
@@ -439,6 +441,20 @@ mod tests {
             "skills/a",
         );
         assert_eq!(r, DependencyReport::default());
+    }
+
+    #[test]
+    fn subfolder_readme_is_shared_content_but_nested_license_is_not() {
+        // Light Ark (lightarktech/founder-coding-skills@e737f2049ac7) skills/model-tiering links
+        // ../../hooks/README.md, which documents enforcement hooks: behavior, not boilerplate.
+        let r = report(
+            "See [hooks](../../hooks/README.md) and ../../hooks/LICENSE",
+            &["SKILL.md"],
+            &["skills/a/SKILL.md", "hooks/README.md", "hooks/LICENSE"],
+            "skills/a",
+        );
+        assert_eq!(r.shared, vec!["hooks/README.md"]);
+        assert!(r.is_partial());
     }
 
     #[test]
