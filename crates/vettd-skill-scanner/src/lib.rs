@@ -34,6 +34,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod checks;
 mod coverage;
+mod dependency_coverage;
 mod emission;
 mod evidence;
 mod expected_hosts;
@@ -46,6 +47,7 @@ mod scanner;
 mod signal;
 mod signal_rules;
 mod skill_md;
+mod spec_validation;
 
 pub use coverage::CoverageEntry;
 pub use emission::RepoContext;

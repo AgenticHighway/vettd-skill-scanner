@@ -111,7 +111,7 @@ pub(crate) static SENSITIVE_PATTERNS: &[SensitivePattern] = &[
     },
     SensitivePattern {
         rule_id: RULE_SAFETY_BYPASS_FLAG,
-        label: "Safety bypass flag detected",
+        label: "Force flag detected (overwrites or skips confirmation)",
         severity: Severity::Low,
         intent: Intent::Negligent,
         code_only: true,
@@ -663,8 +663,9 @@ static SENSITIVE_PATTERN_STRS: &[&str] = &[
     r"(?i)(?:bash|sh|zsh|dash)\s+<\(\s*(?:curl|wget)\s",
     // VTD-0028 — --no-verify safety bypass
     r"(?i)--no-verify",
-    // VTD-0028 — --force safety bypass (low severity)
-    r"(?i)--force",
+    // VTD-0028 — --force (overwrite / skip confirmation, low severity). The optional
+    // `-with-lease` suffix lets the match filter tell the safer git variant apart.
+    r"(?i)--force(?:-with-lease)?",
     // VTD-0005 — .aws credentials/config
     r"(?i)\.aws[/\\](?:credentials|config)\b",
     // VTD-0005 — .config/gcloud credentials
@@ -1046,6 +1047,11 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
                 let mut direct_found = false;
                 for found in re.find_iter(line) {
                     direct_found = true;
+                    if pat.rule_id == RULE_SAFETY_BYPASS_FLAG
+                        && !is_bypass_flag_use(found.as_str(), &lines, i_line)
+                    {
+                        continue;
+                    }
                     if flow_sensitive {
                         let var = assigned_var(line, found.start());
                         // Unknown flow fails closed: the occurrence is kept
@@ -1151,6 +1157,26 @@ pub(crate) fn scan_sensitive_patterns(text_files: &HashMap<String, String>) -> S
         .any(|f| matches!(f.severity, Severity::Critical | Severity::High));
 
     scan
+}
+
+/// Whether a VTD-0028 match is a use of the flag rather than its definition or a safer variant.
+/// `--force-with-lease` refuses to overwrite unseen remote work, and a CLI that merely declares a
+/// `--force` option (`add_argument(`, `click.option(`, `.option(`, on the line or the call's
+/// opening line above) is not bypassing anything. `--no-verify` is always a use.
+fn is_bypass_flag_use(matched: &str, lines: &[&str], i_line: usize) -> bool {
+    if !matched.eq_ignore_ascii_case("--force") {
+        return !matched.to_ascii_lowercase().ends_with("-with-lease");
+    }
+    let defines = |line: &str| {
+        line.contains("add_argument(")
+            || line.contains("click.option(")
+            || line.contains(".option(")
+    };
+    let above = i_line
+        .checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .is_some_and(|prev| prev.trim_end().ends_with('(') && defines(prev));
+    !(defines(lines[i_line]) || above)
 }
 
 /// Flow facts for one file's fetch/decode gating, computed in a fixed number

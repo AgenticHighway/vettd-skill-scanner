@@ -111,14 +111,22 @@ fn clean_skill_attests_security_checks_on_coverage_channel() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn invalid_skill_name_fires_vtd_0099() {
+fn invalid_skill_name_is_not_a_finding() {
+    // Format conformance is a compatibility signal; it must never grade the skill.
     let skill = "---\nname: --bad-name\ndescription: A skill.\n---\nDoes stuff.";
     let mut text_files = HashMap::new();
     text_files.insert("SKILL.md".to_string(), skill.to_string());
     let result = scan(&text_files, &["SKILL.md".to_string()]);
     assert!(
-        result.findings.iter().any(|f| f.rule_id == "VTD-0099"),
-        "invalid name should fire VTD-0099"
+        !result.findings.iter().any(|f| f.rule_id == "VTD-0099"),
+        "invalid name must not raise a finding"
+    );
+    assert!(
+        result
+            .signals
+            .iter()
+            .any(|s| s.rule_id == "compatibility/spec-name"),
+        "invalid name is reported as a compatibility signal"
     );
 }
 

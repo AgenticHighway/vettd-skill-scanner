@@ -9,14 +9,17 @@ use yaml_rust2::Yaml;
 
 use crate::consts::{DEFAULT_SOURCE, DESCRIPTION_MAX_LENGTH, EVALS_MIN_TEST_CASES};
 use crate::coverage::CoverageEntry;
+use crate::dependency_coverage::{dependency_coverage_entries, DependencyReport};
 use crate::expected_hosts::{
     destinations_summary, script_destinations_note, ExternalUrlAudit, ExternalUrlOutcome,
     EXPECTED_HOSTS_POLICY_VERSION,
 };
 use crate::language::language_for_path;
+use crate::rules::RULE_SKILL_NAME_VALIDITY;
 use crate::signal::Signal;
 use crate::signal_rules::*;
 use crate::skill_md::ParsedSkillMd;
+use crate::spec_validation::spec_signals;
 
 const SCAN_SOURCE_CLASS: &str = "scan";
 
@@ -84,6 +87,9 @@ pub(crate) fn emit_signals(
         signals.extend(emit_declared_claims(parsed, observed_at));
         signals.extend(emit_reclassified_signals(reclassified, observed_at));
     }
+    if skill_md_content_present {
+        signals.extend(spec_signals(parsed, repo_context, observed_at));
+    }
     signals.extend(internal_reference_signal(
         &parsed.body,
         all_paths,
@@ -109,6 +115,10 @@ pub struct RepoContext<'a> {
     /// influences structural presence flags (hasScripts/hasReferences/hasEvals), which stay
     /// scoped to `all_paths` alone.
     pub repo_paths: &'a [String],
+    /// The skill folder's own name, when the caller knows it (a local scan knows the directory
+    /// it read). `None` falls back to the last segment of `bundle_path`; with neither, the
+    /// declared name cannot be checked against its folder and is reported as unverified.
+    pub skill_dir_name: Option<&'a str>,
 }
 
 fn emit_scalar_signals(
@@ -215,7 +225,7 @@ fn emit_reclassified_signals(analysis: &ReclassifiedAnalysis, observed_at: &str)
             signals.push(Signal {
                 severity: Some("info".to_string()),
                 detail: Some(format!(
-                    "Description is {} characters (max: {DESCRIPTION_MAX_LENGTH})",
+                    "Description is {} characters; the Agent Skills specification allows at most {DESCRIPTION_MAX_LENGTH}",
                     analysis.description_char_count
                 )),
                 ..base_signal(
@@ -481,15 +491,30 @@ fn emit_declared_claims(parsed: &ParsedSkillMd, observed_at: &str) -> Vec<Signal
     signals
 }
 
+/// Boolean facts the attestation and coverage entries are decided from.
+#[derive(Clone, Copy)]
+pub(crate) struct CoverageFacts {
+    pub has_skill_md: bool,
+    pub skill_md_content_present: bool,
+    pub secrets_check_passed: bool,
+    pub behavioral_check_passed: bool,
+    pub name_valid: bool,
+    pub clean_internal_references: bool,
+}
+
 pub(crate) fn coverage_entries(
-    has_skill_md: bool,
-    skill_md_content_present: bool,
-    secrets_check_passed: bool,
-    behavioral_check_passed: bool,
+    facts: &CoverageFacts,
     external_urls: &ExternalUrlAudit,
-    name_valid: bool,
-    clean_internal_references: bool,
+    dependencies: &DependencyReport,
 ) -> Vec<CoverageEntry> {
+    let CoverageFacts {
+        has_skill_md,
+        skill_md_content_present,
+        secrets_check_passed,
+        behavioral_check_passed,
+        name_valid,
+        clean_internal_references,
+    } = *facts;
     if !has_skill_md {
         // A package without its required definition is not a completed skill
         // scan. Do not attest partial checks or emit coverage for it.
@@ -531,9 +556,9 @@ pub(crate) fn coverage_entries(
             external_urls.outcome == ExternalUrlOutcome::ExpectedHostsOnly,
         ),
         (
-            "VTD-0099",
+            RULE_SKILL_NAME_VALIDITY,
             "Name validation passed",
-            "The declared skill name follows the supported naming rules.".to_string(),
+            "The frontmatter parsed, and the declared skill name follows the naming rules and matches its folder.".to_string(),
             // A SKILL.md detected only through `all_paths` carries no content
             // and no declared name; the fallback sentinel name is not a name
             // to validate. Do not attest name validation in that case.
@@ -547,11 +572,20 @@ pub(crate) fn coverage_entries(
                 rule_id: rule_id.to_string(),
                 label: label.to_string(),
                 detail,
-                category: Some("safety".to_string()),
+                category: Some(
+                    if rule_id == RULE_SKILL_NAME_VALIDITY {
+                        "compatibility"
+                    } else {
+                        "safety"
+                    }
+                    .to_string(),
+                ),
             });
         }
     }
-    if clean_internal_references {
+    entries.extend(dependency_coverage_entries(dependencies));
+    // A closed-resolution claim cannot stand next to a partial: the outside content was not read.
+    if clean_internal_references && !dependencies.is_partial() {
         entries.push(CoverageEntry {
             kind: "coverage".to_string(),
             rule_id: UNRESOLVABLE_INTERNAL_REFERENCES.to_string(),
@@ -563,7 +597,7 @@ pub(crate) fn coverage_entries(
     entries
 }
 
-fn base_signal(rule_id: &str, observed_at: &str, label: &str) -> Signal {
+pub(crate) fn base_signal(rule_id: &str, observed_at: &str, label: &str) -> Signal {
     Signal {
         data_category: rule_id.split('/').next().unwrap_or_default().to_string(),
         source_class: SCAN_SOURCE_CLASS.to_string(),

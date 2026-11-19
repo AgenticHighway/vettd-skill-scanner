@@ -114,7 +114,11 @@ static BEHAVIORAL_PATTERN_DEFS: &[BehavioralPatternRaw] = &[
     // INJECTION_MARKER_PATTERNS
     BehavioralPatternRaw {
         rule_id: RULE_PROMPT_TEMPLATE_MARKER,
-        pattern_str: r"(?i)\[(?:SYSTEM|SYS|SYSTEM[\s_-]+(?:PROMPT|MESSAGE|MSG|INSTRUCTION|INST)|INST|/INST|INSTRUCTION|HUMAN|ASSISTANT)\]",
+        // Bracket markers only count in role-marker position, so an ordinary
+        // "[system]" placeholder inside a sentence does not: a marker opening the
+        // line (after optional quote/list/`>` markers), a marker followed by `:`,
+        // or an `[INST]...[/INST]` pair.
+        pattern_str: r"(?i)(?:^[\s>*+\-\x22'`]*(?:\d+[.)]\s*)?\[(?:SYSTEM|SYS|SYSTEM[\s_-]+(?:PROMPT|MESSAGE|MSG|INSTRUCTION|INST)|INST|/INST|INSTRUCTION|HUMAN|ASSISTANT)\]|\[(?:SYSTEM|SYS|SYSTEM[\s_-]+(?:PROMPT|MESSAGE|MSG|INSTRUCTION|INST)|INST|/INST|INSTRUCTION|HUMAN|ASSISTANT)\]\s*:|\[INST\].*?\[/INST\])",
         label: "Embedded prompt-template marker",
         severity: "medium",
         respect_negation: false,
@@ -179,6 +183,30 @@ pub(crate) fn normalize_for_behavioral_scan(content: &str) -> String {
         .map(|line| hws_re.replace_all(line, " ").trim().to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A bounded evidence snippet that always contains the match: the line start when the match is
+/// near it, otherwise a window beginning shortly before the match. Char-safe.
+fn snippet_around(line: &str, match_start: usize) -> String {
+    const WINDOW: usize = 120;
+    const LEAD: usize = 40;
+    let lead_ws = line.len() - line.trim_start().len();
+    let trimmed = line.trim();
+    let start_char = trimmed
+        .char_indices()
+        .take_while(|(i, _)| *i < match_start.saturating_sub(lead_ws))
+        .count();
+    let skip = if start_char + LEAD <= WINDOW {
+        0
+    } else {
+        start_char - LEAD
+    };
+    let window: String = trimmed.chars().skip(skip).take(WINDOW).collect();
+    if skip > 0 {
+        format!("…{window}")
+    } else {
+        window
+    }
 }
 
 /// strips fenced code blocks, blockquotes, and example-labelled sections from markdown.
@@ -311,7 +339,7 @@ pub(crate) fn scan_behavioral_patterns(
                     match_count += 1;
                     if first_match_line.is_none() {
                         first_match_line = Some(i + 1);
-                        first_match_snippet = line.trim().chars().take(120).collect();
+                        first_match_snippet = snippet_around(line, m.start());
                     }
                 }
             }

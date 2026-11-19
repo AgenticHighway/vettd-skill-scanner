@@ -28,6 +28,9 @@ pub(crate) fn validate_name(name: &str) -> Option<&'static str> {
             );
         }
     }
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        return Some("name must be lowercase");
+    }
     if name.contains("--") {
         return Some("name must not contain consecutive hyphens");
     }
@@ -68,6 +71,7 @@ mod tests {
     fn invalid_char_rejected() {
         assert!(validate_name("my_skill").is_some());
         assert!(validate_name("my skill").is_some());
+        assert!(validate_name("My-Skill").is_some());
         assert!(validate_name("my.skill").is_some());
     }
 
